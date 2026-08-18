@@ -1,0 +1,32 @@
+{
+  "name": "onenote-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server exposing Microsoft OneNote via Microsoft Graph, including rendered handwriting.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "node --watch src/index.ts",
+    "start": "node dist/index.js",
+    "bootstrap": "node src/bootstrap.ts",
+    "test": "node --test \"src/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@azure/msal-node": "^5.5.0",
+    "@google-cloud/firestore": "^9.0.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@resvg/resvg-js": "^2.6.2",
+    "express": "^5.2.1",
+    "fast-xml-parser": "^5.11.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.0.0",
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+output/
+.env
+.env.*
+*.token-cache.json
+.msal-cache*
+npm-debug.log*
+.DS_Store
