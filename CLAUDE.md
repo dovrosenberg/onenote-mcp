@@ -24,12 +24,13 @@ onenote-mcp/
 │   ├── index.ts               # server entrypoint: validate config, bind $PORT, listen
 │   ├── server.ts              # builds the Express app; does not listen
 │   ├── config.ts              # env-var schema, grouped validation, ConfigError
-│   ├── bootstrap.ts           # device-code CLI that seeds the Firestore token cache (placeholder, issue #9)
+│   ├── bootstrap.ts           # device-code CLI that seeds the Firestore token cache (issue #9)
 │   ├── graph-auth.ts          # Layer-2 Graph auth: silent token acquisition (issue #8)
 │   ├── token-cache.ts         # Firestore-backed MSAL ICachePlugin (issue #7)
 │   └── version.ts             # SERVICE_NAME, VERSION
 │
 ├── test/                      # node --test suites; test/<name>.test.ts covers src/<name>.ts
+│   ├── bootstrap.test.ts      # spawns the CLI; covers its refusals only
 │   ├── config.test.ts
 │   ├── graph-auth.test.ts     # drives acquireGraphToken through a fake client
 │   ├── server.test.ts
@@ -52,15 +53,21 @@ A test file is named for the source file it covers: `test/config.test.ts` covers
 whose behaviour is process exit codes and stderr, so it has no unit test; check it by
 running it. Unsetting a required variable and running `npm start` must print the list of
 missing names and exit 1 with no line matching `at …(`, and binding a port already in
-use must print one readable line rather than an `EADDRINUSE` stack. `src/bootstrap.ts`
-is a placeholder until issue #9.
+use must print one readable line rather than an `EADDRINUSE` stack.
+
+`test/bootstrap.test.ts` spawns `src/bootstrap.ts` as a child process, because the module
+signs in at import time and exports nothing. It covers only what happens before the CLI
+needs a human: the exit code and the message on an incomplete environment. The
+device-code sign-in, the cache write, and the Graph probe have no automated test and
+cannot get one — they need a browser, the real Entra tenant, and Firestore, and no
+credential that could stand in for one may be committed. Verify them by running the CLI.
 
 `test/graph-auth.test.ts` drives `acquireGraphToken` through a hand-written
 `SilentTokenSource` and never constructs a `PublicClientApplication`, so
 `createGraphAuth` has no automated test. Testing it needs a cache seeded by a real
-device-code sign-in, which arrives with issues #9 and #10, and no credential that could
-seed one may be committed. Nothing verifies it until an operator runs it by hand against
-the real app registration.
+device-code sign-in, and no credential that could seed one may be committed. Nothing
+verifies it until an operator runs `npm run bootstrap` and then the server against the
+same document.
 
 `test/token-cache.test.ts` covers `readCache` and nothing else. `readCache` is a pure
 function over a document snapshot, so it runs without a backend. `beforeCacheAccess`,
@@ -119,10 +126,24 @@ image built by issue #6.
 
 **Configuration is grouped, and read in exactly one place.** `loadConfig(groups, env)`
 in `src/config.ts` validates only the groups the caller asks for: `graph`, `firestore`,
-`oauth`, `server`. The server asks for all four; `bootstrap.ts` asks for `graph` and
-`firestore` only, so the operator running it locally is never made to hold
-`MCP_OAUTH_CLIENT_SECRET`. Add a new variable to the `SPECS` table, not to a new
-`process.env` read somewhere else.
+`firestore-explicit`, `oauth`, `server`. The server asks for `graph`, `firestore`,
+`oauth`, and `server`; `bootstrap.ts` asks for `graph` and `firestore-explicit` only, so
+the operator running it locally is never made to hold `MCP_OAUTH_CLIENT_SECRET`. Add a
+new variable to the `SPECS` table, not to a new `process.env` read somewhere else.
+
+**The bootstrap CLI requires the two Firestore variables the server defaults.** That is
+the whole difference between the `firestore` and `firestore-explicit` groups:
+`FIRESTORE_CACHE_DOC` falls back to `tokencache/msal` and `GOOGLE_CLOUD_PROJECT` may be
+absent on Cloud Run, where the metadata server supplies it. The CLI runs against whatever
+project the operator's Application Default Credentials point at, so letting either name
+default would seed a real Firestore document somewhere the deployed service does not read
+and still print a success line. Ask for one group or the other, never both.
+
+**`ConfigError` is given the descriptions to print, not asked to look them up.** A
+variable name appears in more than one group with a different reason for being required,
+so `SPECS.find(byName)` would print the server's description in an error raised by the
+bootstrap CLI. `loadConfig` collects the purposes of the specs it actually consulted and
+passes that map to the constructor.
 
 **Startup failures print one readable message and exit 1 — never a stack trace.** That
 covers missing variables, malformed values, and bind failures (`EADDRINUSE`, `EACCES`).
@@ -156,6 +177,22 @@ both — that the `.node` binary is present and that `node_modules/typescript` i
 context by default rather than silently dropped. The entries that mirror `.gitignore`
 (`.env*`, `*.token-cache.json`, `.msal-cache*`) are there so a local operator's
 credentials cannot reach an image layer.
+
+**The bootstrap CLI shares the server's client id, authority, scopes, and cache
+plugin.** It imports `GRAPH_SCOPES` from `src/graph-auth.ts` and
+`createFirestoreTokenCachePlugin` from `src/token-cache.ts` rather than restating either.
+MSAL keys cached tokens by client id and by scope string, so a short scope name in one
+place and the fully-qualified form in the other produces a cache that looks valid and
+that the server's silent acquisition misses. The CLI serializes nothing itself; the write
+happens inside `acquireTokenByDeviceCode`, through the plugin's `afterCacheAccess`.
+
+**The bootstrap CLI prints counts, not names, and one line about the tenant.** Its Graph
+probe is `GET /me/onenote/notebooks?$select=id`, so notebook display names never enter
+the response body. The confirmation names the Firestore project, the document path, and
+the account's home tenant — the tenant because a device-code sign-in into the wrong
+directory succeeds with no error, and that line is the only thing that catches it. The
+CLI's own output therefore carries a tenant id and must not be pasted into an issue, a
+pull request, or a workflow log; it says so itself.
 
 **The server never signs in interactively.** `acquireTokenByDeviceCode` belongs to
 `src/bootstrap.ts` alone. The deployed service acquires silently from the Firestore

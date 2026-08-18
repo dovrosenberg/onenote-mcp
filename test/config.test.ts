@@ -74,15 +74,45 @@ test('the error is named ConfigError and names every missing variable in its mes
 });
 
 test('the bootstrap CLI groups load without any MCP_OAUTH_* variable set', () => {
-  const config = loadConfig(['graph', 'firestore'], {
+  const config = loadConfig(['graph', 'firestore-explicit'], {
     ONENOTE_CLIENT_ID: 'client-id',
     ONENOTE_AUTHORITY: 'https://login.microsoftonline.com/common',
+    FIRESTORE_CACHE_DOC: 'tokencache/msal',
+    GOOGLE_CLOUD_PROJECT: 'proj',
   });
 
   assert.equal(config.graph?.clientId, 'client-id');
   assert.equal(config.firestore?.cacheDocumentPath, 'tokencache/msal');
   assert.equal(config.oauth, undefined);
   assert.equal(config.server, undefined);
+});
+
+test('firestore-explicit requires both names that firestore defaults or leaves unset', () => {
+  // The bootstrap CLI writes with the operator's own credentials. Defaulting either name
+  // would seed a real document in a project or at a path the deployed server never
+  // reads, and the CLI would still report success.
+  const err = expectConfigError({}, ['firestore-explicit']);
+
+  assert.deepEqual([...err.missing].sort(), ['FIRESTORE_CACHE_DOC', 'GOOGLE_CLOUD_PROJECT']);
+  assert.equal(err.invalid.length, 0);
+});
+
+test('firestore-explicit still rejects a collection path', () => {
+  const err = expectConfigError({ FIRESTORE_CACHE_DOC: 'a/b/c', GOOGLE_CLOUD_PROJECT: 'proj' }, [
+    'firestore-explicit',
+  ]);
+
+  assert.equal(err.invalid.length, 1);
+  assert.match(err.invalid[0] ?? '', /^FIRESTORE_CACHE_DOC: /);
+});
+
+test('a missing variable is described by the group that was asked for', () => {
+  // FIRESTORE_CACHE_DOC appears in two groups with different reasons for being needed.
+  // Looking the description up by name alone would print whichever row of the table
+  // comes first, which is the server's, in an error raised by the bootstrap CLI.
+  const err = expectConfigError({ GOOGLE_CLOUD_PROJECT: 'proj' }, ['firestore-explicit']);
+
+  assert.match(err.message, /FIRESTORE_CACHE_DOC — .*bootstrap CLI requires it/);
 });
 
 test('PORT defaults to 8080 and parses as a number', () => {

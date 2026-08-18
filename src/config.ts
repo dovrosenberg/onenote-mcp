@@ -1,20 +1,36 @@
 // Environment-variable schema and validation.
 //
 // Two entrypoints need different subsets of these variables: the server needs the
-// Layer-1 OAuth credentials, the bootstrap CLI (issue #9) runs on the operator's own
-// machine and must not require them. So validation is grouped rather than all-or-nothing.
+// Layer-1 OAuth credentials, the bootstrap CLI runs on the operator's own machine and
+// must not require them. So validation is grouped rather than all-or-nothing.
+//
+// The two entrypoints also differ on how strict the Firestore variables are, which is
+// why there are two Firestore groups. The server asks for `firestore`, where
+// FIRESTORE_CACHE_DOC defaults and GOOGLE_CLOUD_PROJECT may be absent because Cloud Run
+// infers the project from the metadata server. The bootstrap CLI asks for
+// `firestore-explicit`, where both are required: it runs against whatever project the
+// operator's Application Default Credentials happen to point at, and seeding the cache
+// into the wrong project or the wrong document path fails silently — the CLI reports
+// success and the deployed server still finds no account.
 //
 // Nothing here reads process.env at module scope and nothing here exits the process
 // except exitOnConfigError, which is only ever called from an entrypoint.
 
-export type ConfigGroup = 'graph' | 'firestore' | 'oauth' | 'server';
+export type ConfigGroup = 'graph' | 'firestore' | 'firestore-explicit' | 'oauth' | 'server';
 
 export class ConfigError extends Error {
   readonly missing: readonly string[];
   readonly invalid: readonly string[];
 
-  constructor(missing: string[], invalid: string[]) {
-    super(formatConfigError(missing, invalid));
+  /**
+   * `purposes` maps a missing variable's name to the description printed beside it. It
+   * is passed in rather than looked up from SPECS because a name can appear in more
+   * than one group with a different reason for being required — FIRESTORE_CACHE_DOC is
+   * optional in `firestore` and required in `firestore-explicit` — and a lookup by name
+   * alone would print whichever entry happens to come first in the table.
+   */
+  constructor(missing: string[], invalid: string[], purposes: ReadonlyMap<string, string>) {
+    super(formatConfigError(missing, invalid, purposes));
     this.name = 'ConfigError';
     this.missing = missing;
     this.invalid = invalid;
@@ -60,6 +76,21 @@ const SPECS: readonly VarSpec[] = [
     group: 'firestore',
     required: false,
     purpose: 'GCP project; inferred automatically on Cloud Run, needed when running locally',
+  },
+  {
+    name: 'FIRESTORE_CACHE_DOC',
+    group: 'firestore-explicit',
+    required: true,
+    purpose:
+      'Firestore document path holding the MSAL token cache; the bootstrap CLI requires it rather than defaulting, so a local run cannot seed a document the deployed service does not read',
+    check: checkDocumentPath,
+  },
+  {
+    name: 'GOOGLE_CLOUD_PROJECT',
+    group: 'firestore-explicit',
+    required: true,
+    purpose:
+      'GCP project; the bootstrap CLI requires it rather than inferring, so a local run cannot seed the cache into whichever project Application Default Credentials point at',
   },
   {
     name: 'MCP_OAUTH_CLIENT_ID',
@@ -133,9 +164,11 @@ export function loadConfig(
   const missing: string[] = [];
   const invalid: string[] = [];
   const values = new Map<string, string>();
+  const purposes = new Map<string, string>();
 
   for (const spec of SPECS) {
     if (!wanted.has(spec.group)) continue;
+    purposes.set(spec.name, spec.purpose);
 
     const raw = env[spec.name];
     const trimmed = raw === undefined ? '' : raw.trim();
@@ -161,7 +194,7 @@ export function loadConfig(
   }
 
   if (missing.length > 0 || invalid.length > 0) {
-    throw new ConfigError(missing, invalid);
+    throw new ConfigError(missing, invalid, purposes);
   }
 
   const config: {
@@ -177,7 +210,9 @@ export function loadConfig(
       authority: required(values, 'ONENOTE_AUTHORITY'),
     };
   }
-  if (wanted.has('firestore')) {
+  if (wanted.has('firestore') || wanted.has('firestore-explicit')) {
+    // Both groups produce the same shape. They differ only in whether the two names are
+    // required, so asking for both at once is a caller error rather than a merge.
     config.firestore = {
       cacheDocumentPath: required(values, 'FIRESTORE_CACHE_DOC'),
       projectId: values.get('GOOGLE_CLOUD_PROJECT'),
@@ -218,15 +253,19 @@ function required(values: Map<string, string>, name: string): string {
   return value;
 }
 
-function formatConfigError(missing: string[], invalid: string[]): string {
-  // Deliberately does not say "the server did not start" — the bootstrap CLI (#9) uses
-  // this same error, and it is not a server.
+function formatConfigError(
+  missing: string[],
+  invalid: string[],
+  purposes: ReadonlyMap<string, string>,
+): string {
+  // Deliberately does not say "the server did not start" — the bootstrap CLI uses this
+  // same error, and it is not a server.
   const lines: string[] = ['Configuration error. Startup aborted.', ''];
 
   if (missing.length > 0) {
     lines.push(`Missing required environment variable${missing.length === 1 ? '' : 's'}:`);
     for (const name of missing) {
-      lines.push(`  ${name} — ${purposeOf(name)}`);
+      lines.push(`  ${name} — ${purposes.get(name) ?? 'no description available'}`);
     }
     lines.push('');
   }
@@ -241,10 +280,6 @@ function formatConfigError(missing: string[], invalid: string[]): string {
 
   lines.push('See the Configuration section of README.md.');
   return lines.join('\n');
-}
-
-function purposeOf(name: string): string {
-  return SPECS.find((spec) => spec.name === name)?.purpose ?? 'no description available';
 }
 
 function checkHttpsUrl(value: string): string | null {

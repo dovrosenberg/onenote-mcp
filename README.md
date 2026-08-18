@@ -49,8 +49,9 @@ document, whose path comes from `FIRESTORE_CACHE_DOC`. `beforeCacheAccess` reads
 document's `cache` field and hands the string to MSAL. `afterCacheAccess` writes the
 serialized cache back inside a Firestore transaction, and only when MSAL reports that the
 cache changed. A document that does not exist is read as an empty cache, which is the
-state before `npm run bootstrap` has been run. Nothing wires the plugin into a live MSAL
-client yet; that is issue #9 for the bootstrap CLI and issue #8 for the server.
+state before `npm run bootstrap` has been run. Both entrypoints use this same plugin:
+the bootstrap CLI writes the cache through it and the server reads through it, so there
+is one serializer and no second format to keep in step.
 
 `npm test` covers only `readCache`, the function that decodes a document snapshot. The
 two callbacks, the transaction, and `createFirestoreTokenCachePlugin` have no automated
@@ -91,9 +92,43 @@ carry no account identifier: `username` is the user's UPN and `homeAccountId` em
 tenant id, neither of which belongs in a log.
 
 `npm test` covers the acquisition logic through a fake client. `createGraphAuth` itself
-has no automated test: it needs a cache seeded by a real device-code sign-in, which
-arrives with issues #9 and #10. Nothing wires the module into `createApp` yet; the first
-consumer is the Graph structure client, issue #11.
+has no automated test: it needs a cache seeded by a real device-code sign-in, and no
+credential that could seed one may be committed. Run `npm run bootstrap` and then the
+server against the same document to exercise it. Nothing wires the module into
+`createApp` yet; the first consumer is the Graph structure client, issue #11.
+
+## Bootstrap
+
+`npm run bootstrap` is the only interactive Microsoft sign-in in the project, and it runs
+on your machine, not on Cloud Run. It signs in with the device-code flow and writes the
+resulting MSAL cache to the Firestore document the server reads.
+
+```bash
+gcloud auth application-default login
+
+ONENOTE_CLIENT_ID=00000000-0000-0000-0000-000000000000 \
+ONENOTE_AUTHORITY=https://login.microsoftonline.com/common \
+GOOGLE_CLOUD_PROJECT=your-project \
+FIRESTORE_CACHE_DOC=tokencache/msal \
+npm run bootstrap
+```
+
+It prints Microsoft's device-code message, waits for you to approve in a browser, then
+lists your notebooks once and prints the count as proof the token works. The closing
+lines name the Firestore project and document written and the account's home tenant, so
+you can see you signed into the right directory. That output carries the tenant id; keep
+it off issues, pull requests, and workflow logs.
+
+`GOOGLE_CLOUD_PROJECT` and `FIRESTORE_CACHE_DOC` are **required here**, unlike on the
+server where the first is inferred and the second defaults. The CLI writes with your own
+Application Default Credentials, so an unset value would seed a real document in
+whichever project your `gcloud` login points at, and still print a success line. The
+`MCP_OAUTH_*` values are not read, so running this never puts the Layer-1 client secret
+on your machine.
+
+Run it again whenever `GraphAuthError` appears in the server's logs. The refresh token is
+rotated on every use and dies if the service sits idle past roughly 90 days; there is no
+automatic recovery.
 
 ## Container
 
@@ -145,8 +180,8 @@ and the process exits 1 without a stack trace.
 | `MCP_OAUTH_CLIENT_ID` | yes | — | Layer-1 OAuth client ID that Claude presents |
 | `MCP_OAUTH_CLIENT_SECRET` | yes | — | Layer-1 OAuth client secret |
 | `MCP_TOKEN_SIGNING_KEY` | yes | — | Key used to sign issued access tokens (min 32 chars) |
-| `FIRESTORE_CACHE_DOC` | no | `tokencache/msal` | Firestore document path holding the MSAL token cache |
-| `GOOGLE_CLOUD_PROJECT` | no | — | GCP project; inferred automatically on Cloud Run, needed locally |
+| `FIRESTORE_CACHE_DOC` | server: no · bootstrap: **yes** | `tokencache/msal` | Firestore document path holding the MSAL token cache |
+| `GOOGLE_CLOUD_PROJECT` | server: no · bootstrap: **yes** | — | GCP project; inferred automatically on Cloud Run |
 | `PORT` | no | `8080` | Bind port. Cloud Run sets this; the server never hardcodes one. |
 
 `FIRESTORE_CACHE_DOC` names the document the MSAL cache plugin in `src/token-cache.ts`
@@ -158,8 +193,9 @@ slash-separated segments; `loadConfig` rejects a collection path at startup.
 no Layer-2 client secret; the `MCP_OAUTH_*` values below it belong to Layer 1, between
 Claude and this server, and are unrelated.
 
-`npm run bootstrap` needs only `ONENOTE_CLIENT_ID`, `ONENOTE_AUTHORITY`,
-`FIRESTORE_CACHE_DOC`, and `GOOGLE_CLOUD_PROJECT` — not the `MCP_OAUTH_*` values.
+`npm run bootstrap` reads only `ONENOTE_CLIENT_ID`, `ONENOTE_AUTHORITY`,
+`FIRESTORE_CACHE_DOC`, and `GOOGLE_CLOUD_PROJECT` — not the `MCP_OAUTH_*` values — and it
+requires the last two rather than defaulting them. See [Bootstrap](#bootstrap).
 
 ## Repository hygiene
 
