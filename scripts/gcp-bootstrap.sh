@@ -26,7 +26,7 @@ set -euo pipefail
 # must be a valid Firestore location name (e.g. us-central1, europe-west1,
 # nam5). Firestore locations are a subset of Cloud Run regions.
 # ---------------------------------------------------------------------------
-PROJECT="${PROJECT:-}"
+PROJECT="${PROJECT:-onenote-mcp-505918}"
 REGION="${REGION:-us-central1}"
 GAR_REGION="${GAR_REGION:-us-central1}"
 SERVICE="${SERVICE:-onenote-mcp}"
