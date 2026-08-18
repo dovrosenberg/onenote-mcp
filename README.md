@@ -42,6 +42,30 @@ compiler options enforce this.
 See [`CLAUDE.md`](./CLAUDE.md) for the directory layout and the conventions that go with
 it.
 
+## Token cache
+
+`src/token-cache.ts` implements MSAL's `ICachePlugin` against a single Firestore
+document, whose path comes from `FIRESTORE_CACHE_DOC`. `beforeCacheAccess` reads the
+document's `cache` field and hands the string to MSAL. `afterCacheAccess` writes the
+serialized cache back inside a Firestore transaction, and only when MSAL reports that the
+cache changed. A document that does not exist is read as an empty cache, which is the
+state before `npm run bootstrap` has been run. Nothing wires the plugin into a live MSAL
+client yet; that is issue #9 for the bootstrap CLI and issue #12 for the server.
+
+`npm test` covers only `readCache`, the function that decodes a document snapshot. The
+two callbacks, the transaction, and `createFirestoreTokenCachePlugin` are checked by hand
+against the Firestore emulator, following the "Manual verification procedure" section of
+[`docs/plans/7-firestore-msal-cache.md`](./docs/plans/7-firestore-msal-cache.md). That
+procedure needs `java` on `PATH` and the emulator installed:
+
+```bash
+sudo apt-get install google-cloud-cli-firestore-emulator
+```
+
+`gcloud components install cloud-firestore-emulator` does not install it on a
+Debian-packaged Google Cloud CLI. The component manager is disabled in that build, and
+`gcloud` prints the `apt-get` command above in its place.
+
 ## Container
 
 The service deploys to Cloud Run, which runs `linux/amd64`. The image is built for that
@@ -95,6 +119,10 @@ and the process exits 1 without a stack trace.
 | `FIRESTORE_CACHE_DOC` | no | `tokencache/msal` | Firestore document path holding the MSAL token cache |
 | `GOOGLE_CLOUD_PROJECT` | no | — | GCP project; inferred automatically on Cloud Run, needed locally |
 | `PORT` | no | `8080` | Bind port. Cloud Run sets this; the server never hardcodes one. |
+
+`FIRESTORE_CACHE_DOC` names the document the MSAL cache plugin in `src/token-cache.ts`
+reads and writes. Its value must be a document path, meaning an even number of
+slash-separated segments; `loadConfig` rejects a collection path at startup.
 
 `npm run bootstrap` needs only `ONENOTE_CLIENT_ID`, `ONENOTE_AUTHORITY`,
 `FIRESTORE_CACHE_DOC`, and `GOOGLE_CLOUD_PROJECT` — not the `MCP_OAUTH_*` values.

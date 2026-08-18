@@ -25,11 +25,13 @@ onenote-mcp/
 │   ├── server.ts              # builds the Express app; does not listen
 │   ├── config.ts              # env-var schema, grouped validation, ConfigError
 │   ├── bootstrap.ts           # device-code CLI that seeds the Firestore token cache (placeholder, issue #9)
+│   ├── token-cache.ts         # Firestore-backed MSAL ICachePlugin (issue #7)
 │   └── version.ts             # SERVICE_NAME, VERSION
 │
 ├── test/                      # node --test suites; test/<name>.test.ts covers src/<name>.ts
 │   ├── config.test.ts
 │   ├── server.test.ts
+│   ├── token-cache.test.ts    # covers readCache only; see the note below
 │   └── version.test.ts
 │
 ├── docs/
@@ -51,6 +53,20 @@ A test file is named for the source file it covers: `test/config.test.ts` covers
 whose behaviour is process exit codes and stderr, so it is verified by running it rather
 than by a unit test — the commands are in the Final Verification section of
 `docs/plans/5-repo-skeleton.md`. `src/bootstrap.ts` is a placeholder until issue #9.
+
+`test/token-cache.test.ts` covers `readCache` and nothing else. `readCache` is a pure
+function over a document snapshot, so it runs without a backend. `beforeCacheAccess`,
+`afterCacheAccess`, the transaction inside `afterCacheAccess`, and
+`createFirestoreTokenCachePlugin` have no automated test at all. They need a Firestore
+backend, and the emulator is not installed here. Installing it takes `sudo apt-get
+install google-cloud-cli-firestore-emulator`, because this machine's `gcloud` is the
+Debian package and its component manager is disabled, so `gcloud components install
+cloud-firestore-emulator` is refused. What stands in for those tests is the "Manual
+verification procedure" section of `docs/plans/7-firestore-msal-cache.md`, which the
+operator runs on a machine that has the emulator. Do not close the gap by adding an
+in-memory Firestore fake: the behaviour at stake is transaction retry under contention
+and `FieldValue.serverTimestamp()`, and a fake would assert the fake's behaviour rather
+than Firestore's.
 
 `scripts/test/` is deliberately separate from `test/`: those are bash tests driven by
 `scripts/test/run.sh`. `npm test` does not run them. `bootstrap.test.sh` exercises
@@ -134,6 +150,19 @@ both — that the `.node` binary is present and that `node_modules/typescript` i
 context by default rather than silently dropped. The entries that mirror `.gitignore`
 (`.env*`, `*.token-cache.json`, `.msal-cache*`) are there so a local operator's
 credentials cannot reach an image layer.
+
+**The token cache is one opaque string in one document.** `FirestoreTokenCachePlugin`
+stores the output of MSAL's `serialize()` verbatim in the document's `cache` field,
+alongside an `updatedAt` server timestamp. Do not parse that blob and do not split it
+across documents. MSAL owns its structure and changes it between library versions.
+
+**`afterCacheAccess` re-reads inside the transaction.** `--max-instances=1` does not
+prevent two instances existing during a revision transition. The transaction re-reads the
+document, and a stored blob differing from the one this instance last saw is fed back
+through `context.tokenCache.deserialize` before `serialize()` is called, because MSAL's
+`deserialize` merges into the in-memory cache rather than replacing it. Removing the
+re-read turns an overlap into a lost refresh token, and the cache stays unusable until
+`npm run bootstrap` is run again.
 
 ## Repository hygiene
 

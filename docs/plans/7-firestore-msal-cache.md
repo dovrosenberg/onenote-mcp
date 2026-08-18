@@ -9,7 +9,7 @@
 | Phase | Status | Commit |
 |-------|--------|--------|
 | Phase 1: `src/token-cache.ts` — plugin, factory, pure-function unit tests | ☑ | this commit |
-| Phase 2: Documentation — `README.md`, `CLAUDE.md` | ☐ | — |
+| Phase 2: Documentation — `README.md`, `CLAUDE.md` | ☑ | this commit |
 
 ## Acceptance Criteria
 
