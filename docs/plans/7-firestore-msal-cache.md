@@ -9,8 +9,7 @@
 | Phase | Status | Commit |
 |-------|--------|--------|
 | Phase 1: `src/token-cache.ts` — plugin, factory, pure-function unit tests | ☑ | this commit |
-| Phase 2: Emulator-backed tests (round-trip, concurrency) | ☐ | — |
-| Phase 3: Documentation — `README.md`, `CLAUDE.md` | ☐ | — |
+| Phase 2: Documentation — `README.md`, `CLAUDE.md` | ☐ | — |
 
 ## Acceptance Criteria
 
@@ -21,9 +20,9 @@
 - **AC-3:** Wrap the read-modify-write in a Firestore transaction.
 - **AC-4:** Store the serialized cache as a single string field plus an `updatedAt` timestamp. Do not model MSAL's internal structure.
 - **AC-5:** Handle "document does not exist" as an empty cache, not an error — that is the pre-bootstrap state.
-- **AC-6:** Unit tests against the Firestore emulator, including a concurrent-write test that proves the transaction serialises. ⚠️ Deviation: the emulator is not installed in this environment and cannot be installed by the agent. `gcloud` here is the Debian package build with its component manager disabled — `gcloud components install cloud-firestore-emulator` fails with "You cannot perform this action because the Google Cloud CLI component manager is disabled", directing the operator to `sudo apt-get install google-cloud-cli-firestore-emulator`. The tests are written and committed; they skip with a printed reason when `FIRESTORE_EMULATOR_HOST` is unset, and are run manually by the operator against an emulator they start themselves. No substitute Firestore is built.
-- **AC-7:** A test writes a cache, reads it back through a second plugin instance, and gets byte-identical content.
-- **AC-8:** A concurrent-write test produces one coherent final document rather than a partial merge.
+- **AC-6:** Unit tests against the Firestore emulator, including a concurrent-write test that proves the transaction serialises. ⚠️ Deviation: **no emulator-dependent test is committed.** The emulator is not installed here and cannot be installed by the agent — `gcloud` is the Debian package build with its component manager disabled, so `gcloud components install cloud-firestore-emulator` is refused and directs the operator to `sudo apt-get install google-cloud-cli-firestore-emulator`. Committing tests that cannot run in this environment, and that no one has watched pass, buys nothing. Instead: the decoder is unit-tested (Phase 1), and the Firestore-touching behaviour is verified by the operator running the manual procedure documented below. No substitute Firestore is built either.
+- **AC-7:** A test writes a cache, reads it back through a second plugin instance, and gets byte-identical content. ⚠️ Deviation: same as AC-6 — verified by step 2 of the manual procedure, not by a committed test.
+- **AC-8:** A concurrent-write test produces one coherent final document rather than a partial merge. ⚠️ Deviation: same as AC-6 — verified by steps 3 and 4 of the manual procedure, not by a committed test.
 
 ## Context
 
@@ -69,7 +68,7 @@ Findings from checking the issue against the current repository and the installe
 
 **Scope excess — none.** No AC duplicates existing functionality or contradicts a project convention.
 
-**No substitute Firestore.** An earlier draft of this plan proposed an in-memory `FirestoreLike` fake so the plugin's behaviour could be asserted without the emulator, which in turn required the plugin to accept a narrow structural interface instead of a `Firestore`. That is cut. The plugin takes a real `Firestore`. Everything that needs a backend is verified by the emulator tests in Phase 2, run manually. What remains automated in Phase 1 is the one piece that needs no backend at all: the pure function that decodes a document snapshot.
+**No substitute Firestore, and no unrunnable tests.** An earlier draft of this plan proposed an in-memory `FirestoreLike` fake so the plugin's behaviour could be asserted without the emulator, which in turn required the plugin to accept a narrow structural interface instead of a `Firestore`. A later draft dropped the fake but still committed an emulator-gated test file that self-skipped when `FIRESTORE_EMULATOR_HOST` was unset. Both are cut. The plugin takes a real `Firestore`, and the repository commits no test that needs a backend. What is automated is the pure decoder; what needs Firestore is a written manual procedure the operator runs once, with its output recorded in Findings.
 
 **Deliberately out of scope.** Nothing wires the plugin into a running MSAL client in this issue. The bootstrap CLI that first populates the document is issue #9; the Graph client that refreshes through it is issue #12. `src/index.ts`, `src/server.ts`, and `src/bootstrap.ts` are not modified.
 
@@ -185,7 +184,7 @@ Nothing else. No parsing of the blob, no per-entity documents, no schema version
 - `a non-string cache field throws TokenCacheError` — scope gap 1; checks `cache: 42`, `cache: null`, and a document with no `cache` field, and asserts the message contains the document path it was given.
 - `extra fields on the document are ignored` — AC-4; a document carrying `cache`, `updatedAt`, and an unknown field still decodes.
 
-`beforeCacheAccess`, `afterCacheAccess`, the transaction, and the factory are not unit-tested here — they need a backend. They are covered by Phase 2's emulator tests, run manually.
+`beforeCacheAccess`, `afterCacheAccess`, the transaction, and the factory are not unit-tested — they need a backend, and this repository commits no test that needs one. They are covered by the manual verification procedure below.
 
 **Verification:**
 - [ ] `npm test` passes
@@ -193,62 +192,10 @@ Nothing else. No parsing of the blob, no per-entity documents, no schema version
 - [ ] `grep -n "as any\|@ts-expect-error\|@ts-ignore" src/token-cache.ts` returns nothing
 - [ ] `npm run build` emits `dist/token-cache.js`
 
-## Phase 2: Emulator-backed tests
+## Phase 2: Documentation
 
-**Goal:** Exercise the plugin against real Firestore: byte-identical round-trip through a second instance, and concurrent writers producing one coherent document.
+**Goal:** Record the new module, state plainly that its Firestore-touching half has no automated coverage, and give the operator the exact manual procedure that stands in for it.
 **Addresses:** AC-6, AC-7, AC-8
-
-**Files:**
-- Create: `test/token-cache.emulator.test.ts`
-
-**Steps:**
-
-1. The emulator is started by hand. There is no wrapper script and no npm script — two terminals, documented in Phase 3:
-
-   ```bash
-   # terminal 1 — needs: sudo apt-get install google-cloud-cli-firestore-emulator
-   gcloud emulators firestore start --host-port=127.0.0.1:8081
-
-   # terminal 2
-   FIRESTORE_EMULATOR_HOST=127.0.0.1:8081 GOOGLE_CLOUD_PROJECT=onenote-mcp-emulator npm test
-   ```
-
-   `GOOGLE_CLOUD_PROJECT` is required: the client needs a project id and must not fall through to a metadata-server lookup.
-
-2. Write `test/token-cache.emulator.test.ts`. The `npm test` glob (`test/**/*.test.ts`) picks the file up unconditionally, so it gates itself: read `process.env['FIRESTORE_EMULATOR_HOST']` once at module scope and pass `{skip: 'FIRESTORE_EMULATOR_HOST is not set — see README, Token cache tests'}` to every `test()` when it is absent. `node --test` prints the skip reason, so a run that checks nothing says so instead of reporting a pass.
-
-3. Fixtures live at the top of this one file, not in a shared helpers directory:
-   - `sampleCache(accountId: string): string` — a JSON blob shaped like MSAL's serialized cache (`Account`, `IdToken`, `AccessToken`, `RefreshToken`, `AppMetadata` top-level objects) keyed by `accountId`, with fabricated GUIDs and the fake tenant `00000000-0000-0000-0000-000000000000`. No real tenant, no real token, per the repo hygiene rules.
-   - `class TestTokenCache implements ISerializableTokenCache` — roughly fifteen lines: `serialize()` returns the current blob, `deserialize(blob)` merges one level deep (for each top-level key, `{...existing[key], ...incoming[key]}`), mirroring MSAL's `mergeState`. This stands in for MSAL's own `TokenCache` so a test can make a change without acquiring a token. The real `TokenCache` is exercised by the `PublicClientApplication` test below.
-   - Contexts are `new TokenCacheContext(cache, hasChanged)`, imported from `@azure/msal-node`.
-
-4. Each test uses its own document path — `` `emulator-${randomUUID()}/msal` `` from `node:crypto` — so tests never share state. An `after()` hook deletes the documents the file created, so a long-lived emulator does not accumulate them.
-
-5. Build the plugin through `createFirestoreTokenCachePlugin({cacheDocumentPath, projectId: 'onenote-mcp-emulator'})`, so the factory is covered rather than only the class.
-
-6. Note for the implementer: `new PublicClientApplication({auth: {clientId, authority}, cache: {cachePlugin}})` followed by `getTokenCache().getAllAccounts()` is expected to be offline — authority metadata is resolved on token acquisition, not on cache access. Verify that when writing the test. If it does attempt a network call, drop that one test and record the finding in the Findings section; the remaining tests still cover AC-6, AC-7, and AC-8.
-
-**Tests added/updated** (`test/token-cache.emulator.test.ts`):
-
-- `an absent document reads as an empty cache against real Firestore` — AC-5, AC-6; confirms a `get()` on a missing document resolves with `exists === false` rather than rejecting, which is what Phase 1's decoder assumes.
-- `a cache written by one instance is byte-identical when read by a second` — AC-7; instance A writes `sampleCache('acct-1')`; a freshly constructed instance B calls `beforeCacheAccess`; `assert.equal(bCache.state, aBlob)` on the exact string, plus a `Buffer.byteLength` comparison.
-- `afterCacheAccess writes nothing when cacheHasChanged is false` — AC-2; read the document's `updatedAt` before and after, assert it is unchanged and the document is still absent when it started absent.
-- `the stored document has exactly cache and updatedAt, and updatedAt is a Timestamp` — AC-4; `Object.keys(data()).sort()` deep-equals `['cache', 'updatedAt']`, `data().updatedAt instanceof Timestamp`, and `toMillis()` is within 60s of `Date.now()`.
-- `MSAL itself drives the plugin end to end` — AC-1, AC-6; seed the document with a fabricated blob containing one `Account` entry, construct a `PublicClientApplication` with `cache: {cachePlugin}`, assert `getAllAccounts()` returns that account, then `removeAccount()` it and assert the document's `cache` field no longer contains the account id and `updatedAt` advanced.
-- `two overlapping instances both survive: neither write is lost` — AC-3, AC-8; A and B both `beforeCacheAccess` on the same empty document, A adds account `acct-a` and commits, B adds `acct-b` and commits; the final document parses as valid JSON in one piece and contains both ids under `Account`.
-- `five concurrent writers produce one coherent document` — AC-8; five plugin instances seeded from the same starting blob, all five `afterCacheAccess` calls started together and awaited with `Promise.all`; the final `cache` field parses and contains all five account ids. Firestore aborts and retries the losers, and the callback's re-read is what folds each retry's view forward.
-- `a document holding a non-string cache field fails loudly` — scope gap 1 on the real backend; seed `{cache: 42}` directly through the client and assert `beforeCacheAccess` rejects with `TokenCacheError`.
-
-**Verification:**
-- [ ] `npm test` with no emulator running: passes, and the emulator tests report as skipped with their reason — not as passes
-- [ ] `npm run typecheck` passes
-- [ ] Manual run with the emulator started as in step 1: every test in `test/token-cache.emulator.test.ts` passes, and the output is pasted into the Findings section of this plan as the record that AC-6, AC-7, and AC-8 were actually exercised
-- [ ] During the manual run, `updatedAt` on the document written by the round-trip test is a real server timestamp, confirmed by reading the document back through the client
-
-## Phase 3: Documentation
-
-**Goal:** Record the new module and the exact commands for the manual emulator run, so the next agent and the next operator do not have to rediscover them.
-**Addresses:** AC-6
 
 **Files:**
 - Modify: `CLAUDE.md`
@@ -256,44 +203,86 @@ Nothing else. No parsing of the blob, no per-entity documents, no schema version
 
 **Steps:**
 
-1. `CLAUDE.md` directory tree: add `src/token-cache.ts` with the comment `# Firestore-backed MSAL ICachePlugin (issue #7)`, plus `test/token-cache.test.ts` and `test/token-cache.emulator.test.ts`.
-2. `CLAUDE.md` prose under the tree: state that `test/token-cache.emulator.test.ts` skips itself with a printed reason unless `FIRESTORE_EMULATOR_HOST` is set, that the emulator is started by hand rather than by a wrapper script, and that the plugin's Firestore-touching behaviour has no automated coverage without it — the same "explicit skip, never silent" rule as `RUN_DOCKER_TESTS`.
+1. `CLAUDE.md` directory tree: add `src/token-cache.ts` with the comment `# Firestore-backed MSAL ICachePlugin (issue #7)` and `test/token-cache.test.ts`.
+2. `CLAUDE.md` prose under the tree: one paragraph stating that `test/token-cache.test.ts` covers only `readCache`, the pure decoder, and that `beforeCacheAccess`, `afterCacheAccess`, the transaction, and `createFirestoreTokenCachePlugin` have no automated test because the Firestore emulator is not installable here. Point at the manual procedure section of this plan by path. Say explicitly that a future agent must not add an in-memory Firestore fake to close that gap — it would assert the fake's behaviour, not Firestore's.
 3. `CLAUDE.md` Conventions: add two entries, each stating the mechanism then the consequence.
    - **The token cache is one opaque string in one document.** The plugin stores `serialize()`'s output verbatim in `cache` plus an `updatedAt` server timestamp. Do not parse the blob or split it across documents; MSAL owns its shape and it changes between library versions.
    - **`afterCacheAccess` re-reads inside the transaction.** `--max-instances=1` does not prevent two instances existing during a revision transition. The transaction re-reads the document, and a blob differing from the one this instance last saw is fed back through `deserialize` before serialising, because MSAL's deserialize merges. Removing the re-read turns an overlap into a lost refresh token, which wedges the cache until bootstrap is re-run.
-4. `README.md`, a short subsection after the Scripts table titled "Token cache tests": the two commands from Phase 2 step 1 verbatim, the `sudo apt-get install google-cloud-cli-firestore-emulator` prerequisite and why `gcloud components install` will not work here, the fact that `java` must be on `PATH`, and that without the emulator those tests skip with a printed reason rather than failing.
+4. `README.md`, a short subsection after the Scripts table titled "Token cache": what `src/token-cache.ts` is, the fact that `npm test` covers only its decoder, and that the rest is checked by hand against an emulator — with the `sudo apt-get install google-cloud-cli-firestore-emulator` prerequisite, why `gcloud components install` does not work on the Debian-packaged CLI, and that `java` must be on `PATH`.
 5. `README.md` Configuration section: no table change — both variables are already documented at `README.md:95` and `README.md:96`. Add one sentence stating that `FIRESTORE_CACHE_DOC` is the document the MSAL cache plugin reads and writes, and that its value must be a document path (even segment count), which `loadConfig` enforces.
 
 **Tests added/updated:**
-- None. This phase changes only Markdown; the behaviour it describes is covered by Phases 1 and 2. Documentation accuracy is checked in verification below by running the commands the docs name.
+- None. This phase changes only Markdown. The behaviour it describes is covered by Phase 1's unit tests and by the manual procedure below.
 
 **Verification:**
 - [ ] `npm run typecheck` passes
 - [ ] `npm test` passes
 - [ ] Every path named in `CLAUDE.md`'s tree exists
-- [ ] The two commands in the README's "Token cache tests" subsection are copy-pasted and run during the Phase 2 manual verification, unedited
+- [ ] The README's stated prerequisite command is the one that actually appears in `gcloud components install`'s refusal message
+
+## Manual verification procedure
+
+This is what stands in for AC-6, AC-7, and AC-8. It is run by the operator, once, on a machine with the emulator installed. Its output goes into Findings.
+
+**Prerequisites:** `sudo apt-get install google-cloud-cli-firestore-emulator` and `java` on `PATH`. `gcloud components install cloud-firestore-emulator` will not work — this is the Debian-packaged CLI and its component manager is disabled.
+
+**Setup.** In one terminal:
+
+```bash
+gcloud emulators firestore start --host-port=127.0.0.1:8081
+```
+
+In a second terminal, write a throwaway script under the scratchpad — not in the repository, it is not committed:
+
+```bash
+export FIRESTORE_EMULATOR_HOST=127.0.0.1:8081
+export GOOGLE_CLOUD_PROJECT=onenote-mcp-emulator   # the client needs a project id and
+                                                   # must not fall through to the
+                                                   # metadata server
+```
+
+The script imports `createFirestoreTokenCachePlugin` and `FirestoreTokenCachePlugin` from `src/token-cache.ts`, uses `TokenCacheContext` from `@azure/msal-node`, and drives them with a fifteen-line `ISerializableTokenCache` stand-in whose `deserialize` merges one level deep (mirroring MSAL's `mergeState`) so a change can be made without acquiring a real token. Every cache blob is fabricated: fake account ids, the fake tenant `00000000-0000-0000-0000-000000000000`, no real tokens.
+
+**Step 1 — absent document reads as empty (AC-5 against a real backend).** Point a plugin at a document path that does not exist and call `beforeCacheAccess`. It must resolve without throwing and leave the in-memory cache empty. This is the pre-bootstrap state; a `get()` on a missing document resolves with `exists === false` rather than rejecting, which is the assumption Phase 1's decoder is built on.
+
+**Step 2 — byte-identical round-trip (AC-7).** Instance A writes a fabricated blob through `afterCacheAccess` with `cacheHasChanged` true. A separately constructed instance B, pointed at the same path, calls `beforeCacheAccess`. Assert the string B received is `===` to the string A wrote, and that `Buffer.byteLength` matches on both. Then read the raw document through the client and assert `Object.keys(data()).sort()` is `['cache', 'updatedAt']`, that `updatedAt` is a `Timestamp`, and that `toMillis()` is within 60s of now (AC-4).
+
+**Step 3 — two overlapping instances, neither write lost (AC-3, AC-8).** A and B both `beforeCacheAccess` on the same empty document. A adds account `acct-a` and commits. B, which still holds the pre-A view, adds `acct-b` and commits. The final `cache` field must parse as valid JSON in one piece and contain both `acct-a` and `acct-b` under `Account`. If B's write had been a blind overwrite, `acct-a` would be gone — that is the lost refresh token this whole design exists to prevent.
+
+**Step 4 — five concurrent writers, one coherent document (AC-8).** Five plugin instances seeded from the same starting blob, all five `afterCacheAccess` calls started together and awaited with `Promise.all`. The final `cache` field must parse and contain all five account ids. Firestore aborts and retries the losers; the re-read inside the transaction callback is what folds each retry's view forward.
+
+**Step 5 — `cacheHasChanged` false writes nothing (AC-2).** Call `afterCacheAccess` with a context constructed as `new TokenCacheContext(cache, false)` against an absent document. The document must still be absent afterwards.
+
+**Step 6 — malformed document fails loudly (scope gap 1).** Write `{cache: 42}` directly through the client, then call `beforeCacheAccess`. It must reject with `TokenCacheError` and the message must name the document path.
+
+**Step 7 — MSAL drives it end to end (AC-1, AC-6).** Seed the document with a fabricated blob holding one `Account` entry. Construct `new PublicClientApplication({auth: {clientId, authority}, cache: {cachePlugin}})` with a fake client id and `https://login.microsoftonline.com/common`, then call `getTokenCache().getAllAccounts()` and assert it returns that account. Then `removeAccount()` it and assert the document's `cache` field no longer contains the account id and `updatedAt` advanced. This is expected to be offline — authority metadata is resolved on token acquisition, not on cache access. If it turns out to make a network call, record that in Findings; steps 1 through 6 still cover the plugin.
+
+**Cleanup.** Stop the emulator. Its data is in-memory and disappears with the process; nothing to delete. Delete the throwaway script.
+
+**Recording.** Paste the script's output into the Findings section of this plan and tick the manual box in Final Verification. An untouched Findings section means AC-6, AC-7, and AC-8 are unverified, and the plan should not be treated as complete.
 
 ## Final Verification
 
-- [ ] `npm test` passes with no emulator present; the emulator tests report as skipped with their reason
+- [ ] `npm test` passes; no test is skipped, because no committed test needs a backend
 - [ ] `npm run typecheck` passes
 - [ ] `npm run build` succeeds and `dist/token-cache.js` exists
 - [ ] `bash scripts/test/run.sh` passes (unchanged by this issue, run to prove it was not broken)
-- [ ] Manual emulator run completed and its output recorded in Findings
-- [ ] `git grep -n -i "onmicrosoft\|tenant" src/ test/` finds no real tenant name or id; every fixture GUID is fabricated
+- [ ] `git ls-files test/ | xargs grep -ln "FIRESTORE_EMULATOR_HOST"` returns nothing — no committed test depends on an emulator
+- [ ] Manual verification procedure completed by the operator and its output recorded in Findings. Until this box is ticked, AC-6, AC-7, and AC-8 are unverified.
+- [ ] `git grep -n -i "onmicrosoft\|tenant" src/ test/` finds no real tenant name or id
 - [ ] Acceptance criteria traceability:
-  - AC-1 (`ICachePlugin` against one document, path from `FIRESTORE_CACHE_DOC`): Phase 1 — `FirestoreTokenCachePlugin` implements both callbacks against the injected path, and `createFirestoreTokenCachePlugin` takes the path from `FirestoreConfig.cacheDocumentPath`, whose default `tokencache/msal` lives in `src/config.ts:50`. Exercised by `MSAL itself drives the plugin end to end` (Phase 2).
-  - AC-2 (write only when `cacheHasChanged`): Phase 1 — the early return in `afterCacheAccess`; verified by `afterCacheAccess writes nothing when cacheHasChanged is false` (Phase 2).
-  - AC-3 (transactional read-modify-write): Phase 1 — the `runTransaction` body with its re-read and merge; verified by `two overlapping instances both survive` (Phase 2).
-  - AC-4 (single string field plus `updatedAt`, no modelling of MSAL internals): Phase 1 — the two-field `tx.set` and the opaque-blob decoder, unit-tested by `extra fields on the document are ignored`; verified on a real backend by `the stored document has exactly cache and updatedAt` (Phase 2).
-  - AC-5 (absent document is an empty cache): Phase 1 — `readCache` returns `null` for a missing document, unit-tested by `an absent document reads as an empty cache`; repeated against real Firestore in Phase 2.
-  - AC-6 (emulator-backed tests including concurrency): Phase 2 — `test/token-cache.emulator.test.ts`, documented in Phase 3. Deviation recorded above: the emulator cannot be installed by the agent, so the tests are committed but run manually, and no substitute Firestore is built.
-  - AC-7 (byte-identical round-trip through a second instance): Phase 2 — `a cache written by one instance is byte-identical when read by a second`.
-  - AC-8 (concurrent writes produce one coherent document): Phase 2 — `two overlapping instances both survive` and `five concurrent writers produce one coherent document`.
+  - AC-1 (`ICachePlugin` against one document, path from `FIRESTORE_CACHE_DOC`): Phase 1 — `FirestoreTokenCachePlugin` implements both callbacks against the path given to the constructor, and `createFirestoreTokenCachePlugin` takes that path from `FirestoreConfig.cacheDocumentPath`, whose default `tokencache/msal` lives in `src/config.ts:50`. Exercised end to end by manual step 7.
+  - AC-2 (write only when `cacheHasChanged`): Phase 1 — the early return at the top of `afterCacheAccess`. Verified by manual step 5.
+  - AC-3 (transactional read-modify-write): Phase 1 — the `runTransaction` body with its re-read and conditional `deserialize`. Verified by manual step 3.
+  - AC-4 (single string field plus `updatedAt`, no modelling of MSAL internals): Phase 1 — the two-field `tx.set` and a decoder that never parses the blob; unit-tested by `extra fields on the document are ignored`. The server timestamp resolving to a real `Timestamp` is verified by manual step 2.
+  - AC-5 (absent document is an empty cache): Phase 1 — `readCache` returns `null` for a missing document, unit-tested by `an absent document reads as an empty cache`. Confirmed against a real backend by manual step 1.
+  - AC-6 (emulator-backed tests including concurrency): manual procedure, documented in Phase 2. Deviation recorded above — the emulator cannot be installed by the agent, so no emulator-dependent test is committed and no substitute Firestore is built.
+  - AC-7 (byte-identical round-trip through a second instance): manual step 2.
+  - AC-8 (concurrent writes produce one coherent document): manual steps 3 and 4.
 
 ## Findings
 
-> Filled in during implementation: what the work revealed that planning missed, and the pasted output of the manual emulator run.
+> Filled in during implementation: what the work revealed that planning missed, and the pasted output of the manual verification procedure.
 
 ### Phase 1
 
