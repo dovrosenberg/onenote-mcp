@@ -169,11 +169,39 @@ the alignment is arithmetic, not guesswork.
   array of actions targeting elements on the page — not a simple text
   append. Appending to the body means targeting the `body` element with
   action `append`. This is the least intuitive part of the Graph OneNote
-  API; get it right early.
-- `update_page_title` should use the same PATCH mechanism with `target:
-  "title"` and action `replace`. Verify this against current Graph docs
-  before building — title as a PATCH target is documented, but confirm the
-  exact action/content shape it expects.
+  API; get it right early. The three request bodies below were confirmed
+  against the live service on 2026-08-18 (issue #17). The full measured
+  behaviour, including every error code, is in `api-overview.md` under
+  **Writing page content**.
+
+  ```jsonc
+  // append_to_page
+  [{ "target": "body", "action": "append", "content": "<p>appended</p>" }]
+
+  // update_page_title
+  [{ "target": "title", "action": "replace", "content": "New title" }]
+
+  // insert above or below a known element (issue #27)
+  [{ "target": "#beta", "action": "insert", "position": "before", "content": "<p>above</p>" }]
+  ```
+
+- `update_page_title` is `target: "title"`, `action: "replace"`, and the
+  content string becomes the title verbatim. Nothing in it is parsed:
+  `<p>x</p>` produces a title that reads `<p>x</p>`, and `&`, `<` and `"`
+  survive unescaped. No other action works on the title — `append` is 400
+  with code `20141` — and the target must be written `title`, never
+  `#title`.
+- **`target: "body"` is the first top-level div, which on a real page is the
+  first outline and not the page.** Pages authored in the OneNote client
+  have several sibling top-level divs; a `body` append lands at the end of
+  the first one, so `append_to_page` appends to the first outline. Writing
+  anywhere else means reading `?includeIDs=true` and targeting that div's
+  generated id. Generated ids change on every update, so they must be read
+  in the same operation that uses them.
+- **One bad change rejects the whole array.** A request holding a valid
+  change and one naming a missing target returned 400 and applied neither.
+  A multi-change PATCH is therefore all-or-nothing, which is what a tool
+  wanting title-plus-body in one call should rely on.
 - Writes must not clobber existing content, **including ink**. Verify on a
   test page that appending to a page containing handwriting leaves the
   handwriting intact. This is the single most important thing to test.
@@ -405,17 +433,23 @@ Layer 2 is already validated (Appendix A). Layer 1 is new work.
 
 ## Open questions to resolve during build
 
-- **Insert at top of page**: `append_to_page` only appends to the end. A
-  caller wanting to put a block *above* existing content will need
-  something else. Graph's PATCH actions include positional targeting
-  (`before`/`after` relative to an element), so a `prepend_to_page` or a
-  `position` parameter may be straightforward — or may require rewriting
-  full page content. Worth settling before the tool surface is locked in.
 - **Multi-page reads**: if callers routinely need several pages at once, a
   batch variant of `get_page_content` may be worth adding rather than
   making N calls.
-- **`update_page_title` mechanics**: confirm the exact PATCH shape Graph
-  expects for the title target (see writing notes above).
+
+Settled by the spike in issue #17, on 2026-08-18:
+
+- **Insert at top of page** — supported, and cheap. `action: "prepend"` on
+  `target: "body"` puts a block above existing content, and
+  `action: "append"` with `"position": "before"` does the same thing. Both
+  returned 204. Positional targeting relative to a named element also works:
+  `action: "insert"` with `"position": "before"` or `"after"` against a
+  `#{data-id}`. Nothing has to rewrite full page content. A `position`
+  parameter on `append_to_page` is the straightforward shape.
+- **`update_page_title` mechanics** — settled; see the writing notes above.
+- **Ink and writes** — still open. Whether a PATCH preserves handwriting was
+  not tested, because it needs a page carrying real strokes and the spike
+  wrote only to throwaway pages. Issue #19 is that test.
 
 ---
 
