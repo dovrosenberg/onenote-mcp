@@ -7,64 +7,11 @@ design document — read the relevant section of it before changing behaviour.
 
 ```
 onenote-mcp/
-├── CLAUDE.md                  # this file
-├── README.md                  # human-facing: quick start, scripts, config table
-├── project-spec.md            # authoritative design doc — ink pipeline, OAuth layers, deploy model
-├── LICENSE
-│
-├── package.json               # ESM, Node >= 24
-├── package-lock.json          # committed; `npm ci` depends on it
-├── tsconfig.json              # editor + `npm run typecheck`: src/ AND test/, noEmit
-├── tsconfig.build.json        # `npm run build`: src/ only, emits to dist/
-│
-├── Dockerfile                 # multi-stage; runtime is node:24-slim with prod deps only (issue #6)
-├── .dockerignore              # denylist for the build context; keeps host node_modules and dist out
-│
-├── src/                       # TypeScript source, the only thing that ships
-│   ├── index.ts               # server entrypoint: validate config, bind $PORT, listen
-│   ├── server.ts              # builds the Express app; does not listen
-│   ├── config.ts              # env-var schema, grouped validation, ConfigError
-│   ├── bootstrap.ts           # device-code CLI that seeds the Firestore token cache (issue #9)
-│   ├── graph-auth.ts          # Layer-2 Graph auth: silent token acquisition (issue #8)
-│   ├── graph-structure.ts     # Graph reads: notebooks, section groups, sections, pages (issue #11)
-│   ├── ink.ts                 # InkML -> strokes -> SVG -> PNG (issue #12)
-│   ├── logging.ts             # one JSON line per request; fixes what may be in it (#14)
-│   ├── mcp-server.ts          # MCP JSON-RPC surface and the POST /mcp route (issue #14)
-│   ├── mcp-tools.ts           # tool contract, registry, error mapping, arg helpers (#14)
-│   ├── multipart.ts           # splits the multipart/mixed content response (issue #12)
-│   ├── page-content.ts        # the includeInkML=true fetch, and both halves out of it (#12, #13)
-│   ├── page-html.ts           # trims Graph's page markup to readable structure (issue #13)
-│   ├── token-cache.ts         # Firestore-backed MSAL ICachePlugin (issue #7)
-│   └── version.ts             # SERVICE_NAME, VERSION
-│
+├── src/                       # TypeScript source, the only thing that ships│
 ├── test/                      # node --test suites; test/<name>.test.ts covers src/<name>.ts
-│   ├── bootstrap.test.ts      # spawns the CLI; covers its refusals only
-│   ├── config.test.ts
-│   ├── graph-auth.test.ts     # drives acquireGraphToken through a fake client
-│   ├── graph-structure.test.ts # drives the client through a fake fetch; bans the account-wide page list
-│   ├── ink.test.ts            # drives the pipeline from the fixtures to PNG dimensions
-│   ├── logging.test.ts        # asserts a log line carries no argument, header, or query
-│   ├── mcp-server.test.ts     # drives initialize and tools/call over real HTTP
-│   ├── mcp-tools.test.ts      # covers the error mapping and the argument helpers
-│   ├── multipart.test.ts
-│   ├── page-content.test.ts   # drives the fetch through a fake fetch
-│   ├── page-html.test.ts      # trims the styled fixture; asserts no word is lost
 │   ├── fixtures/              # hand-authored InkML and HTML; never a captured page dump
-│   │   ├── xyf-himetric.inkml
-│   │   ├── two-roots-nested.inkml
-│   │   └── styled-page.html
-│   ├── server.test.ts
-│   ├── token-cache.test.ts    # covers readCache only; see the note below
-│   └── version.test.ts
-│
 ├── scripts/                   # operational shell scripts, not part of the built artifact
-│   ├── gcp-bootstrap.sh       # one-time GCP provisioning (issue #2)
 │   └── test/                  # bash tests, run by scripts/test/run.sh
-│       ├── run.sh             # syntax + shellcheck + the behavioural suites
-│       ├── bootstrap.test.sh  # gcp-bootstrap.sh against a stub `gcloud` on PATH
-│       ├── docker.test.sh     # builds the image and runs the container (opt-in)
-│       └── stubs/gcloud
-│
 └── dist/                      # build output; gitignored, never edited, never committed
 ```
 
