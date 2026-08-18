@@ -33,6 +33,7 @@ import type {
   Notebook,
   NotebookTree,
   PageSummary,
+  SectionWithParents,
 } from './graph-structure.ts';
 import { namesMatch, resolveSection, type ResolvedPath } from './name-lookup.ts';
 import {
@@ -68,17 +69,9 @@ export interface StructureClient {
   listPagesInSection(sectionId: string, top?: number): Promise<PageSummary[]>;
   getFullTree(): Promise<NotebookTree[]>;
   getExpandedTree(): Promise<ExpandedNotebook[]>;
+  findSectionsByName(displayName: string): Promise<SectionWithParents[]>;
+  findPagesByTitle(sectionId: string, title: string): Promise<PageSummary[]>;
 }
-
-/**
- * How many page titles `find_page_by_name` reads before it stops looking.
- *
- * 100 is Graph's own ceiling, not a choice: `$top=200` on a section's pages comes back
- * as 400 with code 20129, "the limit of '100' for the $top query has been exceeded".
- * A section holding more pages than this could hide a match, so the result reports
- * `pagesScanned` and `scanTruncated` rather than a clean miss.
- */
-const TITLE_SCAN_LIMIT = TOP_RANGE.max;
 
 /** The name arguments both `_by_name` tools share. */
 const NAME_PATH_PROPERTIES = {
@@ -323,19 +316,16 @@ export function createStructureTools(
         const pageTitle = requiredString(args, 'pageTitle');
 
         const resolved = await resolveSection(structure, path);
-        const pages = await structure.listPagesInSection(resolved.section.id, TITLE_SCAN_LIMIT);
-        const matches = pages.filter((page) => namesMatch(page.title, pageTitle));
+        // Graph does the title comparison, case-insensitively, so no bound on how many
+        // pages the section holds can hide a match.
+        const matches = await structure.findPagesByTitle(resolved.section.id, pageTitle);
 
         return jsonResult({
           ...resolvedPayload(resolved),
           pageTitle,
           matches: matches.map(pagePayload),
           matchCount: matches.length,
-          // A section holding more pages than the scan bound could hide a match, and a
-          // caller cannot tell that from a genuine miss without being told.
-          pagesScanned: pages.length,
-          scanTruncated: pages.length >= TITLE_SCAN_LIMIT,
-          note: findNote(resolved, matches.length, pages.length),
+          note: findNote(resolved, matches.length),
         });
       },
     },
@@ -457,21 +447,21 @@ function pagePayload(page: PageSummary): Record<string, unknown> {
   return { id: page.id, title: page.title, lastModifiedDateTime: page.lastModifiedDateTime };
 }
 
-/** What a zero-match find means, which depends on whether the scan was complete. */
-function findNote(resolved: ResolvedPath, matchCount: number, scanned: number): string {
+/** What the counts mean, and only when they need saying. */
+function findNote(resolved: ResolvedPath, matchCount: number): string {
   const parts: string[] = [];
 
   if (matchCount === 0) {
+    // Graph matched the title across the whole section, so this is a complete answer
+    // rather than a bounded one: no page in that section carries that title.
     parts.push(
-      scanned >= TITLE_SCAN_LIMIT
-        ? `No page title matched, but only the ${TITLE_SCAN_LIMIT} most recently modified pages were read, so an older page may still match. Use list_pages_by_name with the section id, or search_pages scoped to it.`
-        : `No page title matched. All ${scanned} page(s) in the section were read, so no page in it has that title. Titles are matched in full, ignoring case.`,
+      'No page in that section has that title. Titles are matched in full, ignoring case — use search_pages to match part of one.',
     );
   }
 
   if (resolved.deepSearchUsed) {
     parts.push(
-      'The section was found inside a section group nested below the one named, which cost one extra request.',
+      'The section sits below the section group named, and was found by an account-wide search on its name.',
     );
   }
 

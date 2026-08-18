@@ -18,15 +18,12 @@
 // `sectionGroupName` omitted means the section is a direct child of the notebook, not
 // "look anywhere". A caller that does not know where the section sits should browse.
 
-import type { ExpandedNotebook, Section, SectionGroup } from './graph-structure.ts';
+import type { ExpandedNotebook, SectionWithParents } from './graph-structure.ts';
 
 /** The slice of `GraphStructure` this module calls, so a test can pass a plain object. */
 export interface LookupStructure {
   getExpandedTree(): Promise<ExpandedNotebook[]>;
-  listContainerChildren(
-    kind: 'notebooks' | 'sectionGroups',
-    containerId: string,
-  ): Promise<{ sections: Section[]; sectionGroups: SectionGroup[] }>;
+  findSectionsByName(displayName: string): Promise<SectionWithParents[]>;
 }
 
 /** What the caller named. `sectionGroupName` absent means a notebook-level section. */
@@ -86,16 +83,13 @@ export class NameLookupError extends Error {
 const MAX_NAMES_LISTED = 25;
 
 /**
- * Bounds on the fallback walk below a named section group.
+ * The fallback is one filtered request, not a walk.
  *
- * The expanded tree stops at a group's own sections, so a section inside a group nested
- * under it is absent from that response. The walk that finds it costs one request per
- * container, and the OneNote budget is 400 requests an hour, so it is bounded twice: by
- * depth and by total requests. The real account has no nesting at this level, so neither
- * bound is reached on the common path.
+ * `findSectionsByName` returns sections at any depth with their parents, so a section
+ * nested below what the expanded tree reaches costs one request rather than one per
+ * container. It matches on a substring, which is the widest thing that endpoint will
+ * answer case-insensitively, so the full-name comparison is applied here.
  */
-const MAX_DEEP_DEPTH = 5;
-const MAX_DEEP_REQUESTS = 20;
 
 /** Just the two fields, dropping whatever children the node arrived with. */
 function plain(node: ResolvedNode): ResolvedNode {
@@ -188,70 +182,34 @@ export async function resolveSection(
     throw new NameLookupError('ambiguous', 'sectionName', path.sectionName, matches);
   }
 
-  // The expanded response stops at this group's sections, so a section inside a group
-  // nested under it is absent from the response rather than known to be absent. Only
-  // that subtree is walked, and only when the cheap answer came back empty.
-  const deep = await findSectionBelow(structure, group.id, path.sectionName);
-  if (deep.matches.length === 1) {
+  // The expanded response stops at this group's sections, so a section nested below it
+  // is absent from that response rather than known to be absent. One filtered request
+  // settles it at any depth, and only runs when the cheap answer came back empty.
+  const deep = (await structure.findSectionsByName(path.sectionName)).filter(
+    (section) =>
+      // Graph matched a substring; the full-name rule is this module's, so it is applied
+      // here rather than left to the service.
+      namesMatch(section.displayName, path.sectionName) &&
+      section.parentSectionGroup !== null &&
+      namesMatch(section.parentSectionGroup.displayName, path.sectionGroupName as string) &&
+      // Two notebooks can hold a section group of the same name, so the notebook is
+      // checked too rather than assumed from the group.
+      section.parentNotebook !== null &&
+      namesMatch(section.parentNotebook.displayName, notebook.displayName),
+  );
+
+  if (deep.length === 1) {
     return {
       notebook,
       sectionGroup: group,
-      section: plain(deep.matches[0] as ResolvedNode),
+      section: plain(deep[0] as ResolvedNode),
       deepSearchUsed: true,
     };
   }
-  if (deep.matches.length > 1) {
-    throw new NameLookupError('ambiguous', 'sectionName', path.sectionName, deep.matches);
+  if (deep.length > 1) {
+    throw new NameLookupError('ambiguous', 'sectionName', path.sectionName, deep.map(plain));
   }
-  // `deep.seen` re-reads this group's own sections on its way to the nested ones, so it
-  // already contains `sections`; using both would list every name twice.
-  throw new NameLookupError(
-    'not-found',
-    'sectionName',
-    path.sectionName,
-    deep.seen.length > 0 ? deep.seen : sections,
-  );
-}
-
-/**
- * Every section named `wanted` in the groups nested under `groupId`.
- *
- * Breadth-first and sequential: sequential because the concurrency limit is 5 and a
- * fan-out here would be the same mistake `getFullTree` makes, breadth-first so the
- * request bound is spent on the levels nearest the group the caller named.
- *
- * @returns the matches, and every section name seen along the way for the error message.
- */
-async function findSectionBelow(
-  structure: LookupStructure,
-  groupId: string,
-  wanted: string,
-): Promise<{ matches: ResolvedNode[]; seen: ResolvedNode[] }> {
-  const matches: ResolvedNode[] = [];
-  const seen: ResolvedNode[] = [];
-
-  let frontier: string[] = [groupId];
-  let requests = 0;
-
-  for (let depth = 0; depth < MAX_DEEP_DEPTH && frontier.length > 0; depth += 1) {
-    const next: string[] = [];
-
-    for (const id of frontier) {
-      if (requests >= MAX_DEEP_REQUESTS) return { matches, seen };
-      requests += 1;
-
-      const children = await structure.listContainerChildren('sectionGroups', id);
-      for (const section of children.sections) {
-        seen.push(section);
-        if (namesMatch(section.displayName, wanted)) matches.push(section);
-      }
-      next.push(...children.sectionGroups.map((group) => group.id));
-    }
-
-    frontier = next;
-  }
-
-  return { matches, seen };
+  throw new NameLookupError('not-found', 'sectionName', path.sectionName, sections);
 }
 
 /**

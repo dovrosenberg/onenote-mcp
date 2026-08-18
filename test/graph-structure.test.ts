@@ -423,3 +423,84 @@ test('an expanded relationship that is not an array is a GraphResponseError', as
     GraphResponseError,
   );
 });
+
+// ---------------------------------------------------------------------------
+// The two filtered lookups. Both URLs were confirmed against the real tenant, and both
+// carry a limit that is not documented anywhere: `tolower()` is accepted on a section's
+// pages and rejected on sections, and the account-wide sections endpoint answers 500
+// unless a $filter is present.
+// ---------------------------------------------------------------------------
+
+const SECTIONS_BY_NAME =
+  `${GRAPH_ROOT}/me/onenote/sections?$select=id,displayName` +
+  `&$expand=parentNotebook($select=id,displayName),parentSectionGroup($select=id,displayName)` +
+  `&$filter=`;
+
+/** `contains(tolower(...))`, because `tolower(...) eq` answers 500 on this endpoint. */
+function byNameUrl(lowered: string): string {
+  return `${SECTIONS_BY_NAME}${encodeURIComponent(`contains(tolower(displayName), '${lowered}')`)}`;
+}
+
+test('findSectionsByName filters case-insensitively and returns the parents', async () => {
+  const url = byNameUrl('monthly log');
+  const { fetchImpl, calls } = fakeFetch({
+    [url]: () =>
+      json({
+        value: [
+          {
+            id: 'sec-1',
+            displayName: 'Monthly Log',
+            parentNotebook: { id: 'nb-1', displayName: '2026' },
+            parentSectionGroup: { id: 'grp-1', displayName: 'February' },
+          },
+          {
+            id: 'sec-2',
+            displayName: 'Monthly Log',
+            parentNotebook: { id: 'nb-2', displayName: '2025' },
+            parentSectionGroup: null,
+          },
+        ],
+      }),
+  });
+
+  const sections = await new GraphStructure(tokens, fetchImpl).findSectionsByName('Monthly Log');
+
+  assert.equal(calls.length, 1, 'one request reaches a section at any nesting depth');
+  assert.deepEqual(sections[0]?.parentSectionGroup, { id: 'grp-1', displayName: 'February' });
+  // A section directly under a notebook has no parent group, and that is not a fault.
+  assert.equal(sections[1]?.parentSectionGroup, null);
+  assert.deepEqual(sections[1]?.parentNotebook, { id: 'nb-2', displayName: '2025' });
+});
+
+test('findSectionsByName doubles a quote in the name rather than breaking the filter', async () => {
+  const url = byNameUrl("bob''s notes");
+  const { fetchImpl } = fakeFetch({ [url]: () => json({ value: [] }) });
+
+  // An unescaped apostrophe would end the OData string literal early and produce a 400.
+  await new GraphStructure(tokens, fetchImpl).findSectionsByName("Bob's notes");
+});
+
+test('findPagesByTitle lets Graph compare titles, case-insensitively', async () => {
+  const filter = encodeURIComponent("tolower(title) eq 'monthly log'");
+  const url =
+    `${GRAPH_ROOT}/me/onenote/sections/sec-1/pages` +
+    `?$select=id,title,lastModifiedDateTime&$filter=${filter}`;
+  const { fetchImpl, calls } = fakeFetch({
+    [url]: () =>
+      json({
+        value: [
+          { id: 'p-1', title: 'Monthly Log', lastModifiedDateTime: '2026-03-04T10:00:00Z' },
+        ],
+      }),
+  });
+
+  // The caller's capitals are lowered before the comparison, because tolower() applies to
+  // the stored title and not to the literal.
+  const pages = await new GraphStructure(tokens, fetchImpl).findPagesByTitle('sec-1', 'MONTHLY Log');
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(
+    pages.map((page) => page.id),
+    ['p-1'],
+  );
+});

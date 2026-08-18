@@ -2,6 +2,10 @@
 
 Working notes for agents in this repository. `project-spec.md` is the authoritative
 design document — read the relevant section of it before changing behaviour.
+`api-overview.md` is what Microsoft Graph's OneNote endpoints actually do: the resource
+paths, the query options and their limits, and the places the service contradicts its own
+documentation. Read it before adding or changing a Graph call, and add anything new that
+a live run reveals.
 
 ## Directory structure
 
@@ -342,19 +346,21 @@ from a section that does not exist. A name matching twice is a `NameLookupError`
 the candidates. `sectionGroupName` omitted means the section is a direct child of the
 notebook, not "search everywhere".
 
-**The fallback walk below a named section group runs only when the cheap answer is
-empty.** `getExpandedTree` reaches a notebook's sections and one level of section group,
-so a section nested deeper is absent from that response rather than known to be absent.
-`findSectionBelow` walks that one subtree, breadth-first and sequentially, bounded at 5
-levels and 20 requests. Sequential because the concurrency limit is 5 and a fan-out here
-would repeat `getFullTree`'s mistake. The real account has no nesting at that level, so
-the walk does not run on the common path, and `deepSearchUsed` in the result says when it
-did.
+**The fallback below a named section group is one filtered request, not a walk.**
+`getExpandedTree` reaches a notebook's sections and one level of section group, because
+Graph caps `$expand` nesting at two levels — a third answers 400, and so does
+`$levels=max`. A section nested deeper is therefore absent from that response rather than
+known to be absent, and `findSectionsByName` settles it in one request at any depth by
+asking for sections account-wide with their parents expanded. It runs only when the
+expanded tree came back empty-handed, and `deepSearchUsed` in the result says when it did.
 
-**`find_page_by_name` scans at most 100 page titles because Graph says so.** `$top=200`
-on a section's pages is a 400 with code 20129, "the limit of '100' for the $top query has
-been exceeded". The result reports `pagesScanned` and `scanTruncated` so a miss in a
-section holding more than 100 pages is not read as "no such page".
+**Let Graph do the comparisons it will do, and know which ones it refuses.** Page titles
+are matched by `tolower(title) eq '…'` on the section's pages, so nothing bounds how many
+pages a section may hold before a match could be missed. Sections account-wide cannot be
+matched that way: `tolower(displayName) eq '…'` there answers 500 with code 19999, while
+`contains(tolower(displayName), '…')` answers normally, so `findSectionsByName` asks for
+the substring and applies the full-name rule itself. The table of what each endpoint
+accepts is in `api-overview.md`.
 
 **`list_sections` returns sections and section groups in one tagged list.** Graph exposes
 them as two relationships and the caller has to recurse through both — this account is a

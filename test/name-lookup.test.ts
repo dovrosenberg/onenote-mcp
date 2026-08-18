@@ -11,7 +11,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import type { ExpandedNotebook, Section, SectionGroup } from '../src/graph-structure.ts';
+import type { ExpandedNotebook, SectionWithParents } from '../src/graph-structure.ts';
 import {
   NameLookupError,
   matchOne,
@@ -46,33 +46,46 @@ const EXPANDED: ExpandedNotebook[] = [
   },
 ];
 
-/** Only reachable by walking: the expanded tree stops at a group's own sections. */
-const NESTED: Record<string, { sections: Section[]; sectionGroups: SectionGroup[] }> = {
-  'grp-deep': {
-    sections: [],
-    sectionGroups: [{ id: 'grp-deeper', displayName: 'Old' }],
-  },
-  'grp-deeper': {
-    sections: [{ id: 'sec-buried', displayName: 'Buried' }],
-    sectionGroups: [],
-  },
+/**
+ * What the account-wide filtered lookup returns. `Buried` sits under a section group
+ * nested inside `Archive`, which is past what the expanded tree reaches — the only way
+ * to it is this call, and its `parentSectionGroup` is the nested group rather than the
+ * one the caller named.
+ */
+const BY_NAME: Record<string, SectionWithParents[]> = {
+  Buried: [
+    {
+      id: 'sec-buried',
+      displayName: 'Buried',
+      parentNotebook: { id: 'nb-2026', displayName: 'Bullet Journal - 2026' },
+      parentSectionGroup: { id: 'grp-deeper', displayName: 'Archive' },
+    },
+  ],
+  Elsewhere: [
+    {
+      id: 'sec-elsewhere',
+      displayName: 'Elsewhere',
+      parentNotebook: { id: 'nb-2025', displayName: 'Bullet Journal - 2025' },
+      parentSectionGroup: { id: 'grp-other', displayName: 'Archive' },
+    },
+  ],
 };
 
 interface Fake extends LookupStructure {
-  readonly calls: { tree: number; children: string[] };
+  readonly calls: { tree: number; byName: string[] };
 }
 
 function fake(tree: ExpandedNotebook[] = EXPANDED): Fake {
-  const calls = { tree: 0, children: [] as string[] };
+  const calls = { tree: 0, byName: [] as string[] };
   return {
     calls,
     getExpandedTree: () => {
       calls.tree += 1;
       return Promise.resolve(tree);
     },
-    listContainerChildren: (_kind, containerId) => {
-      calls.children.push(containerId);
-      return Promise.resolve(NESTED[containerId] ?? { sections: [], sectionGroups: [] });
+    findSectionsByName: (displayName: string) => {
+      calls.byName.push(displayName);
+      return Promise.resolve(BY_NAME[displayName] ?? []);
     },
   };
 }
@@ -104,7 +117,7 @@ test('a section inside a named group resolves in exactly one request', async () 
   assert.equal(resolved.deepSearchUsed, false);
 
   assert.equal(structure.calls.tree, 1);
-  assert.deepEqual(structure.calls.children, [], 'the common path walks no containers');
+  assert.deepEqual(structure.calls.byName, [], 'the common path costs nothing beyond the tree');
 });
 
 test('a notebook-level section resolves with no group named', async () => {
@@ -116,7 +129,7 @@ test('a notebook-level section resolves with no group named', async () => {
 
   assert.deepEqual(resolved.section, { id: 'sec-inbox', displayName: 'Inbox' });
   assert.equal(resolved.sectionGroup, null);
-  assert.deepEqual(structure.calls.children, []);
+  assert.deepEqual(structure.calls.byName, []);
 });
 
 test('omitting the group name does not reach a section inside a group', async () => {
@@ -161,7 +174,7 @@ test('a missing notebook name lists the notebooks that were there', async () => 
   assert.match(error.message, /matched in full, ignoring case/);
 });
 
-test('a section nested below the named group is found by the fallback walk', async () => {
+test('a section nested below the named group is found by one filtered request', async () => {
   const structure = fake();
   const resolved = await resolveSection(structure, {
     notebookName: 'Bullet Journal - 2026',
@@ -170,22 +183,35 @@ test('a section nested below the named group is found by the fallback walk', asy
   });
 
   assert.deepEqual(resolved.section, { id: 'sec-buried', displayName: 'Buried' });
-  assert.equal(resolved.deepSearchUsed, true, 'the caller is told this cost extra requests');
-  // Breadth-first from the named group: the group itself, then the one below it.
-  assert.deepEqual(structure.calls.children, ['grp-deep', 'grp-deeper']);
+  assert.equal(resolved.deepSearchUsed, true, 'the caller is told this took the other path');
+  assert.deepEqual(structure.calls.byName, ['Buried'], 'one request, not one per container');
 });
 
-test('the fallback walk runs only when the expanded tree came back empty-handed', async () => {
+test('the filtered fallback runs only when the expanded tree came back empty-handed', async () => {
   const structure = fake();
   await resolveSection(structure, {
     notebookName: 'Bullet Journal - 2026',
     sectionGroupName: '062 - February',
     sectionName: 'Monthly Log',
   });
-  assert.deepEqual(structure.calls.children, []);
+  assert.deepEqual(structure.calls.byName, []);
 });
 
-test('a section missing everywhere below the group lists what the walk saw', async () => {
+test('a section of that name in another notebook is not accepted', async () => {
+  // The filtered lookup is account-wide and this section group name exists twice, so the
+  // notebook has to be checked as well as the group.
+  const error = await resolveSection(fake(), {
+    notebookName: 'Bullet Journal - 2026',
+    sectionGroupName: 'Archive',
+    sectionName: 'Elsewhere',
+  }).catch((err: unknown) => err);
+
+  assert.ok(error instanceof NameLookupError);
+  assert.equal(error.kind, 'not-found');
+  assert.equal(error.argument, 'sectionName');
+});
+
+test('a section missing everywhere below the group is a not-found', async () => {
   const error = await resolveSection(fake(), {
     notebookName: 'Bullet Journal - 2026',
     sectionGroupName: 'Archive',
@@ -194,9 +220,7 @@ test('a section missing everywhere below the group lists what the walk saw', asy
 
   assert.ok(error instanceof NameLookupError);
   assert.equal(error.argument, 'sectionName');
-  assert.match(error.message, /Buried/);
-  // The named group's own sections and the walked ones are listed once, not twice.
-  assert.equal(error.message.match(/Buried/g)?.length, 1);
+  assert.equal(error.kind, 'not-found');
 });
 
 test('an empty container yields an error that says there was nothing to match', async () => {

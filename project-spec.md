@@ -114,8 +114,13 @@ the alignment is arithmetic, not guesswork.
 - The container path resolves in one request:
   `GET /me/onenote/notebooks?$select=id,displayName&$expand=sections($select=id,displayName),sectionGroups($select=id,displayName;$expand=sections($select=id,displayName))`.
   Measured at 78 KB for 54 notebooks. It reaches a notebook's sections and one
-  level of section group; a section nested deeper needs a walk, which runs only
-  when the cheap answer comes back empty.
+  level of section group, which is Graph's cap on `$expand` nesting. A section
+  nested deeper is found by one filtered request against the account-wide
+  section list with its parents expanded, which runs only when the cheap answer
+  comes back empty.
+- Page titles are matched by Graph, not read and compared locally:
+  `/sections/{id}/pages?$filter=tolower(title) eq '…'`. Nothing bounds how many
+  pages a section may hold before a match could be missed.
 - Matching is exact and case-insensitive on every name, including the page
   title. `search_pages` is the substring tool; a lookup that quietly accepted a
   prefix would return a different section than the caller named.

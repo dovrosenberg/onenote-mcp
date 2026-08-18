@@ -35,6 +35,26 @@ const EXPANDED_TREE_URL =
   `&$expand=sections($select=id,displayName),` +
   `sectionGroups($select=id,displayName;$expand=sections($select=id,displayName))`;
 
+/**
+ * Sections anywhere in the account whose name contains the query, with their parents.
+ *
+ * This reaches a section at any nesting depth in one request, which neither a walk nor
+ * `$expand` does — `parentSectionGroup` is what says where the section actually sits, and
+ * `$expand` is capped at two levels (a third nesting level answers 400, and `$levels=max`
+ * answers 400 as well).
+ *
+ * `contains(tolower(displayName), '…')` rather than `tolower(displayName) eq '…'`:
+ * the second answers 500 with code 19999 on this endpoint, which is undocumented and was
+ * found by testing. `contains` is therefore how the comparison is made case-insensitive,
+ * and the exact match is applied to the results by the caller. The account-wide
+ * `/me/onenote/sections` with no `$filter` at all also answers 500, so this URL is only
+ * usable with the filter present.
+ */
+const SECTIONS_BY_NAME_URL =
+  `${GRAPH_ROOT}/me/onenote/sections?$select=id,displayName` +
+  `&$expand=parentNotebook($select=id,displayName),parentSectionGroup($select=id,displayName)` +
+  `&$filter=`;
+
 /** The most result pages one list call will follow before giving up. */
 const MAX_PAGE_FOLLOWS = 50;
 
@@ -120,6 +140,12 @@ export interface PageSummary {
 export interface ContainerChildren {
   readonly sections: Section[];
   readonly sectionGroups: SectionGroup[];
+}
+
+/** A section found by name, with the containers it sits in. */
+export interface SectionWithParents extends Section {
+  readonly parentNotebook: Notebook | null;
+  readonly parentSectionGroup: SectionGroup | null;
 }
 
 /** A section group with everything below it already resolved. */
@@ -324,6 +350,38 @@ export class GraphStructure {
   }
 
   /**
+   * Sections anywhere in the account whose name contains `displayName`, with parents.
+   *
+   * Substring rather than equality, because equality with `tolower()` is refused by this
+   * endpoint. The caller narrows the result to a full match; this is the widest query the
+   * service will answer case-insensitively.
+   *
+   * @throws {GraphRequestError} on a non-2xx response.
+   */
+  async findSectionsByName(displayName: string): Promise<SectionWithParents[]> {
+    const filter = `contains(tolower(displayName), ${quoteOData(displayName.trim().toLowerCase())})`;
+    const url = `${SECTIONS_BY_NAME_URL}${encodeURIComponent(filter)}`;
+    return (await this.#collect(url)).map((item) => toSectionWithParents(item, url));
+  }
+
+  /**
+   * Pages in one section whose title matches, compared case-insensitively by Graph.
+   *
+   * `tolower(title)` is accepted here even though it is rejected on sections, so this
+   * replaces reading every title in the section and comparing them locally — which was
+   * bounded at 100 by Graph's own `$top` ceiling and could therefore miss a match.
+   *
+   * @throws {GraphRequestError} on a non-2xx response.
+   */
+  async findPagesByTitle(sectionId: string, title: string): Promise<PageSummary[]> {
+    const filter = `tolower(title) eq ${quoteOData(title.trim().toLowerCase())}`;
+    const url =
+      `${GRAPH_ROOT}/me/onenote/sections/${encodeURIComponent(sectionId)}/pages` +
+      `?$select=id,title,lastModifiedDateTime&$filter=${encodeURIComponent(filter)}`;
+    return (await this.#collect(url)).map((item) => toPageSummary(item, url));
+  }
+
+  /**
    * Every notebook with its sections and one level of section group, in one request.
    *
    * This is the cheap way to answer a question about names. It does not replace
@@ -427,6 +485,28 @@ function toNodeArray(value: unknown, url: string): unknown[] {
     );
   }
   return value;
+}
+
+/** A single-quoted OData string literal; an embedded quote is doubled. */
+export function quoteOData(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+function toSectionWithParents(item: unknown, url: string): SectionWithParents {
+  const record = asRecord(item, url);
+  const notebook = record['parentNotebook'];
+  const group = record['parentSectionGroup'];
+  return {
+    ...toNode(record, url),
+    // A section directly under a notebook has no parent section group, and Graph returns
+    // null rather than omitting it. Both readings end as null here.
+    parentNotebook: isRecord(notebook) ? toNode(notebook, url) : null,
+    parentSectionGroup: isRecord(group) ? toNode(group, url) : null,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function toPageSummary(item: unknown, url: string): PageSummary {

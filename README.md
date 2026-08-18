@@ -113,6 +113,8 @@ the page list inside one section. `new GraphStructure(auth)` takes anything with
 | `getNotebookTree(notebook)` | One notebook with every nested section group resolved |
 | `getFullTree()` | Every notebook, each with its tree resolved |
 | `getExpandedTree()` | Every notebook with its sections and one level of section group, in a single request |
+| `findSectionsByName(displayName)` | Sections anywhere in the account whose name contains that text, each with its parent notebook and section group |
+| `findPagesByTitle(sectionId, title)` | Pages in one section whose title matches, compared case-insensitively by Graph |
 
 `containerKind` is `notebooks` or `sectionGroups` — the two Graph relationship names.
 Both container kinds expose the same child relationships, which is why the list methods
@@ -131,8 +133,13 @@ Measured against a 54-notebook account: one request and 78 KB, against 195 reque
 `getFullTree()`, which matters because OneNote allows 400 requests an hour and 5
 concurrent. The `$select` inside each expand clause is what takes the response from
 441 KB to 78 KB, and the separator inside a clause carrying both `$select` and `$expand`
-is a semicolon. What it does not reach is a section group nested inside a section group;
-that still needs the walk.
+is a semicolon. What it does not reach is a section group nested inside a section group —
+Graph caps `$expand` nesting at two levels — so `findSectionsByName` covers that case in
+one request instead, by filtering the account-wide section list and expanding each
+section's parents.
+
+`api-overview.md` records what these endpoints accept, including the places the service
+contradicts its own documentation.
 
 Three things the traversal handles that a single Graph call does not:
 

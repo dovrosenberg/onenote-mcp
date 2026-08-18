@@ -99,20 +99,33 @@ interface Fake extends StructureClient {
   readonly containerCalls: string[];
   readonly pageCalls: { sectionId: string; top: number | undefined }[];
   readonly treeCalls: { expanded: number; full: number };
+  readonly titleCalls: { sectionId: string; title: string }[];
 }
 
 function fakeStructure(): Fake {
   const containerCalls: string[] = [];
   const pageCalls: { sectionId: string; top: number | undefined }[] = [];
   const treeCalls = { expanded: 0, full: 0 };
+  const titleCalls: { sectionId: string; title: string }[] = [];
 
   return {
     containerCalls,
     pageCalls,
     treeCalls,
+    titleCalls,
     getExpandedTree: () => {
       treeCalls.expanded += 1;
       return Promise.resolve(EXPANDED);
+    },
+    findSectionsByName: () => Promise.resolve([]),
+    findPagesByTitle: (sectionId: string, title: string) => {
+      titleCalls.push({ sectionId, title });
+      // Graph does this comparison; the fake does the same thing the service would.
+      return Promise.resolve(
+        (PAGES[sectionId] ?? []).filter(
+          (page) => page.title.trim().toLowerCase() === title.trim().toLowerCase(),
+        ),
+      );
     },
     listNotebooks: () => Promise.resolve(NOTEBOOKS),
     listContainerChildren: (kind: ContainerKind, containerId: string) => {
@@ -335,14 +348,16 @@ test('find_page_by_name matches names in full, ignoring case', async () => {
     "'monthly log archive' is not a full-string match and must not come back",
   );
 
-  // One tree request plus one page listing. The point of the tool is that it does not
-  // walk containers, so a regression to listContainerChildren shows up here.
+  // One tree request plus one filtered page request. The point of the tool is that it
+  // walks nothing, so a regression to listContainerChildren or to reading every title in
+  // the section shows up here.
   assert.equal(structure.treeCalls.expanded, 1);
   assert.deepEqual(structure.containerCalls, []);
-  assert.deepEqual(structure.pageCalls, [{ sectionId: 'sec-log', top: 100 }]);
+  assert.deepEqual(structure.pageCalls, [], 'titles are filtered by Graph, not scanned');
+  assert.deepEqual(structure.titleCalls, [{ sectionId: 'sec-log', title: 'MONTHLY LOG' }]);
 });
 
-test('find_page_by_name reports a title that matched nothing as a complete scan', async () => {
+test('a title that matched nothing is a complete answer, not a bounded one', async () => {
   const body = await call('find_page_by_name', {
     notebookName: '2026',
     sectionGroupName: 'March',
@@ -351,8 +366,8 @@ test('find_page_by_name reports a title that matched nothing as a complete scan'
   });
 
   assert.equal(body['matchCount'], 0);
-  assert.equal(body['scanTruncated'], false);
-  assert.match(String(body['note']), /All 2 page\(s\)/);
+  assert.deepEqual(body['matches'], []);
+  assert.match(String(body['note']), /No page in that section has that title/);
 });
 
 test('a section name that matches nothing is an error listing what was there', async () => {
