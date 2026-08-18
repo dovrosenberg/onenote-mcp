@@ -53,10 +53,9 @@ state before `npm run bootstrap` has been run. Nothing wires the plugin into a l
 client yet; that is issue #9 for the bootstrap CLI and issue #8 for the server.
 
 `npm test` covers only `readCache`, the function that decodes a document snapshot. The
-two callbacks, the transaction, and `createFirestoreTokenCachePlugin` are checked by hand
-against the Firestore emulator, following the "Manual verification procedure" section of
-[`docs/plans/7-firestore-msal-cache.md`](./docs/plans/7-firestore-msal-cache.md). That
-procedure needs `java` on `PATH` and the emulator installed:
+two callbacks, the transaction, and `createFirestoreTokenCachePlugin` have no automated
+test — they need a Firestore backend. Exercising them means the emulator, which needs
+`java` on `PATH` and an install of its own:
 
 ```bash
 sudo apt-get install google-cloud-cli-firestore-emulator
@@ -92,11 +91,9 @@ carry no account identifier: `username` is the user's UPN and `homeAccountId` em
 tenant id, neither of which belongs in a log.
 
 `npm test` covers the acquisition logic through a fake client. `createGraphAuth` itself
-is checked by hand once the cache has been seeded, following the "Manual verification
-procedure" in
-[`docs/plans/8-graph-auth-module.md`](./docs/plans/8-graph-auth-module.md). Nothing wires
-the module into `createApp` yet; the first consumer is the Graph structure client, issue
-#11.
+has no automated test: it needs a cache seeded by a real device-code sign-in, which
+arrives with issues #9 and #10. Nothing wires the module into `createApp` yet; the first
+consumer is the Graph structure client, issue #11.
 
 ## Container
 

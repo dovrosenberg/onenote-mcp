@@ -36,9 +36,6 @@ onenote-mcp/
 │   ├── token-cache.test.ts    # covers readCache only; see the note below
 │   └── version.test.ts
 │
-├── docs/
-│   └── plans/                 # one implementation plan per issue: <issue-number>-<slug>.md
-│
 ├── scripts/                   # operational shell scripts, not part of the built artifact
 │   ├── gcp-bootstrap.sh       # one-time GCP provisioning (issue #2)
 │   └── test/                  # bash tests, run by scripts/test/run.sh
@@ -52,16 +49,18 @@ onenote-mcp/
 
 A test file is named for the source file it covers: `test/config.test.ts` covers
 `src/config.ts`. Not every source file has one. `src/index.ts` is a top-level entrypoint
-whose behaviour is process exit codes and stderr, so it is verified by running it rather
-than by a unit test — the commands are in the Final Verification section of
-`docs/plans/5-repo-skeleton.md`. `src/bootstrap.ts` is a placeholder until issue #9.
+whose behaviour is process exit codes and stderr, so it has no unit test; check it by
+running it. Unsetting a required variable and running `npm start` must print the list of
+missing names and exit 1 with no line matching `at …(`, and binding a port already in
+use must print one readable line rather than an `EADDRINUSE` stack. `src/bootstrap.ts`
+is a placeholder until issue #9.
 
 `test/graph-auth.test.ts` drives `acquireGraphToken` through a hand-written
 `SilentTokenSource` and never constructs a `PublicClientApplication`, so
 `createGraphAuth` has no automated test. Testing it needs a cache seeded by a real
-device-code sign-in, which arrives with issues #9 and #10. What stands in for it is the
-"Manual verification procedure" section of `docs/plans/8-graph-auth-module.md`, run by
-the operator after #10.
+device-code sign-in, which arrives with issues #9 and #10, and no credential that could
+seed one may be committed. Nothing verifies it until an operator runs it by hand against
+the real app registration.
 
 `test/token-cache.test.ts` covers `readCache` and nothing else. `readCache` is a pure
 function over a document snapshot, so it runs without a backend. `beforeCacheAccess`,
@@ -70,10 +69,9 @@ function over a document snapshot, so it runs without a backend. `beforeCacheAcc
 backend, and the emulator is not installed here. Installing it takes `sudo apt-get
 install google-cloud-cli-firestore-emulator`, because this machine's `gcloud` is the
 Debian package and its component manager is disabled, so `gcloud components install
-cloud-firestore-emulator` is refused. What stands in for those tests is the "Manual
-verification procedure" section of `docs/plans/7-firestore-msal-cache.md`, which the
-operator runs on a machine that has the emulator. Do not close the gap by adding an
-in-memory Firestore fake: the behaviour at stake is transaction retry under contention
+cloud-firestore-emulator` is refused. Nothing stands in for those tests; the gap is
+open, and closing it means an operator driving the plugin against an emulator by hand.
+Do not close it by adding an in-memory Firestore fake: the behaviour at stake is transaction retry under contention
 and `FieldValue.serverTimestamp()`, and a fake would assert the fake's behaviour rather
 than Firestore's.
 
@@ -97,8 +95,7 @@ otherwise. Both suites still get `bash -n` and `shellcheck` on every run.
 | `npm run bootstrap` | `node src/bootstrap.ts` |
 
 There is no ESLint. `npm run typecheck` is the static-analysis gate; run it before every
-commit. It catches the class of error a linter would here, and it is the reason the
-plans list it under "lint".
+commit. It catches the class of error a linter would here.
 
 ## Conventions
 
@@ -195,14 +192,15 @@ This repository is public, and so are its issues, pull requests, and Actions log
 Never commit, and never put in an issue or a workflow log: real page content, rendered
 ink images, the Entra tenant name or ID, Firestore document contents, or the Layer-1
 OAuth client secret. `.gitignore` covers `output/`, `.env*`, `*.token-cache.json`, and
-`.msal-cache*`. Example output in docs must come from a throwaway page with fake content.
+`.msal-cache*`. Example output in `README.md` must come from a throwaway page with fake content.
 The Azure client ID is *not* secret in this design (public client, device-code flow) and
 is safe in config examples.
 
 ## Workflow
 
 Issues are labelled by phase (`phase-1-skeleton` … `phase-5-deploy`) and by who does them
-(`claude` or `manual`). Each `claude` issue gets a plan in `docs/plans/` before code,
-following the structure of the existing plans: numbered acceptance criteria traced to
-phases, and a Findings section recording what implementation revealed that planning
-missed. Commit the plan, then implement phase by phase.
+(`claude` or `manual`). Work a `claude` issue directly; no separate plan document is
+written. The issue's own task list and acceptance section are the specification, and the
+commit message is where the reasoning goes — what the
+implementation revealed that the issue did not anticipate belongs there, not in a
+separate document.
