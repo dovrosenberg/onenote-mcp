@@ -42,6 +42,43 @@ compiler options enforce this.
 See [`CLAUDE.md`](./CLAUDE.md) for the directory layout and the conventions that go with
 it.
 
+## Container
+
+The service deploys to Cloud Run, which runs `linux/amd64`. The image is built for that
+platform explicitly so the `@resvg/resvg-js` native binary matches. The runtime base is
+Debian `node:24-slim` and must not become Alpine — the resvg prebuild is glibc-only.
+
+```bash
+docker build --platform linux/amd64 -t onenote-mcp .
+
+docker run --rm -p 8080:8080 \
+  -e PORT=8080 \
+  -e ONENOTE_CLIENT_ID=00000000-0000-0000-0000-000000000000 \
+  -e ONENOTE_AUTHORITY=https://login.microsoftonline.com/common \
+  -e MCP_OAUTH_CLIENT_ID=test-client \
+  -e MCP_OAUTH_CLIENT_SECRET=test-secret \
+  -e MCP_TOKEN_SIGNING_KEY=0123456789abcdef0123456789abcdef \
+  onenote-mcp
+
+curl -i localhost:8080/healthz    # 200, {"status":"ok",...}
+```
+
+Those values are placeholders that are only well-formed enough to pass startup
+validation; they authenticate against nothing. On Cloud Run, `PORT` is supplied by the
+platform and the rest come from the deploy workflow. If host port 8080 is already taken,
+map a different one: `-p 8081:8080` with `-e PORT=8080`.
+
+To test the image:
+
+```bash
+RUN_DOCKER_TESTS=1 bash scripts/test/run.sh
+```
+
+That builds the image, checks that the resvg glibc binary survived the production-only
+install and that no dev dependencies came with it, renders an SVG to PNG inside the
+container, and asserts `/healthz` answers 200 on the port given in `PORT`. Without
+`RUN_DOCKER_TESTS=1` the docker suite is skipped and the rest still runs.
+
 ## Configuration
 
 Every value comes from an environment variable, validated at startup. A missing or

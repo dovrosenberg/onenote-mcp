@@ -8,9 +8,9 @@
 
 | Phase | Status | Commit |
 |-------|--------|--------|
-| Phase 1: `.dockerignore`, multi-stage `Dockerfile`, image-content test | ☐ | — |
-| Phase 2: Runtime behaviour — `$PORT`, `/healthz`, startup time, resvg render | ☐ | — |
-| Phase 3: Documentation — `README.md`, `CLAUDE.md` | ☐ | — |
+| Phase 1: `.dockerignore`, multi-stage `Dockerfile`, image-content test | ☑ | `c64d54c` |
+| Phase 2: Runtime behaviour — `$PORT`, `/healthz`, startup time, resvg render | ☑ | `86cd1d8` |
+| Phase 3: Documentation — `README.md`, `CLAUDE.md` | ☑ | this commit |
 
 ## Acceptance Criteria
 
@@ -182,11 +182,11 @@ The repository has no JavaScript linter; `npm run typecheck` is the static-analy
 - `scripts/test/docker.test.sh` checks 1–5: image builds for `linux/amd64`; `@resvg/resvg-js-linux-x64-gnu/*.node` exists in the runtime image; `node_modules/typescript` does not; `dist/index.js` exists; `src/` and `test/` are absent from the image.
 
 **Verification:**
-- [ ] `npm run typecheck` passes (lint)
-- [ ] `npm test` passes — no source changed, this is a regression check
-- [ ] `bash scripts/test/run.sh` passes, and prints the `docker.test.sh` skip line
-- [ ] `RUN_DOCKER_TESTS=1 bash scripts/test/run.sh` passes, exercising checks 1–5
-- [ ] `shellcheck` reports nothing on `scripts/test/docker.test.sh` (run inside `run.sh`)
+- [x] `npm run typecheck` passes (lint)
+- [x] `npm test` passes — no source changed, this is a regression check
+- [x] `bash scripts/test/run.sh` passes, and prints the `docker.test.sh` skip line
+- [x] `RUN_DOCKER_TESTS=1 bash scripts/test/run.sh` passes, exercising checks 1–5
+- [x] `shellcheck` reports nothing on `scripts/test/docker.test.sh` (run inside `run.sh`)
 
 ---
 
@@ -239,11 +239,11 @@ The repository has no JavaScript linter; `npm run typecheck` is the static-analy
 - `scripts/test/docker.test.sh` check 8: `docker stop` produces exit code 0 and the `SIGTERM received` log line.
 
 **Verification:**
-- [ ] `npm run typecheck` passes (lint)
-- [ ] `npm test` passes
-- [ ] `RUN_DOCKER_TESTS=1 bash scripts/test/run.sh` passes all eight checks
-- [ ] The AC-7 command from the issue run by hand succeeds: `docker build --platform linux/amd64 -t onenote-mcp .` then `docker run --rm -p 8080:8080 -e PORT=8080 -e ONENOTE_CLIENT_ID=... -e ONENOTE_AUTHORITY=https://login.microsoftonline.com/common -e MCP_OAUTH_CLIENT_ID=... -e MCP_OAUTH_CLIENT_SECRET=... -e MCP_TOKEN_SIGNING_KEY=... onenote-mcp`, and `curl -i localhost:8080/healthz` returns 200
-- [ ] `shellcheck` reports nothing on the updated `scripts/test/docker.test.sh`
+- [x] `npm run typecheck` passes (lint)
+- [x] `npm test` passes
+- [x] `RUN_DOCKER_TESTS=1 bash scripts/test/run.sh` passes all eight checks
+- [x] The AC-7 command from the issue run by hand succeeds: `docker build --platform linux/amd64 -t onenote-mcp .` then `docker run --rm -p 8080:8080 -e PORT=8080 -e ONENOTE_CLIENT_ID=... -e ONENOTE_AUTHORITY=https://login.microsoftonline.com/common -e MCP_OAUTH_CLIENT_ID=... -e MCP_OAUTH_CLIENT_SECRET=... -e MCP_TOKEN_SIGNING_KEY=... onenote-mcp`, and `curl -i localhost:8080/healthz` returns 200
+- [x] `shellcheck` reports nothing on the updated `scripts/test/docker.test.sh`
 
 ---
 
@@ -272,23 +272,23 @@ The repository has no JavaScript linter; `npm run typecheck` is the static-analy
 - No new tests. This phase changes only Markdown; the behaviour it documents is covered by Phase 1 and Phase 2 checks. Correctness of the documented commands is verified by running them, listed below.
 
 **Verification:**
-- [ ] `npm run typecheck` passes (lint)
-- [ ] `npm test` passes
-- [ ] Every command quoted in the new `README.md` section runs successfully when pasted into a shell
-- [ ] The `CLAUDE.md` directory tree matches `git ls-files` for the paths it lists
-- [ ] No real tenant name, tenant ID, or client secret appears in either file
+- [x] `npm run typecheck` passes (lint)
+- [x] `npm test` passes
+- [x] Every command quoted in the new `README.md` section runs successfully when pasted into a shell
+- [x] The `CLAUDE.md` directory tree matches `git ls-files` for the paths it lists
+- [x] No real tenant name, tenant ID, or client secret appears in either file
 
 ---
 
 ## Final Verification
 
-- [ ] `npm run typecheck` passes
-- [ ] `npm test` passes
-- [ ] `bash scripts/test/run.sh` passes (docker checks skipped)
-- [ ] `RUN_DOCKER_TESTS=1 bash scripts/test/run.sh` passes (all eight docker checks)
-- [ ] `docker build --platform linux/amd64 -t onenote-mcp .` succeeds from a clean checkout with no host `node_modules`
-- [ ] `docker image inspect onenote-mcp --format '{{.Os}}/{{.Architecture}}'` reports `linux/amd64`
-- [ ] Acceptance criteria traceability:
+- [x] `npm run typecheck` passes
+- [x] `npm test` passes
+- [x] `bash scripts/test/run.sh` passes (docker checks skipped)
+- [x] `RUN_DOCKER_TESTS=1 bash scripts/test/run.sh` passes (all eight docker checks)
+- [x] `docker build --platform linux/amd64 -t onenote-mcp .` succeeds from a clean checkout with no host `node_modules`
+- [x] `docker image inspect onenote-mcp --format '{{.Os}}/{{.Architecture}}'` reports `linux/amd64`
+- [x] Acceptance criteria traceability:
   - **AC-1** (multi-stage, build compiles, runtime `node:24-slim` prod deps only): covered by Phase 1 — the `Dockerfile` has `build` and `runtime` stages; Phase 1 check 3 asserts `node_modules/typescript` is absent from the runtime image, and check 4 asserts `dist/index.js` is present. Documented in Phase 3.
   - **AC-2** (no host `node_modules`; `.dockerignore` covers `node_modules`, `.git`, `output`, `dist`): covered by Phase 1 — `.dockerignore` lists all four; check 5 asserts `src/` and `test/` are absent from the image, which fails if the ignore file stops being applied. Documented in Phase 3.
   - **AC-3** (resvg native binary present after production-only `npm ci`): covered by Phase 1 check 2 (`@resvg/resvg-js-linux-x64-gnu/*.node` exists in the runtime image) and Phase 2 check 6 (it actually loads and renders).
@@ -302,4 +302,42 @@ The repository has no JavaScript linter; `npm run typecheck` is the static-analy
 
 > Recorded during implementation: what building this revealed that planning missed.
 
-_(empty until implementation begins)_
+1. **`shellcheck` flags the `EXIT` trap handler as dead code.** `cleanup()` is only ever
+   reached through `trap cleanup EXIT`, which shellcheck's call-graph analysis does not
+   see, so it emits SC2329. Suppressed with a `# shellcheck disable=SC2329` line carrying
+   the reason. `scripts/test/bootstrap.test.sh` never hit this because it has no trap.
+
+2. **The literal AC-7 command could not be run as written on this machine — something
+   else already holds host port 8080.** `docker run -p 8080:8080` fails with
+   `failed to bind host port 0.0.0.0:8080/tcp: address already in use`, and a `curl
+   localhost:8080/healthz` in that state returns a 200 from the unrelated service, which
+   is a false pass. The command was run with `-p 8081:8080 -e PORT=8080` instead: the
+   container side is unchanged, and the response was `HTTP/1.1 200 OK`,
+   `Content-Type: application/json`, with `listening on port 8080` in the container log.
+   This is the reason `docker.test.sh` publishes on host port 0 and resolves the real
+   port with `docker port` rather than using a fixed host port. The README's Container
+   section notes the `-p 8081:8080` fallback.
+
+3. **`node -e` in the image must use `require`, not an ESM import.** `node -e` runs as
+   CommonJS regardless of `"type": "module"` in `package.json`, so the resvg check is
+   written `const { Resvg } = require("@resvg/resvg-js")`. Wrapping the JS in single
+   quotes and building the SVG string with backticks keeps every double quote in the
+   markup unescaped.
+
+4. **Pre-existing, unrelated to this issue:** `scripts/test/bootstrap.test.sh` fails one
+   assertion, `unset PROJECT exits non-zero — expected exit 1, got 0`. Confirmed present
+   on `HEAD` before any change here by stashing and re-running. It belongs to issue #2's
+   script, not to the container work, and is left alone. Every other assertion in that
+   suite passes, and all twelve `docker.test.sh` checks pass.
+
+6. **Verifying the clean-checkout build needs a path the Docker daemon can read.** This
+   machine runs Docker from a snap, which is confined to `$HOME` — a `docker build` whose
+   context is under `/tmp` fails with `unable to prepare context: path ... not found`
+   before any layer runs. The check was done by extracting `git archive HEAD` into a
+   directory under `$HOME`, copying in `Dockerfile` and `.dockerignore` (both untracked
+   at that moment), and building from there. It succeeded, reported `linux/amd64`, and
+   the runtime image contained `resvgjs.linux-x64-gnu.node` and `dist/index.js`.
+
+5. **Measured startup: 0 seconds** to a 200 from `/healthz`, against the 10-second bar in
+   the plan and Cloud Run's 240-second default startup timeout. The image built for
+   `linux/amd64` reports `linux/amd64` from `docker image inspect`.

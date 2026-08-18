@@ -17,6 +17,9 @@ onenote-mcp/
 ├── tsconfig.json              # editor + `npm run typecheck`: src/ AND test/, noEmit
 ├── tsconfig.build.json        # `npm run build`: src/ only, emits to dist/
 │
+├── Dockerfile                 # multi-stage; runtime is node:24-slim with prod deps only (issue #6)
+├── .dockerignore              # denylist for the build context; keeps host node_modules and dist out
+│
 ├── src/                       # TypeScript source, the only thing that ships
 │   ├── index.ts               # server entrypoint: validate config, bind $PORT, listen
 │   ├── server.ts              # builds the Express app; does not listen
@@ -34,7 +37,11 @@ onenote-mcp/
 │
 ├── scripts/                   # operational shell scripts, not part of the built artifact
 │   ├── gcp-bootstrap.sh       # one-time GCP provisioning (issue #2)
-│   └── test/                  # bash tests for the above, with a stub `gcloud` on PATH
+│   └── test/                  # bash tests, run by scripts/test/run.sh
+│       ├── run.sh             # syntax + shellcheck + the behavioural suites
+│       ├── bootstrap.test.sh  # gcp-bootstrap.sh against a stub `gcloud` on PATH
+│       ├── docker.test.sh     # builds the image and runs the container (opt-in)
+│       └── stubs/gcloud
 │
 └── dist/                      # build output; gitignored, never edited, never committed
 ```
@@ -45,9 +52,12 @@ whose behaviour is process exit codes and stderr, so it is verified by running i
 than by a unit test — the commands are in the Final Verification section of
 `docs/plans/5-repo-skeleton.md`. `src/bootstrap.ts` is a placeholder until issue #9.
 
-`scripts/test/` is deliberately separate from `test/`: those are bash tests for
-`gcp-bootstrap.sh`, driven by `scripts/test/run.sh` against a stub `gcloud` on `PATH`.
-`npm test` does not run them.
+`scripts/test/` is deliberately separate from `test/`: those are bash tests driven by
+`scripts/test/run.sh`. `npm test` does not run them. `bootstrap.test.sh` exercises
+`gcp-bootstrap.sh` against a stub `gcloud` on `PATH`. `docker.test.sh` builds the image
+and starts the container, so it needs a Docker daemon and takes about a minute;
+`run.sh` runs it only when `RUN_DOCKER_TESTS=1` is set and prints an explicit skip line
+otherwise. Both suites still get `bash -n` and `shellcheck` on every run.
 
 ## Commands
 
@@ -107,6 +117,23 @@ drive routes on an ephemeral port. Mount new routes there, not in `index.ts`.
 **`/healthz` reports no configuration.** The service deploys `--allow-unauthenticated`,
 so its response body is public. A test asserts no key or value in that body matches the
 stub config's secrets; do not add config echo to it.
+
+**The container's runtime base is Debian `-slim`, never Alpine.**
+`@resvg/resvg-js-linux-x64-gnu` declares `libc: ["glibc"]` and ships no musl prebuild.
+On an Alpine base the optional package either fails to install or fails at `require`
+time, and handwriting rendering is the point of this service.
+
+**The runtime stage installs its own dependencies; it does not copy `node_modules`
+forward.** `npm ci --omit=dev` runs again from the lockfile in the runtime stage. Copying
+`/app/node_modules` from the build stage would ship `typescript` and `@types/node` into
+the deployed image, and it would test nothing about whether the platform-specific resvg
+package still resolves without dev dependencies. `scripts/test/docker.test.sh` asserts
+both — that the `.node` binary is present and that `node_modules/typescript` is not.
+
+**`.dockerignore` is a denylist.** A new source directory is included in the build
+context by default rather than silently dropped. The entries that mirror `.gitignore`
+(`.env*`, `*.token-cache.json`, `.msal-cache*`) are there so a local operator's
+credentials cannot reach an image layer.
 
 ## Repository hygiene
 
