@@ -193,3 +193,63 @@ gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" \
   --member="serviceAccount:$DEPLOY_SA" \
   --role="roles/iam.serviceAccountUser" \
   --project="$PROJECT" --quiet >/dev/null
+
+# ---------------------------------------------------------------------------
+# Workload Identity Federation
+#
+# WIF resource names use the numeric project number, not the project ID.
+# ---------------------------------------------------------------------------
+PROJECT_NUMBER="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')"
+[[ -n "$PROJECT_NUMBER" ]] || die "Could not resolve project number for $PROJECT"
+
+POOL_RESOURCE="projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL_ID}"
+WIF_PROVIDER="${POOL_RESOURCE}/providers/${PROVIDER_ID}"
+PRINCIPAL_SET="principalSet://iam.googleapis.com/${POOL_RESOURCE}/attribute.repository/${GITHUB_REPO}"
+
+# A deleted pool is soft-deleted for 30 days. Re-creating one under the same
+# id inside that window fails until it is undeleted or purged.
+ensure_resource "workload identity pool $POOL_ID" \
+  gcloud iam workload-identity-pools describe "$POOL_ID" \
+    --location=global --project="$PROJECT" \
+  -- \
+  gcloud iam workload-identity-pools create "$POOL_ID" \
+    --location=global \
+    --display-name="GitHub Actions" \
+    --project="$PROJECT"
+
+# attribute.repository must be mapped, not just conditioned on: the condition
+# below and the principalSet further down both resolve through it.
+ATTR_MAPPING="google.subject=assertion.sub,attribute.repository=assertion.repository"
+ATTR_CONDITION="assertion.repository == \"${GITHUB_REPO}\""
+
+# This is the one resource that is updated rather than skipped when it already
+# exists. A provider created earlier without the attribute condition would let
+# any GitHub repository impersonate the deploy service account, and skipping
+# would leave that in place silently.
+if gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
+     --location=global --workload-identity-pool="$POOL_ID" \
+     --project="$PROJECT" >/dev/null 2>&1; then
+  log "OIDC provider $PROVIDER_ID exists, re-applying attribute mapping and condition"
+  gcloud iam workload-identity-pools providers update-oidc "$PROVIDER_ID" \
+    --location=global \
+    --workload-identity-pool="$POOL_ID" \
+    --attribute-mapping="$ATTR_MAPPING" \
+    --attribute-condition="$ATTR_CONDITION" \
+    --project="$PROJECT"
+else
+  log "creating OIDC provider $PROVIDER_ID"
+  gcloud iam workload-identity-pools providers create-oidc "$PROVIDER_ID" \
+    --location=global \
+    --workload-identity-pool="$POOL_ID" \
+    --display-name="GitHub OIDC" \
+    --issuer-uri="https://token.actions.githubusercontent.com" \
+    --attribute-mapping="$ATTR_MAPPING" \
+    --attribute-condition="$ATTR_CONDITION" \
+    --project="$PROJECT"
+fi
+
+log "granting roles/iam.workloadIdentityUser on $DEPLOY_SA to $GITHUB_REPO"
+gcloud iam service-accounts add-iam-policy-binding "$DEPLOY_SA" \
+  --member="$PRINCIPAL_SET" \
+  --role="roles/iam.workloadIdentityUser" \
+  --project="$PROJECT" --quiet >/dev/null

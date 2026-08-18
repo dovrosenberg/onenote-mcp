@@ -135,6 +135,36 @@ run_bootstrap PROJECT=test-project SERVICE=other-name STUB_MISSING="$ALL_MISSING
 assert_logged "iam service-accounts create other-name-run" "SERVICE override drives the runtime SA id"
 assert_logged "iam service-accounts create other-name-deploy" "SERVICE override drives the deploy SA id"
 
+echo "--- Phase 4: Workload Identity Federation ---"
+
+POOL_RES="projects/123456789012/locations/global/workloadIdentityPools/github-pool"
+
+run_bootstrap PROJECT=test-project STUB_MISSING="$ALL_MISSING"
+assert_logged "iam workload-identity-pools create github-pool --location=global" \
+  "fresh run creates the pool at location global"
+assert_logged "providers create-oidc github-provider" "fresh run creates the OIDC provider"
+assert_logged "--issuer-uri=https://token.actions.githubusercontent.com" \
+  "provider issuer is GitHub Actions"
+assert_logged "attribute.repository=assertion.repository" \
+  "attribute mapping exposes attribute.repository"
+assert_logged "--attribute-condition=assertion.repository == \"dovrosenberg/onenote-mcp\"" \
+  "provider is conditioned on this repository only"
+assert_logged "iam service-accounts add-iam-policy-binding $DEP_SA --member=principalSet://iam.googleapis.com/$POOL_RES/attribute.repository/dovrosenberg/onenote-mcp --role=roles/iam.workloadIdentityUser" \
+  "workloadIdentityUser is granted to the repo principalSet on the deploy SA"
+
+run_bootstrap PROJECT=test-project STUB_MISSING=
+assert_logged "providers update-oidc github-provider" "existing provider is updated, not skipped"
+assert_not_logged "providers create-oidc" "existing provider is not re-created"
+assert_logged "--attribute-condition=assertion.repository == \"dovrosenberg/onenote-mcp\"" \
+  "update re-applies the repository condition"
+assert_not_logged "iam workload-identity-pools create github-pool" "existing pool is not re-created"
+
+run_bootstrap PROJECT=test-project GITHUB_REPO=someone/else STUB_MISSING="$ALL_MISSING"
+assert_logged "--attribute-condition=assertion.repository == \"someone/else\"" \
+  "GITHUB_REPO override drives the attribute condition"
+assert_logged "attribute.repository/someone/else --role=roles/iam.workloadIdentityUser" \
+  "GITHUB_REPO override drives the principalSet"
+
 if [[ "$FAILURES" -ne 0 ]]; then
   printf '\n%s assertion(s) failed\n' "$FAILURES"
   exit 1
