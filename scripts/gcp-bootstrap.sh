@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+#
+# Provisions every GCP resource the onenote-mcp deploy pipeline needs:
+# APIs, an Artifact Registry Docker repo, a Firestore database in Native mode,
+# a runtime and a deploy service account, and a Workload Identity Federation
+# pool bound to this GitHub repository only.
+#
+# The script is idempotent -- re-running it on an already-configured project
+# is a no-op that still re-asserts every IAM binding and prints the output
+# block at the end.
+#
+# No service-account JSON key is created. Deploys authenticate through
+# Workload Identity Federation, so no key is needed anywhere.
+#
+# Issue #3 is the manual runbook for executing this script.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Parameters. Override any of these from the environment, or edit in place.
+#
+# PROJECT has no default on purpose -- pointing this at the wrong project
+# would create resources you did not ask for.
+#
+# REGION is used both for Cloud Run and for the Firestore database, so it
+# must be a valid Firestore location name (e.g. us-central1, europe-west1,
+# nam5). Firestore locations are a subset of Cloud Run regions.
+# ---------------------------------------------------------------------------
+PROJECT="${PROJECT:-}"
+REGION="${REGION:-us-central1}"
+GAR_REGION="${GAR_REGION:-us-central1}"
+SERVICE="${SERVICE:-onenote-mcp}"
+GITHUB_REPO="${GITHUB_REPO:-dovrosenberg/onenote-mcp}"
+
+# Derived names. Not intended to be overridden.
+RUNTIME_SA_ID="${SERVICE}-run"
+DEPLOY_SA_ID="${SERVICE}-deploy"
+GAR_REPO="${SERVICE}"
+POOL_ID="github-pool"
+PROVIDER_ID="github-provider"
+
+log()  { printf '==> %s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+command -v gcloud >/dev/null 2>&1 || die "gcloud not found on PATH"
+[[ -n "$PROJECT" ]] || die "Set PROJECT (env var, or edit the top of this script)"
+
+gcloud projects describe "$PROJECT" >/dev/null 2>&1 \
+  || die "Cannot describe project $PROJECT. Run: gcloud auth login"
+
+RUNTIME_SA="${RUNTIME_SA_ID}@${PROJECT}.iam.gserviceaccount.com"
+DEPLOY_SA="${DEPLOY_SA_ID}@${PROJECT}.iam.gserviceaccount.com"
+
+# Non-fatal: checking billing needs a permission the operator may not have
+# granted themselves, and a false negative should not block provisioning.
+billing_enabled="$(gcloud beta billing projects describe "$PROJECT" \
+  --format='value(billingEnabled)' 2>/dev/null || true)"
+if [[ -z "$billing_enabled" ]]; then
+  warn "Could not check billing on $PROJECT. Confirm it is enabled before deploying."
+elif [[ "$billing_enabled" != "True" ]]; then
+  warn "Billing is not enabled on $PROJECT. Artifact Registry and Cloud Run will fail."
+fi
+
+log "Project:      $PROJECT"
+log "Region:       $REGION"
+log "GAR region:   $GAR_REGION"
+log "Service:      $SERVICE"
+log "GitHub repo:  $GITHUB_REPO"
+log "Runtime SA:   $RUNTIME_SA"
+log "Deploy SA:    $DEPLOY_SA"
+
+# ---------------------------------------------------------------------------
+# ensure_resource <human name> <describe command...> -- <create command...>
+#
+# Runs the describe command; creates only if it fails. Every create command
+# in this script exits non-zero with ALREADY_EXISTS on a second run, so the
+# guard is what makes the script re-runnable.
+# ---------------------------------------------------------------------------
+ensure_resource() {
+  local name="$1"; shift
+  local -a describe_cmd=() create_cmd=()
+  local seen_sep=0 arg
+  for arg in "$@"; do
+    if [[ "$arg" == "--" && $seen_sep -eq 0 ]]; then
+      seen_sep=1
+      continue
+    fi
+    if [[ $seen_sep -eq 0 ]]; then
+      describe_cmd+=("$arg")
+    else
+      create_cmd+=("$arg")
+    fi
+  done
+  if "${describe_cmd[@]}" >/dev/null 2>&1; then
+    log "$name already exists, skipping create"
+  else
+    log "creating $name"
+    "${create_cmd[@]}"
+  fi
+}
