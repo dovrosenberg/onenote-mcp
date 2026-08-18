@@ -9,7 +9,7 @@
 
 | Phase | Status | Commit |
 |-------|--------|--------|
-| Phase 1: `src/graph-auth.ts` — scopes, named error, silent acquisition, unit tests | ☐ | — |
+| Phase 1: `src/graph-auth.ts` — scopes, named error, silent acquisition, unit tests | ☑ | this commit |
 | Phase 2: Documentation — `README.md`, `CLAUDE.md` | ☐ | — |
 
 ## Acceptance Criteria
@@ -197,3 +197,10 @@ Write a throwaway script under the scratchpad — not in the repository, and nev
 ## Findings
 
 > Filled in during implementation: what the work revealed that planning missed, and the recorded output of the manual verification procedure.
+
+### Phase 1
+
+- **`noUncheckedIndexedAccess` collapses the empty-cache check into one branch.** The plan had a `accounts.length === 0` check followed by `accounts[0]`. Under `noUncheckedIndexedAccess` (`tsconfig.json:14`) that index is `AccountInfo | undefined`, so it would need a cast. The implementation destructures — `const [account] = accounts` — and throws `no-account` when it is `undefined`. One check, no cast; `src/graph-auth.ts` contains no `as`, `@ts-ignore`, or `@ts-expect-error`.
+- **`cause` is assigned, not passed to `super`.** `GraphAuthError`'s constructor takes `options: { cause?: unknown }` and sets `this.cause` only when the key is present. Passing `options` straight to `super` would give every error an own `cause` property of `undefined` on the two paths that have no underlying error (`no-account`, and the null-or-blank-result branch of `silent-failed`), which the tests then could not distinguish from a wrapped error.
+- **The source-scan test asserts it scanned something.** `no module under src/ calls acquireTokenByDeviceCode except bootstrap.ts` first asserts that the file list includes `graph-auth.ts`. Without that, a `readdir` returning an empty list — a moved directory, a changed `import.meta.dirname` — would make the test pass while checking nothing.
+- **Verified:** `npm run typecheck` exit 0; `npm test` 31 pass / 0 fail / 0 skipped; `npm run build` emits `dist/graph-auth.js`; `git grep acquireTokenByDeviceCode -- src/` returns nothing.
