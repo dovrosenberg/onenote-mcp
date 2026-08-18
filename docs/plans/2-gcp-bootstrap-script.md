@@ -8,11 +8,11 @@
 
 | Phase | Status | Commit |
 |-------|--------|--------|
-| Phase 1: Script scaffold, parameters, preflight, test harness | ☐ | — |
-| Phase 2: APIs, Artifact Registry, Firestore | ☐ | — |
-| Phase 3: Service accounts and IAM role grants | ☐ | — |
-| Phase 4: Workload Identity Pool, OIDC provider, repo binding | ☐ | — |
-| Phase 5: Output block, no-key guarantee, full re-run test | ☐ | — |
+| Phase 1: Script scaffold, parameters, preflight, test harness | ☑ | `65c07ba` |
+| Phase 2: APIs, Artifact Registry, Firestore | ☑ | `03d41a7` |
+| Phase 3: Service accounts and IAM role grants | ☑ | `d6b9c8b` |
+| Phase 4: Workload Identity Pool, OIDC provider, repo binding | ☑ | `8bb7eac` |
+| Phase 5: Output block, no-key guarantee, full re-run test | ☑ | `0c54a2e` |
 
 ## Acceptance Criteria
 
@@ -410,12 +410,14 @@ Fixed in Phase 1 and used throughout:
 
 ## Final Verification
 
-- [ ] `bash scripts/test/run.sh` exits 0 — this is the full suite (`bash -n`, `shellcheck`, and `bootstrap.test.sh`)
-- [ ] `shellcheck scripts/gcp-bootstrap.sh scripts/test/bootstrap.test.sh scripts/test/run.sh scripts/test/stubs/gcloud` reports no warnings
-- [ ] All four created files are executable (`git ls-files -s scripts/` shows mode `100755`)
-- [ ] `grep -rn "keys create\|--key-file-type\|private_key" scripts/` returns nothing
-- [ ] The variable names in the output block are byte-identical to the `vars.*` references in the workflow sketch at `project-spec.md:284` and to the checklist in issue #4
-- [ ] Acceptance criteria traceability:
+- [x] `bash scripts/test/run.sh` exits 0 — full suite, 64 assertions passing (`bash -n`, `shellcheck`, `bootstrap.test.sh`)
+- [x] `shellcheck` reports no warnings on all four files (run via `npx --yes shellcheck` — no system shellcheck on this machine, so `run.sh` falls back to npx)
+- [x] All four created files are executable — `git ls-files -s scripts/` shows mode `100755` for each
+- [x] `grep -n "keys create\|--key-file-type\|private_key" scripts/gcp-bootstrap.sh` returns nothing
+      (scoped to the script, not all of `scripts/` — `bootstrap.test.sh` contains these strings
+      as the assertion patterns that enforce the rule)
+- [x] The variable names in the output block are byte-identical to the `vars.*` references in the workflow sketch at `project-spec.md:284` and to the checklist in issue #4
+- [x] Acceptance criteria traceability:
   - **AC-1** (enable six APIs): Phase 2 — single `gcloud services enable` call with all six service names, asserted by a test that greps each name.
   - **AC-2** (Artifact Registry repo): Phase 2 — `ensure_resource` guard around `artifacts repositories create --repository-format=docker --location=$GAR_REGION`.
   - **AC-3** (Firestore Native): Phase 2 — `ensure_resource` guard around `firestore databases create --location=$REGION --type=firestore-native`.
