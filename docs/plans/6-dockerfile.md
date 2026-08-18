@@ -307,16 +307,20 @@ The repository has no JavaScript linter; `npm run typecheck` is the static-analy
    see, so it emits SC2329. Suppressed with a `# shellcheck disable=SC2329` line carrying
    the reason. `scripts/test/bootstrap.test.sh` never hit this because it has no trap.
 
-2. **The literal AC-7 command could not be run as written on this machine — something
-   else already holds host port 8080.** `docker run -p 8080:8080` fails with
-   `failed to bind host port 0.0.0.0:8080/tcp: address already in use`, and a `curl
-   localhost:8080/healthz` in that state returns a 200 from the unrelated service, which
-   is a false pass. The command was run with `-p 8081:8080 -e PORT=8080` instead: the
-   container side is unchanged, and the response was `HTTP/1.1 200 OK`,
-   `Content-Type: application/json`, with `listening on port 8080` in the container log.
-   This is the reason `docker.test.sh` publishes on host port 0 and resolves the real
-   port with `docker port` rather than using a fixed host port. The README's Container
-   section notes the `-p 8081:8080` fallback.
+2. **AC-7 verified with the literal command.** `docker build --platform linux/amd64 -t
+   onenote-mcp .` then `docker run -d -p 8080:8080 -e PORT=8080 ...` then `curl -i
+   localhost:8080/healthz` returns `HTTP/1.1 200 OK`,
+   `Content-Type: application/json; charset=utf-8`, body
+   `{"status":"ok","service":"onenote-mcp","version":"0.1.0"}`, with `listening on port
+   8080` in the container log.
+
+   On the first attempt an unrelated process held host port 8080, so `docker run` failed
+   with `failed to bind host port 0.0.0.0:8080/tcp: address already in use` — and a
+   `curl localhost:8080/healthz` in that state returned a 200 from that other service,
+   which is a false pass. The owner freed the port and the command was re-run as written.
+   That near-miss is the reason `docker.test.sh` publishes on host port 0 and resolves
+   the real port with `docker port` instead of using a fixed one, and the reason the
+   README's Container section notes the `-p 8081:8080` fallback.
 
 3. **`node -e` in the image must use `require`, not an ESM import.** `node -e` runs as
    CommonJS regardless of `"type": "module"` in `package.json`, so the resvg check is
