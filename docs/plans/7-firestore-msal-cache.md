@@ -8,7 +8,7 @@
 
 | Phase | Status | Commit |
 |-------|--------|--------|
-| Phase 1: `src/token-cache.ts` — plugin, factory, pure-function unit tests | ☐ | — |
+| Phase 1: `src/token-cache.ts` — plugin, factory, pure-function unit tests | ☑ | this commit |
 | Phase 2: Emulator-backed tests (round-trip, concurrency) | ☐ | — |
 | Phase 3: Documentation — `README.md`, `CLAUDE.md` | ☐ | — |
 
@@ -294,3 +294,10 @@ Nothing else. No parsing of the blob, no per-entity documents, no schema version
 ## Findings
 
 > Filled in during implementation: what the work revealed that planning missed, and the pasted output of the manual emulator run.
+
+### Phase 1
+
+- **`TokenCacheError` carries the path as a field, not only in the message.** The plan said the message carries the document path. The implementation adds `readonly documentPath: string`, mirroring `ConfigError`'s structured `missing`/`invalid` fields in `src/config.ts:14`. The test asserts the path by field rather than by matching prose, so rewording the message cannot silently break it. The message text is unchanged from the plan.
+- **`exists === true` is not sufficient to decode.** `readCache` returns `null` when `snapshot.exists` is true but `data()` is `undefined`, not just when `exists` is false. The plan's prose said this; it is recorded here because the branch condition is two checks, not one. Covered by the first test.
+- **No typing workaround was needed.** `DocumentSnapshot` satisfies `CacheSnapshot` structurally — `readonly exists: boolean` and `data(): DocumentData | undefined`, where `DocumentData`'s index signature is assignable to `Record<string, unknown>` — so neither `this.#ref.get()` nor `tx.get(this.#ref)` needs a cast, and `tx.set` accepted the two-field computed-key object without a generic annotation. `src/token-cache.ts` contains no `as any`, `@ts-ignore`, or `@ts-expect-error`.
+- **Verified:** `npm run typecheck` exit 0; `npm test` 24 pass / 0 fail / 0 skipped; `npm run build` emits `dist/token-cache.js`.
