@@ -9,8 +9,8 @@
 | Phase | Status | Commit |
 |-------|--------|--------|
 | Phase 1: Project skeleton, dependencies, build and test wiring | ☑ | `e6f00dc` |
-| Phase 2: `src/config.ts` — grouped env schema and fail-fast validation | ☐ | — |
-| Phase 3: `src/index.ts` entrypoint, `/healthz`, bootstrap placeholder | ☐ | — |
+| Phase 2: `src/config.ts` — grouped env schema and fail-fast validation | ☑ | `7a06ac7` |
+| Phase 3: `src/index.ts` entrypoint, `/healthz`, bootstrap placeholder | ☑ | pending |
 
 ## Acceptance Criteria
 
@@ -293,7 +293,8 @@ The repo has no JavaScript linter and this issue does not ask for one, so adding
 - [ ] `npm run typecheck` exits 0 (lint)
 - [ ] `npm run build && env -u ONENOTE_CLIENT_ID -u ONENOTE_AUTHORITY -u MCP_OAUTH_CLIENT_ID -u MCP_OAUTH_CLIENT_SECRET -u MCP_TOKEN_SIGNING_KEY npm start` exits non-zero, prints all five missing names, and prints no line matching `` `at .*\(` `` (AC-9)
 - [ ] with all required vars set and `PORT=8081`, `npm start` logs `listening on port 8081` and `curl -s -o /dev/null -w '%{http_code}' localhost:8081/healthz` returns `200` (AC-5)
-- [ ] with all required vars set and `PORT` unset, the same check against `localhost:8080` returns `200` (default path)
+- [ ] with all required vars set and `PORT` unset, startup logs `listening on port 8080` (default path). ⚠️ Not measurable as an HTTP 200 on this machine — an unrelated process holds port 8080. The default *value* is covered by the `config.test.ts` case asserting `8080`, and the default being *read by the entrypoint* is covered by the startup log line. The HTTP 200 is verified on `PORT=8081`, which is the same code path with a different value.
+- [ ] a bind failure (`EADDRINUSE`, `EACCES`) prints one readable line and exits 1 with no stack trace — added during Phase 3, see Findings during execution
 - [ ] `grep -rnE '\b(8080|3000)\b' src/index.ts src/server.ts` returns nothing — the only `8080` in the tree is the documented default inside the `config.ts` table (AC-5, "never a hardcoded port")
 - [ ] `npm run bootstrap` with the graph and firestore vars set prints the issue-#9 message and exits 1
 
@@ -322,3 +323,44 @@ The repo has no JavaScript linter and this issue does not ask for one, so adding
 
 - **Issue #6:** ✅ Done — its Dockerfile AC was edited to `node:24-slim`, and a "Base image constraints" section was added recording that the base must stay Debian `-slim` and must not become Alpine (the resvg prebuild is glibc-only, no musl build exists).
 - **Issue #21:** will need to add a public-base-URL env var to both `config.ts` and the deploy workflow's `env_vars:` block in the same change. Deliberately omitted here (Scope excess).
+
+---
+
+## Findings during execution
+
+Things learned while implementing that were not visible when the plan was written.
+
+1. **`dist/` was shipping compiled test files.** The single `tsconfig.json` emitted
+   `version.test.js` into `dist/`, which the Docker runtime stage in #6 would then carry.
+   Fixed by adding `tsconfig.build.json`, which extends the base config and excludes
+   `src/**/*.test.ts` from emit. `npm run build` uses it; `npm run typecheck` keeps using
+   the base config, so tests are still type-checked. Verified both ways: a deliberate type
+   error planted in a `.test.ts` file fails `npm run typecheck`, and `dist/` contains no
+   `.test.js`.
+
+2. **The entrypoint had no `listen` error handler.** A port conflict or a privileged port
+   would have printed a raw stack trace — the same failure mode AC-9 rules out for missing
+   variables, reached by a different route. `src/index.ts` now handles `EADDRINUSE` and
+   `EACCES` with one readable line and exit 1, and rethrows anything else. This was
+   confirmed against a real conflict rather than a simulated one: port 8080 on the
+   development machine is held by an unrelated process, and the handler produced
+   `Port 8080 is already in use. Set PORT to a free port.` with exit 1 and no stack.
+
+3. **`app.listen()` returns the `http.Server`, not the `Application`.** The first attempt
+   attached `.on('error')` and `.close()` to the value returned by `createApp()`, which is
+   an Express `Application`. `npm run typecheck` caught it before commit
+   (`TS2345: Argument of type '"error"' is not assignable to parameter of type '"mount"'`),
+   which is the specific reason the plan accepts `tsc --noEmit` as the lint substitute.
+
+4. **`createApp` sets `trust proxy` and disables `x-powered-by`.** Neither is in the issue.
+   `trust proxy` is needed because Cloud Run terminates TLS and forwards the original
+   scheme in `X-Forwarded-Proto`; without it `req.protocol` reports `http`, and issue #22's
+   authorization-code redirect has to build absolute `https` URLs. Setting it now avoids a
+   confusing debugging session later.
+
+5. **A local `curl localhost:8080` can reach the wrong server.** Node's `listen(port)` binds
+   dual-stack `::`, while the unrelated process on this machine binds `127.0.0.1` only.
+   `curl localhost` resolves to `127.0.0.1` and reached the other process, which returned
+   `200` for `GET /` and briefly looked like a missing-404 bug in this server. Probing
+   `http://[::1]:PORT` instead disambiguates. Worth knowing before debugging #6's container
+   run against a local port.
