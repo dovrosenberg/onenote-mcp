@@ -480,10 +480,19 @@ change rarely; pages change often. Anything that needs the tree more than once i
 hour should hold it rather than fetch it, and no tool should walk the account as a side
 effect of answering an unrelated question.
 
-**Ask for the fields, not the objects.** `$select` is already used on every listing in
-`src/graph-structure.ts`. Keep it that way. The 441 KB measured for the expanded tree was
-with no `$select` inside the expand clauses; whether `$expand=sections($select=id,displayName)`
-is accepted here has not been tested.
+**Ask for the fields, not the objects, inside the expand clauses too.** `$select` is
+already used on every listing in `src/graph-structure.ts`. It also works inside `$expand`
+here, and it is worth 5.7x on the tree above — same 54 notebooks, 290 sections, 43
+section groups and 270 group sections in every case:
+
+| Request | Bytes |
+|---|---|
+| `?$expand=sections,sectionGroups($expand=sections)` | 441,012 |
+| `?$expand=sections($select=id,displayName),sectionGroups($expand=sections($select=id,displayName))` | 158,070 |
+| the same plus `$select=id,displayName` at the top level and on `sectionGroups` | 77,982 |
+
+The third form is the one to use. Note the separator inside a clause that carries both:
+`sectionGroups($select=id,displayName;$expand=sections(...))` — a semicolon, not a comma.
 
 ## Repository hygiene
 
