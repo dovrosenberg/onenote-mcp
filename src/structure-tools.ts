@@ -1,4 +1,5 @@
-// The four browsing tools: list_notebooks, list_sections, list_pages, search_pages.
+// The browsing tools: list_notebooks, list_sections, list_pages, search_pages, and the
+// two name-based lookups, find_page_by_name and list_pages_by_name.
 //
 // These are what a calling model uses to get from "somewhere in this account" to a page
 // id, which is the only thing the reading and writing tools take. The descriptions below
@@ -15,6 +16,10 @@
 // `search_pages` never calls the account-wide page list; see src/page-search.ts for what
 // it does instead and why the walk is bounded.
 //
+// The two `_by_name` tools exist because everything else here takes an id, so a caller
+// that already knows the names pays three round trips to convert them. They resolve the
+// whole path in one Graph request; the rules for matching are in src/name-lookup.ts.
+//
 // Every result is JSON in a single text block. Nothing here logs a notebook, section, or
 // page name: the names are the answer and go to the caller, and src/logging.ts records
 // only the tool name.
@@ -24,10 +29,12 @@ import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 import type {
   ContainerChildren,
   ContainerKind,
+  ExpandedNotebook,
   Notebook,
   NotebookTree,
   PageSummary,
 } from './graph-structure.ts';
+import { namesMatch, resolveSection, type ResolvedPath } from './name-lookup.ts';
 import {
   MAX_SECTIONS_SEARCHED,
   SEARCH_TIME_BUDGET_MS,
@@ -60,7 +67,36 @@ export interface StructureClient {
   listContainerChildren(kind: ContainerKind, containerId: string): Promise<ContainerChildren>;
   listPagesInSection(sectionId: string, top?: number): Promise<PageSummary[]>;
   getFullTree(): Promise<NotebookTree[]>;
+  getExpandedTree(): Promise<ExpandedNotebook[]>;
 }
+
+/**
+ * How many page titles `find_page_by_name` reads before it stops looking.
+ *
+ * 100 is Graph's own ceiling, not a choice: `$top=200` on a section's pages comes back
+ * as 400 with code 20129, "the limit of '100' for the $top query has been exceeded".
+ * A section holding more pages than this could hide a match, so the result reports
+ * `pagesScanned` and `scanTruncated` rather than a clean miss.
+ */
+const TITLE_SCAN_LIMIT = TOP_RANGE.max;
+
+/** The name arguments both `_by_name` tools share. */
+const NAME_PATH_PROPERTIES = {
+  notebookName: {
+    type: 'string',
+    description: 'The notebook name, matched in full and case-insensitively.',
+  },
+  sectionGroupName: {
+    type: 'string',
+    description:
+      'The section group holding the section, if it is in one. Omit when the section ' +
+      'sits directly in the notebook; omitting it does not search inside groups.',
+  },
+  sectionName: {
+    type: 'string',
+    description: 'The section name, matched in full and case-insensitively.',
+  },
+} as const;
 
 /**
  * Build the browsing tools over one structure client.
@@ -254,6 +290,98 @@ export function createStructureTools(
         });
       },
     },
+
+    {
+      name: 'find_page_by_name',
+      title: 'Find a page by name',
+      description:
+        'Find a page when you already know where it lives: the notebook, the section ' +
+        'group if it is in one, the section, and the page title. Saves the ' +
+        'list_notebooks -> list_sections -> list_pages walk that reaching the same page ' +
+        'by id would cost. Every name is matched in full and case-insensitively, so ' +
+        "'monthly log' finds 'Monthly Log' and 'Monthly' finds nothing — use " +
+        'search_pages when you only remember part of a title. Omit sectionGroupName ' +
+        'when the section sits directly in the notebook; it is not a wildcard. A name ' +
+        'that matches nothing comes back as an error listing what was there, and a name ' +
+        'that matches more than one thing comes back as an error listing the ' +
+        'candidates. Returns the page id to pass to get_page_content.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ...NAME_PATH_PROPERTIES,
+          pageTitle: {
+            type: 'string',
+            description: 'The page title, matched in full and case-insensitively.',
+          },
+        },
+        required: ['notebookName', 'sectionName', 'pageTitle'],
+        additionalProperties: false,
+      },
+      annotations: READ_ONLY,
+      handle: async (args) => {
+        const path = namePath(args);
+        const pageTitle = requiredString(args, 'pageTitle');
+
+        const resolved = await resolveSection(structure, path);
+        const pages = await structure.listPagesInSection(resolved.section.id, TITLE_SCAN_LIMIT);
+        const matches = pages.filter((page) => namesMatch(page.title, pageTitle));
+
+        return jsonResult({
+          ...resolvedPayload(resolved),
+          pageTitle,
+          matches: matches.map(pagePayload),
+          matchCount: matches.length,
+          // A section holding more pages than the scan bound could hide a match, and a
+          // caller cannot tell that from a genuine miss without being told.
+          pagesScanned: pages.length,
+          scanTruncated: pages.length >= TITLE_SCAN_LIMIT,
+          note: findNote(resolved, matches.length, pages.length),
+        });
+      },
+    },
+
+    {
+      name: 'list_pages_by_name',
+      title: 'List a section\'s pages by name',
+      description:
+        'List the pages in a section you can name, most recently modified first. Takes ' +
+        'the notebook name, the section group name if the section is in one, and the ' +
+        'section name, all matched in full and case-insensitively. This is list_pages ' +
+        'without the two calls it would take to turn those names into a section id. top ' +
+        `bounds the result (${TOP_RANGE.min}-${TOP_RANGE.max}, default ${DEFAULT_TOP}) ` +
+        'and moreAvailable reports whether older pages exist beyond it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ...NAME_PATH_PROPERTIES,
+          top: {
+            type: 'integer',
+            minimum: TOP_RANGE.min,
+            maximum: TOP_RANGE.max,
+            description: `How many pages to return. Defaults to ${DEFAULT_TOP}.`,
+          },
+        },
+        required: ['notebookName', 'sectionName'],
+        additionalProperties: false,
+      },
+      annotations: READ_ONLY,
+      handle: async (args) => {
+        const path = namePath(args);
+        const top = optionalInteger(args, 'top', TOP_RANGE) ?? DEFAULT_TOP;
+
+        const resolved = await resolveSection(structure, path);
+        const pages = await structure.listPagesInSection(resolved.section.id, top);
+
+        return jsonResult({
+          ...resolvedPayload(resolved),
+          pages: pages.map(pagePayload),
+          count: pages.length,
+          top,
+          moreAvailable: pages.length >= top,
+        });
+      },
+    },
+
   ];
 }
 
@@ -290,6 +418,60 @@ function searchNote(result: SearchResult): string {
   if (result.totalMatches > result.matches.length) {
     parts.push(
       `${result.totalMatches} titles matched and the ${result.matches.length} most recently modified are returned.`,
+    );
+  }
+
+  return parts.join(' ');
+}
+
+/** The three name arguments, read the same way by both `_by_name` tools. */
+function namePath(args: Readonly<Record<string, unknown>>): {
+  notebookName: string;
+  sectionGroupName: string | undefined;
+  sectionName: string;
+} {
+  return {
+    notebookName: requiredString(args, 'notebookName'),
+    sectionGroupName: optionalString(args, 'sectionGroupName'),
+    sectionName: requiredString(args, 'sectionName'),
+  };
+}
+
+/**
+ * What the lookup resolved to, in every `_by_name` result.
+ *
+ * The ids are here so a caller can move on to get_page_content, list_pages, or the write
+ * tools without repeating the lookup, and the display names are here so it can see which
+ * container it actually got — the names it passed differ in case, and may differ in
+ * whitespace.
+ */
+function resolvedPayload(resolved: ResolvedPath): Record<string, unknown> {
+  return {
+    notebook: resolved.notebook,
+    sectionGroup: resolved.sectionGroup,
+    section: resolved.section,
+  };
+}
+
+function pagePayload(page: PageSummary): Record<string, unknown> {
+  return { id: page.id, title: page.title, lastModifiedDateTime: page.lastModifiedDateTime };
+}
+
+/** What a zero-match find means, which depends on whether the scan was complete. */
+function findNote(resolved: ResolvedPath, matchCount: number, scanned: number): string {
+  const parts: string[] = [];
+
+  if (matchCount === 0) {
+    parts.push(
+      scanned >= TITLE_SCAN_LIMIT
+        ? `No page title matched, but only the ${TITLE_SCAN_LIMIT} most recently modified pages were read, so an older page may still match. Use list_pages_by_name with the section id, or search_pages scoped to it.`
+        : `No page title matched. All ${scanned} page(s) in the section were read, so no page in it has that title. Titles are matched in full, ignoring case.`,
+    );
+  }
+
+  if (resolved.deepSearchUsed) {
+    parts.push(
+      'The section was found inside a section group nested below the one named, which cost one extra request.',
     );
   }
 

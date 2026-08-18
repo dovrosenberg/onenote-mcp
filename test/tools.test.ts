@@ -20,7 +20,15 @@ test('createTools exposes the browsing tools and the reading tool', () => {
   const tools = createTools(STUB_CONFIG);
   assert.deepEqual(
     tools.map((tool) => tool.name),
-    ['list_notebooks', 'list_sections', 'list_pages', 'search_pages', 'get_page_content'],
+    [
+      'list_notebooks',
+      'list_sections',
+      'list_pages',
+      'search_pages',
+      'find_page_by_name',
+      'list_pages_by_name',
+      'get_page_content',
+    ],
   );
   assert.doesNotThrow(() => indexTools(tools));
 });

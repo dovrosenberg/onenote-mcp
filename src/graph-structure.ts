@@ -20,6 +20,21 @@ export const GRAPH_ROOT = 'https://graph.microsoft.com/v1.0';
 /** `$select` for structure nodes; display names are needed to show a tree at all. */
 const NODE_SELECT = '$select=id,displayName&$orderby=displayName';
 
+/**
+ * One request that returns a notebook's sections, its section groups, and those groups'
+ * sections. `$select` is repeated inside every expand clause because it is worth 5.7x on
+ * the response: 441 KB without it against 78 KB with it, for the same tree. The separator
+ * inside a clause carrying both `$select` and `$expand` is a semicolon, not a comma.
+ *
+ * This is the shape the OneNote throttling guidance asks for — see the `Graph request
+ * budget` section of CLAUDE.md. The per-container walk that returns the same data costs
+ * `1 + 2 x containers`, which is 195 requests on the real account against this one.
+ */
+const EXPANDED_TREE_URL =
+  `${GRAPH_ROOT}/me/onenote/notebooks?$select=id,displayName` +
+  `&$expand=sections($select=id,displayName),` +
+  `sectionGroups($select=id,displayName;$expand=sections($select=id,displayName))`;
+
 /** The most result pages one list call will follow before giving up. */
 const MAX_PAGE_FOLLOWS = 50;
 
@@ -117,6 +132,21 @@ export interface SectionGroupNode extends SectionGroup {
 export interface NotebookTree extends Notebook {
   readonly sections: Section[];
   readonly sectionGroups: SectionGroupNode[];
+}
+
+/**
+ * A section group as the expanded tree returns it: its own sections, but not its nested
+ * section groups. The nested `$expand` reaches one level, so anything deeper is absent
+ * from the response rather than empty in it — `nestedGroupsUnknown` says which.
+ */
+export interface ExpandedSectionGroup extends SectionGroup {
+  readonly sections: Section[];
+}
+
+/** One notebook out of the expanded tree. */
+export interface ExpandedNotebook extends Notebook {
+  readonly sections: Section[];
+  readonly sectionGroups: ExpandedSectionGroup[];
 }
 
 /**
@@ -293,6 +323,22 @@ export class GraphStructure {
     };
   }
 
+  /**
+   * Every notebook with its sections and one level of section group, in one request.
+   *
+   * This is the cheap way to answer a question about names. It does not replace
+   * `getFullTree`: a section group nested inside a section group is not in the response,
+   * and its sections are not either. A caller that finds nothing here and needs to be
+   * sure has to walk the notebook it cares about.
+   *
+   * @throws {GraphRequestError} on a non-2xx response.
+   * @throws {GraphResponseError} if the body is not the expected shape.
+   */
+  async getExpandedTree(): Promise<ExpandedNotebook[]> {
+    const items = await this.#collect(EXPANDED_TREE_URL);
+    return items.map((item) => toExpandedNotebook(item, EXPANDED_TREE_URL));
+  }
+
   /** Every notebook, each with its tree resolved. */
   async getFullTree(): Promise<NotebookTree[]> {
     const notebooks = await this.listNotebooks();
@@ -347,6 +393,40 @@ function toNode(item: unknown, url: string): { id: string; displayName: string }
     // preferable to `undefined` reaching a caller that only formats it.
     displayName: optionalString(record, 'displayName') ?? '',
   };
+}
+
+/**
+ * One notebook out of the expanded response.
+ *
+ * An absent `sections` or `sectionGroups` is read as empty rather than raised on: Graph
+ * omits an expanded relationship that holds nothing, and a notebook with no section
+ * groups is ordinary.
+ */
+function toExpandedNotebook(item: unknown, url: string): ExpandedNotebook {
+  const record = asRecord(item, url);
+  return {
+    ...toNode(record, url),
+    sections: toNodeArray(record['sections'], url).map((node) => toNode(node, url)),
+    sectionGroups: toNodeArray(record['sectionGroups'], url).map((group) => {
+      const groupRecord = asRecord(group, url);
+      return {
+        ...toNode(groupRecord, url),
+        sections: toNodeArray(groupRecord['sections'], url).map((node) => toNode(node, url)),
+      };
+    }),
+  };
+}
+
+/** An expanded relationship: absent means empty, anything but an array is a fault. */
+function toNodeArray(value: unknown, url: string): unknown[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new GraphResponseError(
+      `GET ${url} returned an expanded relationship that is not an array.`,
+      url,
+    );
+  }
+  return value;
 }
 
 function toPageSummary(item: unknown, url: string): PageSummary {

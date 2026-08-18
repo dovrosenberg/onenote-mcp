@@ -87,6 +87,12 @@ What no test covers is whether an MCP client actually shows the image block to i
 or whether `MAX_INK_PNG_BYTES` is the right number — 750 KB of PNG, about 1 MB once
 base64-encoded, is a budget chosen rather than measured against any client's cap.
 
+`test/name-lookup.test.ts` drives the resolver through a fake `LookupStructure` that
+counts calls, because what this module is for is what it does not do: the common path is
+one `getExpandedTree` and no container walk. Its fixture nests a section group inside a
+section group, which the expanded response cannot reach — that is the only thing
+exercising the fallback walk, because the real account has no nesting at that level.
+
 `test/tools.test.ts` covers the registry, and it constructs the real MSAL and Firestore
 clients while doing so. Neither opens a connection until a token is asked for, so it
 needs no credential and no backend; if that ever stops being true, this test is where it
@@ -326,6 +332,30 @@ not fit: an image too small to read is a better answer than a failed request, an
 result says which width it got so the model can tell "illegible handwriting" from
 "rendered too small".
 
+**The `_by_name` tools resolve names in one request, and refuse rather than guess.**
+`resolveSection` in `src/name-lookup.ts` matches exactly and case-insensitively on every
+name, so `'monthly log'` finds `'Monthly Log'` and `'Monthly'` finds nothing — substring
+matching is what `search_pages` is for, and a lookup that accepted a prefix would return a
+different section than the caller named. A name matching nothing is a `NameLookupError`
+listing the sibling names, never an empty result: a caller cannot tell an empty section
+from a section that does not exist. A name matching twice is a `NameLookupError` carrying
+the candidates. `sectionGroupName` omitted means the section is a direct child of the
+notebook, not "search everywhere".
+
+**The fallback walk below a named section group runs only when the cheap answer is
+empty.** `getExpandedTree` reaches a notebook's sections and one level of section group,
+so a section nested deeper is absent from that response rather than known to be absent.
+`findSectionBelow` walks that one subtree, breadth-first and sequentially, bounded at 5
+levels and 20 requests. Sequential because the concurrency limit is 5 and a fan-out here
+would repeat `getFullTree`'s mistake. The real account has no nesting at that level, so
+the walk does not run on the common path, and `deepSearchUsed` in the result says when it
+did.
+
+**`find_page_by_name` scans at most 100 page titles because Graph says so.** `$top=200`
+on a section's pages is a 400 with code 20129, "the limit of '100' for the $top query has
+been exceeded". The result reports `pagesScanned` and `scanTruncated` so a miss in a
+section holding more than 100 pages is not read as "no such page".
+
 **`list_sections` returns sections and section groups in one tagged list.** Graph exposes
 them as two relationships and the caller has to recurse through both — this account is a
 notebook per year with a section group per month — so a result that carried only sections
@@ -378,6 +408,11 @@ following once `top` items are in hand, so `top` is a result count and not a pag
 Both walks have a bound: 50 followed links, and 20 levels of section-group nesting.
 Neither is a real structure Graph produces; each exists so a self-referencing response
 ends as one named error rather than as an unbounded loop.
+
+**Prefer `getExpandedTree` to `getFullTree`.** They answer nearly the same question and
+cost 1 request against 195 — see the `Graph request budget` section. `getFullTree` is
+still the only thing that reaches section groups nested inside section groups, so it is
+not dead, but nothing new should call it without needing that.
 
 **Structure traversal recurses.** A notebook holds sections and section groups, and a
 section group holds further sections and section groups — the UI's "tab groups". Both

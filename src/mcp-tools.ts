@@ -16,6 +16,7 @@ import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 import { GraphAuthError } from './graph-auth.ts';
 import { GraphRequestError, GraphResponseError } from './graph-structure.ts';
 import { InkParseError, InkRenderError } from './ink.ts';
+import { NameLookupError } from './name-lookup.ts';
 
 /**
  * One tool: what `tools/list` advertises, and what `tools/call` invokes.
@@ -107,6 +108,11 @@ function toolErrorText(toolName: string, err: unknown): string {
     return `${toolName}: ${err.message}`;
   }
   if (err instanceof InkParseError || err instanceof InkRenderError) {
+    return `${toolName}: ${err.message}`;
+  }
+  if (err instanceof NameLookupError) {
+    // The message lists the sibling names that were actually there, which is what lets
+    // the calling model fix the argument without another browsing call.
     return `${toolName}: ${err.message}`;
   }
   // Anything else is a bug in this server. Report that it happened and nothing more:

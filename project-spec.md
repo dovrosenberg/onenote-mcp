@@ -104,6 +104,27 @@ the alignment is arithmetic, not guesswork.
 | `list_sections(containerType, containerId)` | Sections **and** section groups under a notebook or section group. `containerType` is `notebook` or `sectionGroup`. |
 | `list_pages(sectionId, top?)` | Pages in one section, sorted by last-modified |
 | `search_pages(query, sectionId?)` | Find pages by title. Scope to a section where possible; if unscoped, iterate sections rather than hitting the account-wide endpoint. |
+| `find_page_by_name(notebookName, sectionGroupName?, sectionName, pageTitle)` | The pages in that section whose title matches, for a caller that already knows the names |
+| `list_pages_by_name(notebookName, sectionGroupName?, sectionName, top?)` | Every page in a section named the same way |
+
+**Design notes for the two `_by_name` tools:**
+- They exist because every other tool takes an id, so a caller holding names
+  spends three round trips converting them. The account allows 400 Graph
+  requests an hour, so those round trips are not free.
+- The container path resolves in one request:
+  `GET /me/onenote/notebooks?$select=id,displayName&$expand=sections($select=id,displayName),sectionGroups($select=id,displayName;$expand=sections($select=id,displayName))`.
+  Measured at 78 KB for 54 notebooks. It reaches a notebook's sections and one
+  level of section group; a section nested deeper needs a walk, which runs only
+  when the cheap answer comes back empty.
+- Matching is exact and case-insensitive on every name, including the page
+  title. `search_pages` is the substring tool; a lookup that quietly accepted a
+  prefix would return a different section than the caller named.
+- A name that matches nothing is an error listing the names that were there,
+  not an empty result. A caller cannot tell an empty section from a
+  non-existent one otherwise.
+- Ambiguity is reported with the candidate ids, never resolved by picking one.
+- `sectionGroupName` omitted means the section sits directly in the notebook.
+  It is not a wildcard.
 
 ### Reading
 

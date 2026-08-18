@@ -353,3 +353,73 @@ test('no module under src/ calls the account-wide page list', async () => {
 function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
 }
+
+// ---------------------------------------------------------------------------
+// getExpandedTree. The URL is the assertion that matters most here: the $select inside
+// each expand clause is worth 5.7x on the response, and the separator between $select
+// and $expand inside one clause is a semicolon. Both were measured and confirmed against
+// the real tenant; a comma there returns a 400 that no unit test would otherwise catch.
+// ---------------------------------------------------------------------------
+
+const EXPANDED_URL =
+  `${GRAPH_ROOT}/me/onenote/notebooks?$select=id,displayName` +
+  `&$expand=sections($select=id,displayName),` +
+  `sectionGroups($select=id,displayName;$expand=sections($select=id,displayName))`;
+
+test('getExpandedTree asks for the tree in one request and parses it', async () => {
+  const { fetchImpl, calls } = fakeFetch({
+    [EXPANDED_URL]: () =>
+      json({
+        value: [
+          {
+            id: 'nb-1',
+            displayName: '2026',
+            sections: [{ id: 'sec-1', displayName: 'Inbox' }],
+            sectionGroups: [
+              {
+                id: 'grp-1',
+                displayName: 'March',
+                sections: [{ id: 'sec-2', displayName: 'Daily' }],
+              },
+            ],
+          },
+        ],
+      }),
+  });
+
+  const tree = await new GraphStructure(tokens, fetchImpl).getExpandedTree();
+
+  assert.equal(calls.length, 1, 'the whole point is that this is one request');
+  assert.deepEqual(tree, [
+    {
+      id: 'nb-1',
+      displayName: '2026',
+      sections: [{ id: 'sec-1', displayName: 'Inbox' }],
+      sectionGroups: [
+        { id: 'grp-1', displayName: 'March', sections: [{ id: 'sec-2', displayName: 'Daily' }] },
+      ],
+    },
+  ]);
+});
+
+test('an expanded relationship Graph omitted reads as empty, not as a fault', async () => {
+  // Graph leaves the property off a relationship that holds nothing, and a notebook with
+  // no section groups is ordinary.
+  const { fetchImpl } = fakeFetch({
+    [EXPANDED_URL]: () => json({ value: [{ id: 'nb-1', displayName: '2026' }] }),
+  });
+
+  const tree = await new GraphStructure(tokens, fetchImpl).getExpandedTree();
+  assert.deepEqual(tree, [{ id: 'nb-1', displayName: '2026', sections: [], sectionGroups: [] }]);
+});
+
+test('an expanded relationship that is not an array is a GraphResponseError', async () => {
+  const { fetchImpl } = fakeFetch({
+    [EXPANDED_URL]: () => json({ value: [{ id: 'nb-1', displayName: '2026', sections: {} }] }),
+  });
+
+  await assert.rejects(
+    () => new GraphStructure(tokens, fetchImpl).getExpandedTree(),
+    GraphResponseError,
+  );
+});

@@ -10,11 +10,13 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type {
   ContainerChildren,
   ContainerKind,
+  ExpandedNotebook,
   Notebook,
   NotebookTree,
   PageSummary,
 } from '../src/graph-structure.ts';
 import { ToolInputError, indexTools, type ToolDefinition } from '../src/mcp-tools.ts';
+import { NameLookupError } from '../src/name-lookup.ts';
 import { createStructureTools, type StructureClient } from '../src/structure-tools.ts';
 
 const NOTEBOOKS: Notebook[] = [
@@ -49,26 +51,69 @@ const TREE: NotebookTree[] = [
   },
 ];
 
+/**
+ * The one-request tree the `_by_name` tools resolve against. It carries a notebook-level
+ * section, a section group with its own sections, and a second notebook whose section
+ * shares a name with the first — the ambiguity the lookup must refuse to resolve is
+ * across notebooks, and a lookup scoped to one notebook must not trip over it.
+ */
+const EXPANDED: ExpandedNotebook[] = [
+  {
+    id: 'nb-2026',
+    displayName: '2026',
+    sections: [{ id: 'sec-inbox', displayName: 'Inbox' }],
+    sectionGroups: [
+      {
+        id: 'grp-march',
+        displayName: 'March',
+        sections: [
+          { id: 'sec-daily', displayName: 'Daily todo' },
+          { id: 'sec-log', displayName: 'Monthly Log' },
+        ],
+      },
+      { id: 'grp-april', displayName: 'April', sections: [] },
+    ],
+  },
+  {
+    id: 'nb-2025',
+    displayName: '2025',
+    sections: [{ id: 'sec-inbox-2025', displayName: 'Inbox' }],
+    sectionGroups: [],
+  },
+];
+
 const PAGES: Record<string, PageSummary[]> = {
   'sec-inbox': [
     { id: 'p-1', title: 'Budget review', lastModifiedDateTime: '2026-03-04T10:00:00Z' },
     { id: 'p-2', title: 'Standup', lastModifiedDateTime: '2026-03-03T10:00:00Z' },
   ],
   'sec-daily': [{ id: 'p-3', title: 'budget notes', lastModifiedDateTime: '2026-03-05T10:00:00Z' }],
+  'sec-log': [
+    { id: 'p-log', title: 'Monthly Log', lastModifiedDateTime: '2026-03-06T10:00:00Z' },
+    { id: 'p-other', title: 'monthly log archive', lastModifiedDateTime: '2026-03-02T10:00:00Z' },
+  ],
+  'sec-nested': [{ id: 'p-4', title: 'Deep', lastModifiedDateTime: '2026-03-07T10:00:00Z' }],
 };
 
 interface Fake extends StructureClient {
   readonly containerCalls: string[];
   readonly pageCalls: { sectionId: string; top: number | undefined }[];
+  readonly treeCalls: { expanded: number; full: number };
 }
 
 function fakeStructure(): Fake {
   const containerCalls: string[] = [];
   const pageCalls: { sectionId: string; top: number | undefined }[] = [];
+  const treeCalls = { expanded: 0, full: 0 };
 
   return {
     containerCalls,
     pageCalls,
+    treeCalls,
+    getExpandedTree: () => {
+      treeCalls.expanded += 1;
+      return Promise.resolve(EXPANDED);
+    },
     listNotebooks: () => Promise.resolve(NOTEBOOKS),
     listContainerChildren: (kind: ContainerKind, containerId: string) => {
       containerCalls.push(`${kind}:${containerId}`);
@@ -80,7 +125,10 @@ function fakeStructure(): Fake {
       pageCalls.push({ sectionId, top });
       return Promise.resolve(PAGES[sectionId] ?? []);
     },
-    getFullTree: () => Promise.resolve(TREE),
+    getFullTree: () => {
+      treeCalls.full += 1;
+      return Promise.resolve(TREE);
+    },
   };
 }
 
@@ -106,11 +154,18 @@ async function call(
   return payload(await byName(createStructureTools(structure), name).handle(args));
 }
 
-test('the four browsing tools are registered under the names the spec gives them', () => {
+test('the browsing tools are registered under the names the spec gives them', () => {
   const tools = createStructureTools(fakeStructure());
   assert.deepEqual(
     tools.map((tool) => tool.name),
-    ['list_notebooks', 'list_sections', 'list_pages', 'search_pages'],
+    [
+      'list_notebooks',
+      'list_sections',
+      'list_pages',
+      'search_pages',
+      'find_page_by_name',
+      'list_pages_by_name',
+    ],
   );
   // Duplicate names would shadow silently in the JSON-RPC layer.
   assert.doesNotThrow(() => indexTools(tools));
@@ -249,4 +304,134 @@ test('search_pages requires a query', async () => {
   const tool = byName(createStructureTools(fakeStructure()), 'search_pages');
   await assert.rejects(tool.handle({}), ToolInputError);
   await assert.rejects(tool.handle({ query: '   ' }), ToolInputError);
+});
+
+// ---------------------------------------------------------------------------
+// The name-based lookups. What matters here is the tool surface: which client calls the
+// resolution costs, what the result carries, and that a bad name is an error rather than
+// an empty list. The matching rules themselves are covered in test/name-lookup.test.ts.
+// ---------------------------------------------------------------------------
+
+test('find_page_by_name matches names in full, ignoring case', async () => {
+  const structure = fakeStructure();
+  const body = await call(
+    'find_page_by_name',
+    {
+      notebookName: '2026',
+      sectionGroupName: 'march',
+      sectionName: 'monthly log',
+      pageTitle: 'MONTHLY LOG',
+    },
+    structure,
+  );
+
+  assert.deepEqual(body['notebook'], { id: 'nb-2026', displayName: '2026' });
+  assert.deepEqual(body['sectionGroup'], { id: 'grp-march', displayName: 'March' });
+  assert.deepEqual(body['section'], { id: 'sec-log', displayName: 'Monthly Log' });
+  assert.equal(body['matchCount'], 1);
+  assert.deepEqual(
+    (body['matches'] as { id: string }[]).map((page) => page.id),
+    ['p-log'],
+    "'monthly log archive' is not a full-string match and must not come back",
+  );
+
+  // One tree request plus one page listing. The point of the tool is that it does not
+  // walk containers, so a regression to listContainerChildren shows up here.
+  assert.equal(structure.treeCalls.expanded, 1);
+  assert.deepEqual(structure.containerCalls, []);
+  assert.deepEqual(structure.pageCalls, [{ sectionId: 'sec-log', top: 100 }]);
+});
+
+test('find_page_by_name reports a title that matched nothing as a complete scan', async () => {
+  const body = await call('find_page_by_name', {
+    notebookName: '2026',
+    sectionGroupName: 'March',
+    sectionName: 'Monthly Log',
+    pageTitle: 'Weekly Log',
+  });
+
+  assert.equal(body['matchCount'], 0);
+  assert.equal(body['scanTruncated'], false);
+  assert.match(String(body['note']), /All 2 page\(s\)/);
+});
+
+test('a section name that matches nothing is an error listing what was there', async () => {
+  const tool = byName(createStructureTools(fakeStructure()), 'find_page_by_name');
+  const result = await tool
+    .handle({
+      notebookName: '2026',
+      sectionGroupName: 'April',
+      sectionName: 'Monthly Log',
+      pageTitle: 'anything',
+    })
+    .catch((err: unknown) => err);
+
+  assert.ok(result instanceof NameLookupError);
+  assert.equal(result.argument, 'sectionName');
+  assert.equal(result.kind, 'not-found');
+});
+
+test('a notebook name that matches two notebooks is refused, not guessed', async () => {
+  const structure = fakeStructure();
+  const ambiguous: StructureClient = {
+    ...structure,
+    getExpandedTree: () =>
+      Promise.resolve([
+        { id: 'nb-a', displayName: 'Journal', sections: [], sectionGroups: [] },
+        { id: 'nb-b', displayName: 'journal', sections: [], sectionGroups: [] },
+      ]),
+  };
+
+  const tool = byName(createStructureTools(ambiguous), 'list_pages_by_name');
+  const result = await tool
+    .handle({ notebookName: 'Journal', sectionName: 'Inbox' })
+    .catch((err: unknown) => err);
+
+  assert.ok(result instanceof NameLookupError);
+  assert.equal(result.kind, 'ambiguous');
+  assert.equal(result.argument, 'notebookName');
+  assert.equal(result.candidates.length, 2);
+});
+
+test('list_pages_by_name lists a notebook-level section without a group name', async () => {
+  const structure = fakeStructure();
+  const body = await call('list_pages_by_name', { notebookName: '2026', sectionName: 'Inbox' }, structure);
+
+  assert.deepEqual(body['section'], { id: 'sec-inbox', displayName: 'Inbox' });
+  assert.equal(body['sectionGroup'], null);
+  assert.equal(body['count'], 2);
+  assert.equal(body['top'], 50);
+  assert.equal(body['moreAvailable'], false);
+  assert.deepEqual(structure.pageCalls, [{ sectionId: 'sec-inbox', top: 50 }]);
+});
+
+test('list_pages_by_name honours top and reports that more pages exist', async () => {
+  const body = await call('list_pages_by_name', {
+    notebookName: '2026',
+    sectionName: 'Inbox',
+    top: 2,
+  });
+
+  assert.equal(body['count'], 2);
+  assert.equal(body['moreAvailable'], true);
+});
+
+test('omitting sectionGroupName does not search inside section groups', async () => {
+  // 'Daily todo' exists, but inside a group. The lookup must not find it: a caller that
+  // named no group said the section is a direct child of the notebook.
+  const tool = byName(createStructureTools(fakeStructure()), 'list_pages_by_name');
+  const result = await tool
+    .handle({ notebookName: '2026', sectionName: 'Daily todo' })
+    .catch((err: unknown) => err);
+
+  assert.ok(result instanceof NameLookupError);
+  assert.equal(result.argument, 'sectionName');
+});
+
+test('a name that is not a string is a ToolInputError naming the argument', async () => {
+  const tool = byName(createStructureTools(fakeStructure()), 'find_page_by_name');
+  await assert.rejects(
+    () => tool.handle({ notebookName: '2026', sectionName: '', pageTitle: 'x' }),
+    (err: unknown) => err instanceof ToolInputError && err.argument === 'sectionName',
+  );
 });
