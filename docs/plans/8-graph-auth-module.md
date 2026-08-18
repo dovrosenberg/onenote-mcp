@@ -10,7 +10,7 @@
 | Phase | Status | Commit |
 |-------|--------|--------|
 | Phase 1: `src/graph-auth.ts` — scopes, named error, silent acquisition, unit tests | ☑ | this commit |
-| Phase 2: Documentation — `README.md`, `CLAUDE.md` | ☐ | — |
+| Phase 2: Documentation — `README.md`, `CLAUDE.md` | ☑ | this commit |
 
 ## Acceptance Criteria
 
@@ -204,3 +204,8 @@ Write a throwaway script under the scratchpad — not in the repository, and nev
 - **`cause` is assigned, not passed to `super`.** `GraphAuthError`'s constructor takes `options: { cause?: unknown }` and sets `this.cause` only when the key is present. Passing `options` straight to `super` would give every error an own `cause` property of `undefined` on the two paths that have no underlying error (`no-account`, and the null-or-blank-result branch of `silent-failed`), which the tests then could not distinguish from a wrapped error.
 - **The source-scan test asserts it scanned something.** `no module under src/ calls acquireTokenByDeviceCode except bootstrap.ts` first asserts that the file list includes `graph-auth.ts`. Without that, a `readdir` returning an empty list — a moved directory, a changed `import.meta.dirname` — would make the test pass while checking nothing.
 - **Verified:** `npm run typecheck` exit 0; `npm test` 31 pass / 0 fail / 0 skipped; `npm run build` emits `dist/graph-auth.js`; `git grep acquireTokenByDeviceCode -- src/` returns nothing.
+
+### Phase 2
+
+- **The plans this documentation would have pointed at are gone.** Commit `362c0c9` ("plan cleanup") deleted `docs/plans/2-`, `5-`, `6-` and `7-` while this issue was in progress, so `README.md:58` and `CLAUDE.md:74` now link to a deleted `docs/plans/7-firestore-msal-cache.md`, and `CLAUDE.md:57` names a deleted `docs/plans/5-repo-skeleton.md`. Those three references were left as they are: repairing them is not this issue's scope, and the right repair depends on whether completed plans are meant to stay deleted. This plan's own manual procedure is referenced the same way, so it inherits the same question.
+- **Verified:** every file named in `CLAUDE.md`'s directory tree resolves on disk; `npm run typecheck` exit 0; `npm test` 31 pass / 0 fail / 0 skipped; `bash scripts/test/run.sh` exit 0 (docker suite skipped, as designed, without `RUN_DOCKER_TESTS=1`); `README.md` no longer attributes the server-side token-cache consumer to issue #12.

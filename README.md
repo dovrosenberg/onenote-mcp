@@ -50,7 +50,7 @@ document's `cache` field and hands the string to MSAL. `afterCacheAccess` writes
 serialized cache back inside a Firestore transaction, and only when MSAL reports that the
 cache changed. A document that does not exist is read as an empty cache, which is the
 state before `npm run bootstrap` has been run. Nothing wires the plugin into a live MSAL
-client yet; that is issue #9 for the bootstrap CLI and issue #12 for the server.
+client yet; that is issue #9 for the bootstrap CLI and issue #8 for the server.
 
 `npm test` covers only `readCache`, the function that decodes a document snapshot. The
 two callbacks, the transaction, and `createFirestoreTokenCachePlugin` are checked by hand
@@ -65,6 +65,38 @@ sudo apt-get install google-cloud-cli-firestore-emulator
 `gcloud components install cloud-firestore-emulator` does not install it on a
 Debian-packaged Google Cloud CLI. The component manager is disabled in that build, and
 `gcloud` prints the `apt-get` command above in its place.
+
+## Graph auth
+
+`src/graph-auth.ts` turns the seeded token cache into a Microsoft Graph access token.
+`createGraphAuth` builds one `PublicClientApplication` from `ONENOTE_CLIENT_ID`,
+`ONENOTE_AUTHORITY`, and the Firestore cache plugin, and holds it for the life of the
+process. `getAccessToken()` reads the cached account, calls `acquireTokenSilent`, and
+returns the token. Requested scopes are `Notes.Read` and `Notes.ReadWrite`, fully
+qualified.
+
+The deployed server never signs in interactively. It has no way to prompt anyone, and
+Graph's OneNote endpoints do not support app-only auth, so there is no fallback when the
+stored refresh token dies — a human re-runs `npm run bootstrap`. Every failure is
+therefore a `GraphAuthError` saying so, rather than a raw MSAL error that would reach the
+caller as a bare 401 from Graph:
+
+| `reason` | What happened | What to do |
+|---|---|---|
+| `cache-unreadable` | The Firestore document is absent, or its `cache` field is not something MSAL can deserialize | `npm run bootstrap` |
+| `no-account` | The cache was read but holds no signed-in account | `npm run bootstrap` |
+| `silent-failed` | The stored refresh token is expired or revoked, or the token endpoint returned nothing usable | `npm run bootstrap` |
+
+The messages name the document path and the underlying MSAL error, and deliberately
+carry no account identifier: `username` is the user's UPN and `homeAccountId` embeds the
+tenant id, neither of which belongs in a log.
+
+`npm test` covers the acquisition logic through a fake client. `createGraphAuth` itself
+is checked by hand once the cache has been seeded, following the "Manual verification
+procedure" in
+[`docs/plans/8-graph-auth-module.md`](./docs/plans/8-graph-auth-module.md). Nothing wires
+the module into `createApp` yet; the first consumer is the Graph structure client, issue
+#11.
 
 ## Container
 
@@ -123,6 +155,11 @@ and the process exits 1 without a stack trace.
 `FIRESTORE_CACHE_DOC` names the document the MSAL cache plugin in `src/token-cache.ts`
 reads and writes. Its value must be a document path, meaning an even number of
 slash-separated segments; `loadConfig` rejects a collection path at startup.
+
+`ONENOTE_CLIENT_ID` and `ONENOTE_AUTHORITY` identify the Azure app registration that
+`src/graph-auth.ts` presents to Entra ID. It is a public client, so there is deliberately
+no Layer-2 client secret; the `MCP_OAUTH_*` values below it belong to Layer 1, between
+Claude and this server, and are unrelated.
 
 `npm run bootstrap` needs only `ONENOTE_CLIENT_ID`, `ONENOTE_AUTHORITY`,
 `FIRESTORE_CACHE_DOC`, and `GOOGLE_CLOUD_PROJECT` — not the `MCP_OAUTH_*` values.

@@ -25,11 +25,13 @@ onenote-mcp/
 │   ├── server.ts              # builds the Express app; does not listen
 │   ├── config.ts              # env-var schema, grouped validation, ConfigError
 │   ├── bootstrap.ts           # device-code CLI that seeds the Firestore token cache (placeholder, issue #9)
+│   ├── graph-auth.ts          # Layer-2 Graph auth: silent token acquisition (issue #8)
 │   ├── token-cache.ts         # Firestore-backed MSAL ICachePlugin (issue #7)
 │   └── version.ts             # SERVICE_NAME, VERSION
 │
 ├── test/                      # node --test suites; test/<name>.test.ts covers src/<name>.ts
 │   ├── config.test.ts
+│   ├── graph-auth.test.ts     # drives acquireGraphToken through a fake client
 │   ├── server.test.ts
 │   ├── token-cache.test.ts    # covers readCache only; see the note below
 │   └── version.test.ts
@@ -53,6 +55,13 @@ A test file is named for the source file it covers: `test/config.test.ts` covers
 whose behaviour is process exit codes and stderr, so it is verified by running it rather
 than by a unit test — the commands are in the Final Verification section of
 `docs/plans/5-repo-skeleton.md`. `src/bootstrap.ts` is a placeholder until issue #9.
+
+`test/graph-auth.test.ts` drives `acquireGraphToken` through a hand-written
+`SilentTokenSource` and never constructs a `PublicClientApplication`, so
+`createGraphAuth` has no automated test. Testing it needs a cache seeded by a real
+device-code sign-in, which arrives with issues #9 and #10. What stands in for it is the
+"Manual verification procedure" section of `docs/plans/8-graph-auth-module.md`, run by
+the operator after #10.
 
 `test/token-cache.test.ts` covers `readCache` and nothing else. `readCache` is a pure
 function over a document snapshot, so it runs without a backend. `beforeCacheAccess`,
@@ -150,6 +159,21 @@ both — that the `.node` binary is present and that `node_modules/typescript` i
 context by default rather than silently dropped. The entries that mirror `.gitignore`
 (`.env*`, `*.token-cache.json`, `.msal-cache*`) are there so a local operator's
 credentials cannot reach an image layer.
+
+**The server never signs in interactively.** `acquireTokenByDeviceCode` belongs to
+`src/bootstrap.ts` alone. The deployed service acquires silently from the Firestore
+cache through `src/graph-auth.ts`. A device-code call in a request path would block on a
+human who is not there, and Cloud Run would time the request out. A test in
+`test/graph-auth.test.ts` scans every file under `src/` for that call.
+
+**Graph auth failures are `GraphAuthError`, never a raw MSAL error.**
+`acquireGraphToken` wraps both the `getTokenCache().getAllAccounts()` call and the
+`acquireTokenSilent` call, so an undecodable cache, an empty cache, and a dead refresh
+token all reach the caller as one error type whose message ends in `npm run bootstrap`.
+Letting the MSAL error through instead surfaces to the operator as a bare 401 from
+Graph, which does not say that a human has to re-run the CLI. The messages name the
+document path and the underlying error, never `username` or `homeAccountId` — the first
+is the user's UPN and the second embeds the tenant id.
 
 **The token cache is one opaque string in one document.** `FirestoreTokenCachePlugin`
 stores the output of MSAL's `serialize()` verbatim in the document's `cache` field,
