@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Test stub for gcloud. Records every invocation to $GCLOUD_LOG and exits 0,
+# except for describe/list calls matching a pattern in $STUB_MISSING, which
+# exit 1 to simulate a resource that does not exist yet.
+joined="$*"
+printf '%s\n' "$joined" >> "$GCLOUD_LOG"
+
+# Deterministic project number so WIF resource names are assertable.
+if [[ "$joined" == *"projects describe"*"projectNumber"* ]]; then
+  echo "123456789012"
+  exit 0
+fi
+
+if [[ "$joined" == "beta billing projects describe"* ]]; then
+  echo "True"
+  exit 0
+fi
+
+if [[ "$joined" == *" describe"* || "$joined" == *" list"* ]]; then
+  for pat in ${STUB_MISSING:-}; do
+    if [[ "$joined" == *"${pat//_/ }"* ]]; then
+      exit 1
+    fi
+  done
+fi
+
+exit 0
