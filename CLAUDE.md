@@ -422,6 +422,69 @@ through `context.tokenCache.deserialize` before `serialize()` is called, because
 re-read turns an overlap into a lost refresh token, and the cache stays unusable until
 `npm run bootstrap` is run again.
 
+## Graph request budget
+
+The OneNote endpoints throttle harder than the rest of Graph, and this repository has
+already been throttled by its own structure walk. The limits below are Microsoft's
+documented ones for a delegated app — which is what this service is — and the numbers
+beside them were measured against the real account on 2026-08-18.
+
+| Limit | Delegated app per user | What this repository does |
+|---|---|---|
+| Concurrent requests | 5 | `getFullTree()` opens 108 |
+| Requests per minute | 120 | a paced walk at ~80/min saw no 429; the burst above failed immediately |
+| Requests per hour | 400 | one `getFullTree()` costs 195 |
+
+A throttled response is HTTP 429 with OData code `10007`, "the server is too busy". The
+penalty outlasts a short backoff: after the burst above, five retries spanning three
+minutes were all refused.
+
+The design principles below come from Microsoft's own guidance
+(<https://devblogs.microsoft.com/microsoft365dev/onenote-api-throttling-and-how-to-avoid-it/>)
+and from what the measurements showed.
+
+**Collapse a hierarchy walk into one request with `$expand`.** This is the article's
+first best practice and it is not a micro-optimisation here.
+`GET /me/onenote/notebooks?$expand=sections,sectionGroups($expand=sections)` returns
+every notebook, its sections, its section groups, and those groups' sections in a single
+call: measured at 2.9 seconds and 441 KB for 54 notebooks, 290 direct sections, 43
+section groups and their 270 sections. The per-container walk that `getFullTree` does
+instead costs `1 + 2 x containers`, which is 195 requests on the same account — half the
+hourly budget for the same data. Note that the nested `$expand` reaches one level of
+section group; a group nested inside a group still needs a follow-up request, so the
+walk cannot be deleted, only avoided in the common case.
+
+**Never fan out with an unbounded `Promise.all` over ids.** The concurrency limit is 5,
+so any code that maps a list of containers, sections, or pages onto concurrent requests
+has to cap what is in flight — 4 is the safe cap — and space request starts to stay
+under 120 per minute. `getFullTree` and `#expandGroups` in `src/graph-structure.ts` both
+violate this today; that is an open gap, not a decision.
+
+**Retry only what is retryable, and inspect the OData code first.** The article's second
+best practice: a 4xx other than 429 means the request itself is wrong and retrying it
+burns quota to fail again. 429 and 503 are worth retrying after a wait; 400 with code
+`20266`, 400 with code `20112` "invalid entity id", and 404 are not. Nothing in
+`src/graph-structure.ts` retries anything at all yet, so the first 429 rejects the
+enclosing `Promise.all` while its siblings are still consuming quota.
+
+**Treat the hourly 400 as the binding constraint on tool design, not the per-minute
+120.** A tool that walks the account can run at most twice an hour before every later
+call in that hour fails. That is what makes an unscoped `search_pages` unsafe as
+written: it walks the tree and then lists pages per section, and the account holds 560
+sections. The bounds in `src/page-search.ts` do not express this — 200 sections cannot
+be reached inside a 25-second budget at a legal request rate, and the tree walk alone
+would exhaust the budget before the first section is listed.
+
+**Prefer a cached structure over re-reading it.** Notebooks, section groups and sections
+change rarely; pages change often. Anything that needs the tree more than once in an
+hour should hold it rather than fetch it, and no tool should walk the account as a side
+effect of answering an unrelated question.
+
+**Ask for the fields, not the objects.** `$select` is already used on every listing in
+`src/graph-structure.ts`. Keep it that way. The 441 KB measured for the expanded tree was
+with no `$select` inside the expand clauses; whether `$expand=sections($select=id,displayName)`
+is accepted here has not been tested.
+
 ## Repository hygiene
 
 This repository is public, and so are its issues, pull requests, and Actions logs.
