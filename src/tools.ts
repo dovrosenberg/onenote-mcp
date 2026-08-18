@@ -13,13 +13,20 @@ import type { Config } from './config.ts';
 import { createGraphAuth } from './graph-auth.ts';
 import { createGraphStructure } from './graph-structure.ts';
 import type { ToolDefinition } from './mcp-tools.ts';
+import { createGraphPageContent } from './page-content.ts';
+import { createPageTools } from './page-tools.ts';
 import { createStructureTools } from './structure-tools.ts';
 
 /**
  * Every tool this server exposes.
  *
- * Issue #15 adds the four browsing tools. Reading (#16) and writing (#18) append to the
- * list returned here.
+ * Issue #15 adds the four browsing tools and #16 the reading tool. Writing (#18)
+ * appends to the list returned here.
+ *
+ * The browsing tools and the reading tool are built over two different Graph clients
+ * because the endpoints answer with different things — JSON for structure, a
+ * `multipart/mixed` body for page content — but both take the same auth object, so one
+ * MSAL client and one token cache serve the whole process.
  */
 export function createTools(config: Config): ToolDefinition[] {
   const { graph, firestore } = config;
@@ -27,7 +34,10 @@ export function createTools(config: Config): ToolDefinition[] {
     throw new Error("internal: createTools needs the 'graph' and 'firestore' config groups");
   }
 
-  const structure = createGraphStructure(createGraphAuth(graph, firestore));
+  const auth = createGraphAuth(graph, firestore);
 
-  return [...createStructureTools(structure)];
+  return [
+    ...createStructureTools(createGraphStructure(auth)),
+    ...createPageTools(createGraphPageContent(auth)),
+  ];
 }

@@ -88,7 +88,7 @@ test('tools/list answers on a request that never initialised', async () => {
   const body = (await res.json()) as { result: { tools: { name: string }[] } };
   assert.deepEqual(
     body.result.tools.map((tool) => tool.name),
-    ['list_notebooks', 'list_sections', 'list_pages', 'search_pages'],
+    ['list_notebooks', 'list_sections', 'list_pages', 'search_pages', 'get_page_content'],
   );
 });
 

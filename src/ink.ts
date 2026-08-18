@@ -32,6 +32,22 @@ const PX_PER_INCH = 96;
 /** The raster width Appendix A used, and the width the fixture renders at. */
 export const DEFAULT_RENDER_WIDTH = 1400;
 
+/**
+ * The most PNG a rendered page of ink may weigh before it is re-rendered smaller.
+ *
+ * The image reaches the calling model base64-encoded inside a JSON-RPC response, which
+ * costs a third more than the bytes counted here, so 750 KB of PNG is about 1 MB on the
+ * wire. The number is a budget rather than a measured limit: nothing has been measured
+ * against a real client's cap.
+ */
+export const MAX_INK_PNG_BYTES = 750_000;
+
+/** The width below which shrinking stops, legible or not. */
+export const MIN_RENDER_WIDTH = 500;
+
+/** Each shrink step multiplies the width by this. */
+const SHRINK_FACTOR = 0.75;
+
 /** The channel order assumed when a document declares no `<traceFormat>`. */
 const DEFAULT_CHANNEL_ORDER: readonly string[] = ['X', 'Y'];
 
@@ -252,6 +268,34 @@ export function renderInk(text: string, width: number = DEFAULT_RENDER_WIDTH): I
 
   const { svg } = strokesToSvg(strokes);
   return { ...rasterizeSvg(svg, width), svg, strokeCount: strokes.length };
+}
+
+/**
+ * Re-render an image at a smaller width until its PNG fits `maxBytes`.
+ *
+ * PNG size does not follow from the pixel count in any way worth predicting — a page of
+ * sparse strokes compresses far better than a dense one — so the width is stepped down
+ * and the result measured each time rather than computed once. The image is returned as
+ * it is when it already fits, and at MIN_RENDER_WIDTH when even that does not: an ink
+ * image no model can read is still a better answer than an error, and the caller is told
+ * the width it got.
+ *
+ * @throws {InkRenderError} if resvg rejects the document at a smaller width.
+ */
+export function fitInkToByteBudget(
+  image: InkImage,
+  maxBytes: number = MAX_INK_PNG_BYTES,
+  minWidth: number = MIN_RENDER_WIDTH,
+): InkImage {
+  let current = image;
+
+  while (current.png.byteLength > maxBytes && current.width > minWidth) {
+    const next = Math.max(minWidth, Math.floor(current.width * SHRINK_FACTOR));
+    if (next >= current.width) break;
+    current = { ...current, ...rasterizeSvg(current.svg, next) };
+  }
+
+  return current;
 }
 
 /** Strokes from one already-parsed `<ink>` element. */

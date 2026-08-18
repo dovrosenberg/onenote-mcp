@@ -7,6 +7,8 @@ import {
   DEFAULT_RENDER_WIDTH,
   InkParseError,
   InkRenderError,
+  MIN_RENDER_WIDTH,
+  fitInkToByteBudget,
   himetricToPx,
   parseInkStrokes,
   rasterizeSvg,
@@ -247,4 +249,36 @@ test('rasterizeSvg rejects a width that is not a positive integer', () => {
 
 test('a document resvg cannot render raises InkRenderError, not a raw resvg error', () => {
   assert.throws(() => rasterizeSvg('<svg><this is not markup'), InkRenderError);
+});
+
+test('an image already inside the byte budget is returned untouched', async () => {
+  const image = renderInk(await fixture('xyf-himetric.inkml'));
+  assert.ok(image !== null);
+
+  const fitted = fitInkToByteBudget(image, image.png.byteLength);
+  assert.equal(fitted, image, 'no re-render is done when the image already fits');
+});
+
+test('an image over the budget is re-rendered narrower, down to the floor', async () => {
+  const image = renderInk(await fixture('xyf-himetric.inkml'));
+  assert.ok(image !== null);
+  assert.equal(image.width, DEFAULT_RENDER_WIDTH);
+
+  // A budget of one byte is unreachable at any width, so the floor is what is reached
+  // rather than an error: an image too small to read still beats a failed request.
+  const fitted = fitInkToByteBudget(image, 1);
+  assert.equal(fitted.width, MIN_RENDER_WIDTH);
+  assert.deepEqual(pngSize(fitted.png), { width: fitted.width, height: fitted.height });
+  assert.equal(fitted.strokeCount, image.strokeCount);
+  assert.equal(fitted.svg, image.svg, 'the same drawing, rasterised smaller');
+});
+
+test('shrinking stops at the first width that fits', async () => {
+  const image = renderInk(await fixture('xyf-himetric.inkml'));
+  assert.ok(image !== null);
+
+  // One step down from 1400 is 1050. A budget just under the full-size PNG must take
+  // that step and no more, so the result is not shrunk further than it has to be.
+  const fitted = fitInkToByteBudget(image, image.png.byteLength - 1);
+  assert.equal(fitted.width, Math.floor(DEFAULT_RENDER_WIDTH * 0.75));
 });

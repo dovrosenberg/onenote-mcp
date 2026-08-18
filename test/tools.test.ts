@@ -16,11 +16,11 @@ const STUB_CONFIG: Config = {
   server: { port: 0 },
 };
 
-test('createTools exposes the browsing tools issue #15 adds', () => {
+test('createTools exposes the browsing tools and the reading tool', () => {
   const tools = createTools(STUB_CONFIG);
   assert.deepEqual(
     tools.map((tool) => tool.name),
-    ['list_notebooks', 'list_sections', 'list_pages', 'search_pages'],
+    ['list_notebooks', 'list_sections', 'list_pages', 'search_pages', 'get_page_content'],
   );
   assert.doesNotThrow(() => indexTools(tools));
 });

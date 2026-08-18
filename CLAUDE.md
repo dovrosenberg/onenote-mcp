@@ -78,6 +78,15 @@ seconds are chosen against the account described in `project-spec.md`, not measu
 nothing says whether an unscoped search finishes inside an MCP client's timeout until an
 operator runs one against the real tenant.
 
+`test/page-tools.test.ts` drives `get_page_content` through a fake `PageContentClient`,
+but the ink in it is the committed InkML fixture rendered for real: the image block's
+base64 is decoded and its PNG header checked against the width the JSON block reports,
+so a result that claimed an image and carried something else would fail. It forces the
+downscale path by injecting a one-byte budget rather than by committing a large fixture.
+What no test covers is whether an MCP client actually shows the image block to its model,
+or whether `MAX_INK_PNG_BYTES` is the right number — 750 KB of PNG, about 1 MB once
+base64-encoded, is a budget chosen rather than measured against any client's cap.
+
 `test/tools.test.ts` covers the registry, and it constructs the real MSAL and Firestore
 clients while doing so. Neither opens a connection until a token is asked for, so it
 needs no credential and no backend; if that ever stops being true, this test is where it
@@ -231,7 +240,7 @@ markup in its message.
 **One fetch serves both halves of a page.** `GraphPageContent.fetchRaw` is the only
 `includeInkML=true` call, and it returns the split parts. `fetchContent` turns that one
 response into `{ html, ink }` — the trimmed HTML and the rendered PNG — and is what the
-`get_page_content` tool in issue #16 wraps. A page with no ink comes back as plain
+`get_page_content` tool wraps. A page with no ink comes back as plain
 `text/html` rather than as `multipart/mixed`, so `pageHtml` falls back to the whole body
 when there are no parts; dropping it because there are no parts to search would lose the
 text of every typed page.
@@ -288,13 +297,34 @@ which is what the `requiredString` / `optionalString` / `optionalInteger` helper
 `ToolDefinition` and the argument helpers from `src/mcp-tools.ts`, so listing the modules
 there as well would make the two files import each other. `src/mcp-tools.ts` holds the
 contract, the error mapping, and the helpers; `src/tools.ts` builds the shared Graph
-client and concatenates the lists each tool module returns. `#16` and `#18` append there.
+client and concatenates the lists each tool module returns. `#18` appends there.
 
 **A tool answers with one JSON text block, and every count it reports is real.**
 `list_pages` says `moreAvailable` when Graph returned exactly `top` items, and
 `search_pages` says how many sections it searched out of how many it found. A model
 cannot tell a truncated search that matched nothing from a complete one, so a bounded
-result that omitted the bound would be read as "no such page".
+result that omitted the bound would be read as "no such page". `get_page_content` is the
+one tool that answers with a second block, and it is an image block for the reason below.
+
+**`get_page_content` returns the ink as an MCP image block, and that is the point.** The
+calling model reads the handwriting with its own vision; there is no OCR service and no
+handwriting API anywhere in this repository. Base64 inside the JSON text block would
+reach the model as characters it cannot see, and a file path would name a container
+filesystem no client can read — `test/page-tools.test.ts` asserts the PNG's base64 prefix
+does not appear in the text block. A page with no ink yields one block and `inkImage:
+null`; that is the normal answer for a typed page and not an error.
+
+**All of a page's ink is one cropped image.** Ink and typed content are independent on
+these pages, so the bounding box in `strokesToSvg` loses nothing worth keeping, and
+nothing here splices ink fragments back into the HTML at the positions they came from.
+
+**The ink PNG is shrunk by measurement, not by arithmetic.** `fitInkToByteBudget` in
+`src/ink.ts` re-rasterises the same SVG at 0.75× the width until the PNG fits
+`MAX_INK_PNG_BYTES`, because PNG size depends on how dense the strokes are and cannot be
+predicted from the pixel count. It stops at `MIN_RENDER_WIDTH` even when that still does
+not fit: an image too small to read is a better answer than a failed request, and the
+result says which width it got so the model can tell "illegible handwriting" from
+"rendered too small".
 
 **`list_sections` returns sections and section groups in one tagged list.** Graph exposes
 them as two relationships and the caller has to recurse through both — this account is a
