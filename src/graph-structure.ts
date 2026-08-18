@@ -14,6 +14,12 @@
 // nothing here assumes one level.
 
 import type { GraphAuth } from './graph-auth.ts';
+import {
+  UNGATED,
+  createGate,
+  parseRetryAfter,
+  type RequestGate,
+} from './graph-throttle.ts';
 
 export const GRAPH_ROOT = 'https://graph.microsoft.com/v1.0';
 
@@ -55,8 +61,33 @@ const SECTIONS_BY_NAME_URL =
   `&$expand=parentNotebook($select=id,displayName),parentSectionGroup($select=id,displayName)` +
   `&$filter=`;
 
+/**
+ * One container with both its child relationships inlined.
+ *
+ * Two requests become one. `listSections` and `listSectionGroups` still exist because a
+ * caller sometimes wants only one of the two, but nothing should ask for both separately.
+ */
+function containerChildrenUrl(kind: ContainerKind, containerId: string): string {
+  return (
+    `${GRAPH_ROOT}/me/onenote/${kind}/${encodeURIComponent(containerId)}?$select=id,displayName` +
+    `&$expand=sections($select=id,displayName),sectionGroups($select=id,displayName)`
+  );
+}
+
 /** The most result pages one list call will follow before giving up. */
 const MAX_PAGE_FOLLOWS = 50;
+
+/**
+ * How many containers a walk visits at once.
+ *
+ * The gate enforces this too, but the walk bounds itself as well: a client constructed
+ * without a gate — which is what a test does — must not be able to open 108 requests at
+ * once, because that is the shape that got this repository throttled.
+ */
+const WALK_CONCURRENCY = 4;
+
+/** Graph's own ceiling on `$top`; above it the request is a 400 with code 20129. */
+export const MAX_GRAPH_TOP = 100;
 
 /** How deep section groups may nest before the walk is treated as a cycle. */
 const MAX_SECTION_GROUP_DEPTH = 20;
@@ -70,8 +101,16 @@ export class GraphRequestError extends Error {
   readonly status: number;
   readonly statusText: string;
   readonly body: string;
+  /** From `Retry-After`, in milliseconds. Only Graph knows how long a 429 lasts. */
+  readonly retryAfterMs: number | undefined;
 
-  constructor(url: string, status: number, statusText: string, body: string) {
+  constructor(
+    url: string,
+    status: number,
+    statusText: string,
+    body: string,
+    retryAfterMs?: number,
+  ) {
     super(
       `GET ${url} failed: ${status} ${statusText}${body === '' ? '' : ` ${truncate(body, MAX_BODY_CHARS)}`}`,
     );
@@ -80,6 +119,7 @@ export class GraphRequestError extends Error {
     this.status = status;
     this.statusText = statusText;
     this.body = body;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -191,7 +231,13 @@ export async function graphGet(
   if (!response.ok) {
     // The body is read before it is thrown away: Graph puts the actual reason in it,
     // and error 20266 is only distinguishable from any other 400 by that text.
-    throw new GraphRequestError(url, response.status, response.statusText, await safeText(response));
+    throw new GraphRequestError(
+      url,
+      response.status,
+      response.statusText,
+      await safeText(response),
+      parseRetryAfter(response.headers.get('retry-after')),
+    );
   }
 
   let body: unknown;
@@ -224,6 +270,7 @@ async function collectValues(
   accessToken: string,
   fetchImpl: FetchLike,
   limit?: number,
+  gate: RequestGate = UNGATED,
 ): Promise<unknown[]> {
   const items: unknown[] = [];
   let url: string | undefined = firstUrl;
@@ -236,7 +283,12 @@ async function collectValues(
       );
     }
 
-    const body: Record<string, unknown> = await graphGet(url, accessToken, fetchImpl);
+    // Gated per request rather than per listing: following @odata.nextLink issues
+    // several requests and each counts against the limits separately. The gate also
+    // holds the retry, so a 429 on page three does not lose the first two.
+    const body: Record<string, unknown> = await gate.run(() =>
+      graphGet(url as string, accessToken, fetchImpl),
+    );
 
     const value = body['value'];
     if (!Array.isArray(value)) {
@@ -269,10 +321,21 @@ async function collectValues(
 export class GraphStructure {
   readonly #tokens: TokenSource;
   readonly #fetch: FetchLike;
+  readonly #gate: RequestGate;
 
-  constructor(tokens: TokenSource, fetchImpl: FetchLike = globalThis.fetch) {
+  /**
+   * `gate` defaults to UNGATED so a test runs at full speed. The deployed server builds
+   * this through `createGraphStructure`, which passes the shared production gate — that
+   * is what keeps the process inside OneNote's 5 concurrent and 120-per-minute limits.
+   */
+  constructor(
+    tokens: TokenSource,
+    fetchImpl: FetchLike = globalThis.fetch,
+    gate: RequestGate = UNGATED,
+  ) {
     this.#tokens = tokens;
     this.#fetch = fetchImpl;
+    this.#gate = gate;
   }
 
   /** Every notebook the signed-in account can see, by display name. */
@@ -296,16 +359,26 @@ export class GraphStructure {
     return (await this.#collect(url)).map((item) => toNode(item, url));
   }
 
-  /** Both child relationships of one container, fetched together. */
+  /**
+   * Both child relationships of one container, in one request.
+   *
+   * `$expand` on the container itself replaces the two list calls this used to make. On
+   * a walk that visits every container, that halves the request count, and requests are
+   * the scarce thing: the budget is 400 an hour.
+   *
+   * @throws {GraphRequestError} on a non-2xx response.
+   * @throws {GraphResponseError} if the body is not the expected shape.
+   */
   async listContainerChildren(
     containerKind: ContainerKind,
     containerId: string,
   ): Promise<ContainerChildren> {
-    const [sections, sectionGroups] = await Promise.all([
-      this.listSections(containerKind, containerId),
-      this.listSectionGroups(containerKind, containerId),
-    ]);
-    return { sections, sectionGroups };
+    const url = containerChildrenUrl(containerKind, containerId);
+    const body = await this.#get(url);
+    return {
+      sections: toNodeArray(body['sections'], url).map((item) => toNode(item, url)),
+      sectionGroups: toNodeArray(body['sectionGroups'], url).map((item) => toNode(item, url)),
+    };
   }
 
   /**
@@ -319,9 +392,13 @@ export class GraphStructure {
       throw new RangeError(`top must be a positive integer, got ${String(top)}`);
     }
 
+    // Graph rejects a $top above 100 outright — 400 with code 20129 — so the request
+    // asks for at most that and `collectValues` follows @odata.nextLink until `top`
+    // items are in hand. `top` is therefore a result count, not a page size.
     const url =
       `${GRAPH_ROOT}/me/onenote/sections/${encodeURIComponent(sectionId)}/pages` +
-      `?$top=${top}&$orderby=lastModifiedDateTime desc&$select=id,title,lastModifiedDateTime`;
+      `?$top=${Math.min(top, MAX_GRAPH_TOP)}` +
+      `&$orderby=lastModifiedDateTime desc&$select=id,title,lastModifiedDateTime`;
 
     return (await this.#collect(url, top)).map((item) => toPageSummary(item, url));
   }
@@ -382,6 +459,24 @@ export class GraphStructure {
   }
 
   /**
+   * Pages in one section whose title contains `query`, compared case-insensitively.
+   *
+   * The comparison happens in the service, so a section holding thousands of pages costs
+   * the same one request as a section holding three, and nothing is truncated on the way
+   * back. This is what an unscoped title search runs per section.
+   *
+   * @throws {GraphRequestError} on a non-2xx response.
+   */
+  async findPagesMatchingTitle(sectionId: string, query: string): Promise<PageSummary[]> {
+    const filter = `contains(tolower(title), ${quoteOData(query.trim().toLowerCase())})`;
+    const url =
+      `${GRAPH_ROOT}/me/onenote/sections/${encodeURIComponent(sectionId)}/pages` +
+      `?$select=id,title,lastModifiedDateTime&$orderby=${encodeURIComponent('lastModifiedDateTime desc')}` +
+      `&$top=${MAX_GRAPH_TOP}&$filter=${encodeURIComponent(filter)}`;
+    return (await this.#collect(url, MAX_GRAPH_TOP)).map((item) => toPageSummary(item, url));
+  }
+
+  /**
    * Every notebook with its sections and one level of section group, in one request.
    *
    * This is the cheap way to answer a question about names. It does not replace
@@ -397,10 +492,27 @@ export class GraphStructure {
     return items.map((item) => toExpandedNotebook(item, EXPANDED_TREE_URL));
   }
 
-  /** Every notebook, each with its tree resolved. */
+  /**
+   * Every notebook, each with its tree resolved.
+   *
+   * Built on `getExpandedTree`, so the notebooks, their sections, their section groups
+   * and those groups' sections all arrive in the first request. What remains is one
+   * request per section group, to find whether anything nests below it — Graph caps
+   * `$expand` at two levels, so nothing cheaper answers that. On the account this was
+   * measured against that is 44 requests rather than the 195 the per-container walk cost.
+   *
+   * Prefer `getExpandedTree` when one level of section group is enough. This exists for
+   * the case where it is not.
+   */
   async getFullTree(): Promise<NotebookTree[]> {
-    const notebooks = await this.listNotebooks();
-    return Promise.all(notebooks.map((notebook) => this.getNotebookTree(notebook)));
+    const expanded = await this.getExpandedTree();
+
+    return mapWithLimit(expanded, WALK_CONCURRENCY, async (notebook) => ({
+      id: notebook.id,
+      displayName: notebook.displayName,
+      sections: notebook.sections,
+      sectionGroups: await this.#expandGroups(notebook.sectionGroups, 1),
+    }));
   }
 
   async #expandGroups(groups: SectionGroup[], depth: number): Promise<SectionGroupNode[]> {
@@ -413,34 +525,48 @@ export class GraphStructure {
       );
     }
 
-    return Promise.all(
-      groups.map(async (group): Promise<SectionGroupNode> => {
-        const children = await this.listContainerChildren('sectionGroups', group.id);
-        return {
-          id: group.id,
-          displayName: group.displayName,
-          sections: children.sections,
-          sectionGroups: await this.#expandGroups(children.sectionGroups, depth + 1),
-        };
-      }),
-    );
+    // One request per group, and at most WALK_CONCURRENCY of them in flight. The
+    // request is what says whether anything nests below this group; its sections come
+    // back in the same response.
+    return mapWithLimit(groups, WALK_CONCURRENCY, async (group): Promise<SectionGroupNode> => {
+      const children = await this.listContainerChildren('sectionGroups', group.id);
+      return {
+        id: group.id,
+        displayName: group.displayName,
+        sections: children.sections,
+        sectionGroups: await this.#expandGroups(children.sectionGroups, depth + 1),
+      };
+    });
   }
 
   #containerUrl(containerKind: ContainerKind, containerId: string): string {
     return `${GRAPH_ROOT}/me/onenote/${containerKind}/${encodeURIComponent(containerId)}`;
   }
 
+  /** One entity, gated. */
+  async #get(url: string): Promise<Record<string, unknown>> {
+    const accessToken = await this.#tokens.getAccessToken();
+    return this.#gate.run(() => graphGet(url, accessToken, this.#fetch));
+  }
+
+  /** One collection, with every request it makes passing through the gate. */
   async #collect(url: string, limit?: number): Promise<unknown[]> {
     const accessToken = await this.#tokens.getAccessToken();
-    return limit === undefined
-      ? collectValues(url, accessToken, this.#fetch)
-      : collectValues(url, accessToken, this.#fetch, limit);
+    return collectValues(url, accessToken, this.#fetch, limit, this.#gate);
   }
 }
 
-/** Build the client from the server's Graph auth. */
+/**
+ * The gate every client built by a factory in this repository shares.
+ *
+ * One per process, because the limits are per app per user and two clients pacing
+ * themselves independently would together exceed what either one allows.
+ */
+export const PRODUCTION_GATE: RequestGate = createGate();
+
+/** Build the client from the server's Graph auth, sharing the process-wide gate. */
 export function createGraphStructure(auth: GraphAuth): GraphStructure {
-  return new GraphStructure(auth);
+  return new GraphStructure(auth, globalThis.fetch, PRODUCTION_GATE);
 }
 
 function toNode(item: unknown, url: string): { id: string; displayName: string } {
@@ -485,6 +611,34 @@ function toNodeArray(value: unknown, url: string): unknown[] {
     );
   }
   return value;
+}
+
+/**
+ * `Promise.all` with a ceiling on how many run at once, preserving input order.
+ *
+ * Written out rather than pulled in as a dependency because it is fifteen lines and the
+ * thing it prevents — an unbounded fan-out against an API that allows five concurrent
+ * requests — is the most expensive mistake this repository has made.
+ */
+async function mapWithLimit<T, R>(
+  items: readonly T[],
+  limit: number,
+  run: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array<R>(items.length);
+  let cursor = 0;
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = cursor;
+      if (index >= items.length) return;
+      cursor += 1;
+      results[index] = await run(items[index] as T);
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return results;
 }
 
 /** A single-quoted OData string literal; an embedded quote is doubled. */

@@ -12,6 +12,7 @@ import {
   type FetchLike,
   type TokenSource,
 } from '../src/graph-structure.ts';
+import { createGate } from '../src/graph-throttle.ts';
 
 const TOKEN = 'fake-access-token';
 const NODE_QUERY = '$select=id,displayName&$orderby=displayName';
@@ -53,6 +54,27 @@ function json(body: unknown, init: ResponseInit = {}): Response {
 
 function childUrl(kind: 'notebooks' | 'sectionGroups', id: string, child: string): string {
   return `${GRAPH_ROOT}/me/onenote/${kind}/${id}/${child}?${NODE_QUERY}`;
+}
+
+/**
+ * One container with both child relationships inlined. `listContainerChildren` asks for
+ * this instead of the two `childUrl` listings, which halves the cost of any walk.
+ */
+function containerUrl(kind: 'notebooks' | 'sectionGroups', id: string): string {
+  return (
+    `${GRAPH_ROOT}/me/onenote/${kind}/${id}?$select=id,displayName` +
+    `&$expand=sections($select=id,displayName),sectionGroups($select=id,displayName)`
+  );
+}
+
+/** The container response shape: the entity itself, with the children inlined. */
+function container(
+  id: string,
+  displayName: string,
+  sections: { id: string; displayName: string }[],
+  sectionGroups: { id: string; displayName: string }[],
+): Response {
+  return json({ id, displayName, sections, sectionGroups });
 }
 
 function pagesUrl(sectionId: string, top: number): string {
@@ -236,19 +258,17 @@ test('listPagesInSection rejects a top that is not a positive integer', async ()
 test('getNotebookTree returns the full tree through a nested section group', async () => {
   // The acceptance case from issue #11: a notebook whose section group contains a
   // further section group. A walk that stopped one level down would miss s-3 entirely.
-  const empty = { value: [] };
-  const { fetchImpl } = fakeFetch({
-    [childUrl('notebooks', 'nb-1', 'sections')]: () =>
-      json({ value: [{ id: 's-1', displayName: 'Year overview' }] }),
-    [childUrl('notebooks', 'nb-1', 'sectionGroups')]: () =>
-      json({ value: [{ id: 'g-1', displayName: 'March' }] }),
-    [childUrl('sectionGroups', 'g-1', 'sections')]: () =>
-      json({ value: [{ id: 's-2', displayName: 'Monthly calendar' }] }),
-    [childUrl('sectionGroups', 'g-1', 'sectionGroups')]: () =>
-      json({ value: [{ id: 'g-2', displayName: 'Week 1' }] }),
-    [childUrl('sectionGroups', 'g-2', 'sections')]: () =>
-      json({ value: [{ id: 's-3', displayName: 'Daily todo' }] }),
-    [childUrl('sectionGroups', 'g-2', 'sectionGroups')]: () => json(empty),
+  const { fetchImpl, calls } = fakeFetch({
+    [containerUrl('notebooks', 'nb-1')]: () =>
+      container('nb-1', '2026', [{ id: 's-1', displayName: 'Year overview' }], [
+        { id: 'g-1', displayName: 'March' },
+      ]),
+    [containerUrl('sectionGroups', 'g-1')]: () =>
+      container('g-1', 'March', [{ id: 's-2', displayName: 'Monthly calendar' }], [
+        { id: 'g-2', displayName: 'Week 1' },
+      ]),
+    [containerUrl('sectionGroups', 'g-2')]: () =>
+      container('g-2', 'Week 1', [{ id: 's-3', displayName: 'Daily todo' }], []),
   });
 
   const tree = await new GraphStructure(tokens, fetchImpl).getNotebookTree({
@@ -276,16 +296,18 @@ test('getNotebookTree returns the full tree through a nested section group', asy
       },
     ],
   });
+
+  // One request per container, not two: the children arrive with the container.
+  assert.equal(calls.length, 3);
 });
 
 test('a section group that contains itself is abandoned rather than recursed forever', async () => {
   const { fetchImpl, calls } = fakeFetch({
-    [childUrl('notebooks', 'nb-1', 'sections')]: () => json({ value: [] }),
-    [childUrl('notebooks', 'nb-1', 'sectionGroups')]: () =>
-      json({ value: [{ id: 'g-1', displayName: 'March' }] }),
-    [childUrl('sectionGroups', 'g-1', 'sections')]: () => json({ value: [] }),
-    [childUrl('sectionGroups', 'g-1', 'sectionGroups')]: () =>
-      json({ value: [{ id: 'g-1', displayName: 'March' }] }),
+    [containerUrl('notebooks', 'nb-1')]: () =>
+      container('nb-1', '2026', [], [{ id: 'g-1', displayName: 'March' }]),
+    // The group reports itself as its own child, which no real structure does.
+    [containerUrl('sectionGroups', 'g-1')]: () =>
+      container('g-1', 'March', [], [{ id: 'g-1', displayName: 'March' }]),
   });
 
   const err = await caught(
@@ -503,4 +525,90 @@ test('findPagesByTitle lets Graph compare titles, case-insensitively', async () 
     pages.map((page) => page.id),
     ['p-1'],
   );
+});
+
+// ---------------------------------------------------------------------------
+// The gate, seen from the client. The policy itself is tested in
+// test/graph-throttle.test.ts; what matters here is that the client's requests actually
+// go through it, and that a 429 carries the Retry-After the gate needs.
+// ---------------------------------------------------------------------------
+
+test('a 429 from Graph is retried through the gate rather than thrown at the caller', async () => {
+  const url = `${GRAPH_ROOT}/me/onenote/notebooks?${NODE_QUERY}`;
+  let attempts = 0;
+  const { fetchImpl } = fakeFetch({
+    [url]: () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return new Response('{"error":{"code":"10007"}}', {
+          status: 429,
+          headers: { 'content-type': 'application/json', 'retry-after': '3' },
+        });
+      }
+      return json({ value: [{ id: 'nb-1', displayName: '2026' }] });
+    },
+  });
+
+  const slept: number[] = [];
+  const gate = createGate({
+    minIntervalMs: 0,
+    sleep: (ms: number) => {
+      slept.push(ms);
+      return Promise.resolve();
+    },
+  });
+
+  const notebooks = await new GraphStructure(tokens, fetchImpl, gate).listNotebooks();
+
+  assert.deepEqual(notebooks, [{ id: 'nb-1', displayName: '2026' }]);
+  assert.equal(attempts, 2);
+  assert.deepEqual(slept, [3_000], 'the Retry-After header is what the wait comes from');
+});
+
+test('a 404 is not retried, and reaches the caller as it is', async () => {
+  const url = `${GRAPH_ROOT}/me/onenote/notebooks?${NODE_QUERY}`;
+  let attempts = 0;
+  const { fetchImpl } = fakeFetch({
+    [url]: () => {
+      attempts += 1;
+      return new Response('{"error":{"code":"20112"}}', { status: 404 });
+    },
+  });
+
+  const err = await caught(new GraphStructure(tokens, fetchImpl, createGate({ minIntervalMs: 0 })).listNotebooks());
+
+  assert.ok(err instanceof GraphRequestError);
+  assert.equal(err.status, 404);
+  assert.equal(attempts, 1, 'repeating a 404 would spend quota to fail again');
+});
+
+test('listPagesInSection never asks Graph for more than 100, and pages to reach top', async () => {
+  // $top=200 is a 400 with code 20129, so a caller asking for 150 has to be served by
+  // following @odata.nextLink rather than by a bigger request.
+  const first =
+    `${GRAPH_ROOT}/me/onenote/sections/s-1/pages` +
+    `?$top=100&$orderby=lastModifiedDateTime desc&$select=id,title,lastModifiedDateTime`;
+  const next = `${GRAPH_ROOT}/me/onenote/sections/s-1/pages?$skiptoken=abc`;
+
+  const pageAt = (index: number): Record<string, string> => ({
+    id: `p-${index}`,
+    title: `Page ${index}`,
+    lastModifiedDateTime: '2026-03-04T10:00:00Z',
+  });
+
+  const { fetchImpl, calls } = fakeFetch({
+    [first]: () =>
+      json({
+        value: Array.from({ length: 100 }, (_unused, index) => pageAt(index)),
+        '@odata.nextLink': next,
+      }),
+    [next]: () =>
+      json({ value: Array.from({ length: 100 }, (_unused, index) => pageAt(100 + index)) }),
+  });
+
+  const pages = await new GraphStructure(tokens, fetchImpl).listPagesInSection('s-1', 150);
+
+  assert.equal(pages.length, 150);
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every((call) => !call.url.includes('$top=150')));
 });

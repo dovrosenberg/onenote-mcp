@@ -71,6 +71,7 @@ export interface StructureClient {
   getExpandedTree(): Promise<ExpandedNotebook[]>;
   findSectionsByName(displayName: string): Promise<SectionWithParents[]>;
   findPagesByTitle(sectionId: string, title: string): Promise<PageSummary[]>;
+  findPagesMatchingTitle(sectionId: string, query: string): Promise<PageSummary[]>;
 }
 
 /** The name arguments both `_by_name` tools share. */

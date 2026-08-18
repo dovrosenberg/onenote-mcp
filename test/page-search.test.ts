@@ -7,7 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import type { NotebookTree, PageSummary } from '../src/graph-structure.ts';
+import type { ExpandedNotebook, PageSummary } from '../src/graph-structure.ts';
 import {
   flattenSections,
   searchAllSections,
@@ -22,10 +22,12 @@ function page(id: string, title: string, modified: string): PageSummary {
 }
 
 /**
- * A notebook per year with a section group per month, which is the structure this
- * account uses and the one a walk that stopped at direct children would miss.
+ * The tree as `getExpandedTree` returns it: a notebook's own sections, and its section
+ * groups with their sections. That is two levels, which is Graph's cap on `$expand`
+ * nesting — `sec-week`, in a group below a group, is deliberately absent, because an
+ * unscoped search does not reach it and the counts have to say so.
  */
-const TREE: NotebookTree[] = [
+const TREE: ExpandedNotebook[] = [
   {
     id: 'nb-2026',
     displayName: '2026',
@@ -34,14 +36,9 @@ const TREE: NotebookTree[] = [
       {
         id: 'grp-march',
         displayName: 'March',
-        sections: [{ id: 'sec-daily', displayName: 'Daily todo' }],
-        sectionGroups: [
-          {
-            id: 'grp-week-10',
-            displayName: 'Week 10',
-            sections: [{ id: 'sec-week', displayName: 'Weekly todo' }],
-            sectionGroups: [],
-          },
+        sections: [
+          { id: 'sec-daily', displayName: 'Daily todo' },
+          { id: 'sec-week', displayName: 'Weekly todo' },
         ],
       },
     ],
@@ -80,16 +77,18 @@ function fakeStructure(
   return {
     listed,
     maxInFlight: () => peak,
-    getFullTree: () => Promise.resolve(TREE),
-    listPagesInSection: async (sectionId) => {
+    getExpandedTree: () => Promise.resolve(TREE),
+    // Graph applies the title filter, so the fake does too: returning every page here
+    // would test a matching rule the service no longer runs.
+    findPagesMatchingTitle: async (sectionId, query) => {
       listed.push(sectionId);
       inFlight += 1;
       peak = Math.max(peak, inFlight);
       try {
         hooks.onList?.(sectionId);
-        // A real listing is a round trip; yielding here lets the concurrency bound show.
+        // A real request is a round trip; yielding here lets the concurrency bound show.
         await Promise.resolve();
-        return pages[sectionId] ?? [];
+        return (pages[sectionId] ?? []).filter((item) => titleMatches(item.title, query));
       } finally {
         inFlight -= 1;
       }
@@ -111,12 +110,17 @@ test('titleMatches is a case-insensitive substring, and ignores surrounding blan
   assert.ok(!titleMatches('Standup', 'budget'));
 });
 
-test('flattenSections recurses through nested section groups and builds a path', () => {
+test('flattenSections covers both levels of the expanded tree and builds a path', () => {
   const refs = flattenSections(TREE);
 
   assert.deepEqual(
     refs.map((ref) => ref.path),
-    ['2026 / Inbox', '2026 / March / Daily todo', '2026 / March / Week 10 / Weekly todo', '2025 / Archive'],
+    [
+      '2026 / Inbox',
+      '2026 / March / Daily todo',
+      '2026 / March / Weekly todo',
+      '2025 / Archive',
+    ],
   );
   assert.deepEqual(
     refs.map((ref) => ref.id),
@@ -149,14 +153,14 @@ test('an unscoped search covers every section and tags each match with its path'
   assert.equal(result.stoppedEarly, false);
   assert.equal(result.stoppedBecause, null);
 
-  // Newest first, and the match in the twice-nested section group is present.
+  // Newest first, and each match carries the path of the section it came from.
   assert.deepEqual(
     result.matches.map((match) => match.pageId),
     ['p-4', 'p-2', 'p-1', 'p-5'],
   );
   assert.equal(
     result.matches.find((match) => match.pageId === 'p-4')?.sectionPath,
-    '2026 / March / Week 10 / Weekly todo',
+    '2026 / March / Weekly todo',
   );
 });
 

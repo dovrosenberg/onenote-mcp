@@ -12,7 +12,14 @@
 // sent them; `fetchContent` is the whole page — trimmed HTML and rendered ink — from
 // that one response.
 
-import { GraphRequestError, GRAPH_ROOT, type FetchLike, type TokenSource } from './graph-structure.ts';
+import {
+  GraphRequestError,
+  GRAPH_ROOT,
+  PRODUCTION_GATE,
+  type FetchLike,
+  type TokenSource,
+} from './graph-structure.ts';
+import { UNGATED, parseRetryAfter, type RequestGate } from './graph-throttle.ts';
 import { renderInk, DEFAULT_RENDER_WIDTH, type InkImage } from './ink.ts';
 import { splitMultipart, findPart, type MultipartPart } from './multipart.ts';
 import { trimPageHtml } from './page-html.ts';
@@ -67,10 +74,22 @@ export function inkCandidates(content: RawPageContent): InkCandidate[] {
 export class GraphPageContent {
   readonly #tokens: TokenSource;
   readonly #fetch: FetchLike;
+  readonly #gate: RequestGate;
 
-  constructor(tokens: TokenSource, fetchImpl: FetchLike = globalThis.fetch) {
+  /**
+   * `gate` defaults to UNGATED so a test runs at full speed. `createGraphPageContent`
+   * passes the process-wide gate, which is what keeps page reads inside the same
+   * concurrency and rate limits the structure calls obey — the limits are per user, so
+   * two clients pacing separately would together exceed both.
+   */
+  constructor(
+    tokens: TokenSource,
+    fetchImpl: FetchLike = globalThis.fetch,
+    gate: RequestGate = UNGATED,
+  ) {
     this.#tokens = tokens;
     this.#fetch = fetchImpl;
+    this.#gate = gate;
   }
 
   /**
@@ -81,16 +100,29 @@ export class GraphPageContent {
   async fetchRaw(pageId: string): Promise<RawPageContent> {
     const url = pageContentUrl(pageId);
     const accessToken = await this.#tokens.getAccessToken();
-    const response = await this.#fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
 
-    const contentType = response.headers.get('content-type');
-    const raw = await safeText(response);
+    return this.#gate.run(async () => {
+      const response = await this.#fetch(url, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
 
-    if (!response.ok) {
-      throw new GraphRequestError(url, response.status, response.statusText, raw);
-    }
+      const contentType = response.headers.get('content-type');
+      const raw = await safeText(response);
 
-    return { raw, contentType, parts: splitMultipart(raw, contentType) ?? [] };
+      if (!response.ok) {
+        // The retry hint goes on the error because the gate is what acts on it; a 429
+        // here is retried on the same terms as one from a structure call.
+        throw new GraphRequestError(
+          url,
+          response.status,
+          response.statusText,
+          raw,
+          parseRetryAfter(response.headers.get('retry-after')),
+        );
+      }
+
+      return { raw, contentType, parts: splitMultipart(raw, contentType) ?? [] };
+    });
   }
 
   /**
@@ -155,9 +187,9 @@ export function pageHtml(content: RawPageContent): string | null {
   return content.parts.length === 0 ? content.raw : null;
 }
 
-/** Build the client from the server's Graph auth. */
+/** Build the client from the server's Graph auth, sharing the process-wide gate. */
 export function createGraphPageContent(tokens: TokenSource): GraphPageContent {
-  return new GraphPageContent(tokens);
+  return new GraphPageContent(tokens, globalThis.fetch, PRODUCTION_GATE);
 }
 
 /** An unreadable body must not mask the status that is about to be thrown. */

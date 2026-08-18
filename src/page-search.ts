@@ -2,9 +2,15 @@
 //
 // There is no account-wide page list to search against. `GET /me/onenote/pages` fails
 // with error 20266, "maximum sections exceeded", on an account with this many sections,
-// so a title search that is not already scoped to one section has to walk the structure
-// and list each section's pages. That is many requests, and the walk is therefore
-// bounded twice: by how many sections it will visit, and by how long it will spend.
+// so a title search that is not already scoped to one section has to visit each section
+// separately. That is one request per section, and the walk is therefore bounded twice:
+// by how many sections it will visit, and by how long it will spend.
+//
+// Two things make it cheaper than it was. The section list comes from `getExpandedTree`,
+// one request rather than the 195 the per-container walk cost. And the title comparison
+// is done by Graph, with `contains(tolower(title), '…')`, so a section returns its
+// matches rather than its first hundred pages — nothing is read and discarded, and no
+// per-section page bound can hide a match.
 //
 // A bound that is not reported is worse than no bound, because a truncated search that
 // found nothing is indistinguishable from a complete search that found nothing. Every
@@ -17,13 +23,21 @@
 
 import type {
   ContainerKind,
-  NotebookTree,
+  ExpandedNotebook,
+  ExpandedSectionGroup,
   PageSummary,
-  SectionGroupNode,
 } from './graph-structure.ts';
 
-/** How many sections one unscoped search will visit before it stops. */
-export const MAX_SECTIONS_SEARCHED = 200;
+/**
+ * How many sections one unscoped search will visit before it stops.
+ *
+ * Sized against the request budget rather than against the account. OneNote allows 120
+ * requests a minute and 400 an hour; at the paced rate this service runs at, 60 sections
+ * is what fits inside the time budget below, and it leaves most of the hourly budget for
+ * everything else. The account holds 560 sections, so an unscoped search is a sample and
+ * says so — `stoppedEarly` and the counts are in every result.
+ */
+export const MAX_SECTIONS_SEARCHED = 60;
 
 /**
  * How long one unscoped search will spend listing pages, in milliseconds.
@@ -34,8 +48,13 @@ export const MAX_SECTIONS_SEARCHED = 200;
  */
 export const SEARCH_TIME_BUDGET_MS = 25_000;
 
-/** How many pages are read out of each section while searching it. */
-export const PAGES_PER_SECTION = 100;
+/**
+ * How many matches are read out of each section.
+ *
+ * This bounds the matches, not the pages: Graph applies the title filter, so a section
+ * with 500 pages and two matching titles returns two.
+ */
+export const MATCHES_PER_SECTION = 100;
 
 /** How many sections are listed at once. Graph throttles a client that fans out wide. */
 export const SECTION_CONCURRENCY = 4;
@@ -77,14 +96,14 @@ export interface SearchResult {
 
 /** The slice of `GraphStructure` a search calls; a test supplies a plain object. */
 export interface SearchableStructure {
-  getFullTree(): Promise<NotebookTree[]>;
-  listPagesInSection(sectionId: string, top?: number): Promise<PageSummary[]>;
+  getExpandedTree(): Promise<ExpandedNotebook[]>;
+  findPagesMatchingTitle(sectionId: string, query: string): Promise<PageSummary[]>;
 }
 
 export interface SearchOptions {
   readonly maxSections?: number;
   readonly timeBudgetMs?: number;
-  readonly pagesPerSection?: number;
+  readonly matchesPerSection?: number;
   readonly concurrency?: number;
   readonly maxMatches?: number;
   /** Injected so the time budget is testable without waiting for it. */
@@ -104,54 +123,53 @@ export function titleMatches(title: string, query: string): boolean {
 }
 
 /**
- * Every section in the tree, depth first, with its path.
+ * Every section in the expanded tree, with the path that names it.
  *
- * Section groups nest, and this account nests them a month deep under each notebook, so
- * the recursion is the point: a flatten that stopped at a notebook's direct sections
- * would search almost nothing.
+ * The tree carries a notebook's own sections and its section groups' sections, which is
+ * as deep as Graph's `$expand` reaches. A section nested below that is not searched and
+ * not counted — `find_page_by_name` is the tool that reaches one, and this one says how
+ * many sections it saw so a caller is not told "no such page" by a partial walk.
  */
-export function flattenSections(trees: readonly NotebookTree[]): SectionRef[] {
+export function flattenSections(trees: readonly ExpandedNotebook[]): SectionRef[] {
   const refs: SectionRef[] = [];
 
-  const walk = (
-    sections: readonly { id: string; displayName: string }[],
-    groups: readonly SectionGroupNode[],
+  const add = (
+    section: { id: string; displayName: string },
     prefix: readonly string[],
   ): void => {
-    for (const section of sections) {
-      refs.push({
-        id: section.id,
-        displayName: section.displayName,
-        path: [...prefix, section.displayName].join(' / '),
-      });
-    }
-    for (const group of groups) {
-      walk(group.sections, group.sectionGroups, [...prefix, group.displayName]);
-    }
+    refs.push({
+      id: section.id,
+      displayName: section.displayName,
+      path: [...prefix, section.displayName].join(' / '),
+    });
   };
 
   for (const tree of trees) {
-    walk(tree.sections, tree.sectionGroups, [tree.displayName]);
+    for (const section of tree.sections) add(section, [tree.displayName]);
+    for (const group of tree.sectionGroups as readonly ExpandedSectionGroup[]) {
+      for (const section of group.sections) add(section, [tree.displayName, group.displayName]);
+    }
   }
 
   return refs;
 }
 
 /**
- * Title search inside one section. Nothing is truncated silently: `PAGES_PER_SECTION`
- * bounds the read, and the caller is told how many pages were looked at.
+ * Title search inside one section: one request, and Graph does the matching.
+ *
+ * `titleMatches` is not applied again here. The filter Graph runs is the same rule —
+ * a case-insensitive substring of the title — and re-checking it locally would only
+ * disagree with the service over Unicode casing.
  */
 export async function searchOneSection(
   structure: SearchableStructure,
   sectionId: string,
   query: string,
-  options: { pagesPerSection?: number; maxMatches?: number } = {},
+  options: { matchesPerSection?: number; maxMatches?: number } = {},
 ): Promise<SearchResult> {
-  const pagesPerSection = options.pagesPerSection ?? PAGES_PER_SECTION;
-  const pages = await structure.listPagesInSection(sectionId, pagesPerSection);
-
+  const pages = await structure.findPagesMatchingTitle(sectionId, query);
   const matches = pages
-    .filter((page) => titleMatches(page.title, query))
+    .slice(0, options.matchesPerSection ?? MATCHES_PER_SECTION)
     .map((page) => toMatch(page, sectionId));
 
   return capped(matches, 1, 1, null, options.maxMatches ?? MAX_MATCHES);
@@ -171,13 +189,14 @@ export async function searchAllSections(
 ): Promise<SearchResult> {
   const maxSections = options.maxSections ?? MAX_SECTIONS_SEARCHED;
   const timeBudgetMs = options.timeBudgetMs ?? SEARCH_TIME_BUDGET_MS;
-  const pagesPerSection = options.pagesPerSection ?? PAGES_PER_SECTION;
+  const matchesPerSection = options.matchesPerSection ?? MATCHES_PER_SECTION;
   const concurrency = options.concurrency ?? SECTION_CONCURRENCY;
   const maxMatches = options.maxMatches ?? MAX_MATCHES;
   const now = options.now ?? Date.now;
 
   const deadline = now() + timeBudgetMs;
-  const sections = flattenSections(await structure.getFullTree());
+  // One request for every section in the account, rather than one per container.
+  const sections = flattenSections(await structure.getExpandedTree());
   const planned = sections.slice(0, maxSections);
 
   const matches: PageMatch[] = [];
@@ -199,9 +218,9 @@ export async function searchAllSections(
       }
       cursor += 1;
 
-      const pages = await structure.listPagesInSection(ref.id, pagesPerSection);
-      for (const page of pages) {
-        if (titleMatches(page.title, query)) matches.push(toMatch(page, ref.id, ref.path));
+      const pages = await structure.findPagesMatchingTitle(ref.id, query);
+      for (const page of pages.slice(0, matchesPerSection)) {
+        matches.push(toMatch(page, ref.id, ref.path));
       }
       searched += 1;
     }

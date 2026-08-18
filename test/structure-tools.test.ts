@@ -118,6 +118,14 @@ function fakeStructure(): Fake {
       return Promise.resolve(EXPANDED);
     },
     findSectionsByName: () => Promise.resolve([]),
+    findPagesMatchingTitle: (sectionId: string, query: string) => {
+      pageCalls.push({ sectionId, top: undefined });
+      return Promise.resolve(
+        (PAGES[sectionId] ?? []).filter((page) =>
+          page.title.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()),
+        ),
+      );
+    },
     findPagesByTitle: (sectionId: string, title: string) => {
       titleCalls.push({ sectionId, title });
       // Graph does this comparison; the fake does the same thing the service would.
@@ -284,16 +292,18 @@ test('an unscoped search walks the tree and reports full coverage', async () => 
   const structure = fakeStructure();
   const body = await call('search_pages', { query: 'budget' }, structure);
 
+  // Every section in the expanded tree: the notebooks' own sections and the sections of
+  // their section groups.
   assert.deepEqual(
     structure.pageCalls.map((entry) => entry.sectionId).sort(),
-    ['sec-daily', 'sec-inbox'],
+    ['sec-daily', 'sec-inbox', 'sec-inbox-2025', 'sec-log'],
   );
   assert.equal(body['scope'], 'account');
-  assert.equal(body['sectionsSearched'], 2);
-  assert.equal(body['sectionsFound'], 2);
+  assert.equal(body['sectionsSearched'], 4);
+  assert.equal(body['sectionsFound'], 4);
   assert.equal(body['stoppedEarly'], false);
   assert.equal(body['stoppedBecause'], null);
-  assert.match(String(body['note']), /Searched all 2/);
+  assert.match(String(body['note']), /Searched all 4/);
 
   // Newest first, and each match says which section it is in.
   const matches = body['matches'] as { pageId: string; sectionPath: string }[];
@@ -308,8 +318,8 @@ test('a truncated search says so in the note rather than reading as an answer', 
   assert.equal(body['stoppedEarly'], true);
   assert.equal(body['stoppedBecause'], 'section-limit');
   assert.equal(body['sectionsSearched'], 1);
-  assert.equal(body['sectionsFound'], 2);
-  assert.match(String(body['note']), /1 of 2 sections/);
+  assert.equal(body['sectionsFound'], 4);
+  assert.match(String(body['note']), /1 of 4 sections/);
   assert.match(String(body['note']), /sectionId/);
 });
 
