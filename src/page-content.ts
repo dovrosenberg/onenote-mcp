@@ -6,14 +6,16 @@
 // another the InkML that ./ink.ts turns into a picture.
 //
 // One fetch serves both halves. A caller asking for a page should not pay two round
-// trips, and should not have to know that ink is a separate concern; issue #13 builds
-// the HTML half on top of this same fetch.
+// trips, and should not have to know that ink is a separate concern.
 //
-// This module holds no HTML trimming. It returns the parts as Graph sent them.
+// The trimming itself lives in ./page-html.ts. `fetchRaw` returns the parts as Graph
+// sent them; `fetchContent` is the whole page — trimmed HTML and rendered ink — from
+// that one response.
 
 import { GraphRequestError, GRAPH_ROOT, type FetchLike, type TokenSource } from './graph-structure.ts';
 import { renderInk, DEFAULT_RENDER_WIDTH, type InkImage } from './ink.ts';
 import { splitMultipart, findPart, type MultipartPart } from './multipart.ts';
+import { trimPageHtml } from './page-html.ts';
 
 /** A page's content as Graph returned it, already split into parts. */
 export interface RawPageContent {
@@ -23,6 +25,14 @@ export interface RawPageContent {
   readonly contentType: string | null;
   /** The parts, or an empty array when the response was not multipart. */
   readonly parts: MultipartPart[];
+}
+
+/** One page: its typed content as trimmed HTML, and its handwriting as a PNG. */
+export interface PageContent {
+  /** The trimmed HTML, or null when the response carried no HTML part. */
+  readonly html: string | null;
+  /** The rendered handwriting, or null when the page has none. Null is normal. */
+  readonly ink: InkImage | null;
 }
 
 /** Anything in a content response that could hold an `<ink>` root. */
@@ -84,6 +94,18 @@ export class GraphPageContent {
   }
 
   /**
+   * One page's typed content and handwriting, from a single fetch.
+   *
+   * @throws {GraphRequestError} on a non-2xx response.
+   * @throws {InkRenderError} if rasterisation fails.
+   */
+  async fetchContent(pageId: string, width: number = DEFAULT_RENDER_WIDTH): Promise<PageContent> {
+    const content = await this.fetchRaw(pageId);
+    const html = pageHtml(content);
+    return { html: html === null ? null : trimPageHtml(html), ink: renderPageInk(content, width) };
+  }
+
+  /**
    * The page's handwriting as a PNG, or null when the page has none.
    *
    * Null is the normal answer for a typed page and is not an error.
@@ -118,6 +140,19 @@ export function renderPageInk(
 /** The HTML part of a content response, or null if the response carries none. */
 export function htmlPart(content: RawPageContent): MultipartPart | null {
   return findPart(content.parts, /html/i);
+}
+
+/**
+ * The page's HTML as Graph sent it, or null when the response carries none.
+ *
+ * A response that was not multipart at all is the HTML: `includeInkML=true` on a page
+ * with no ink comes back as plain `text/html`, and dropping it because there are no
+ * parts to search would lose every typed page.
+ */
+export function pageHtml(content: RawPageContent): string | null {
+  const part = htmlPart(content);
+  if (part !== null) return part.body;
+  return content.parts.length === 0 ? content.raw : null;
 }
 
 /** Build the client from the server's Graph auth. */

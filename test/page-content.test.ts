@@ -9,6 +9,7 @@ import {
   htmlPart,
   inkCandidates,
   pageContentUrl,
+  pageHtml,
   renderPageInk,
 } from '../src/page-content.ts';
 
@@ -168,4 +169,55 @@ test('a non-2xx content response throws GraphRequestError with the body', async 
   assert.ok(err instanceof GraphRequestError, `expected GraphRequestError, got ${String(err)}`);
   assert.equal(err.status, 400);
   assert.match(err.body, /20266/);
+});
+
+test('one fetch yields the trimmed HTML and the ink together', async () => {
+  const url = pageContentUrl(PAGE_ID);
+  const inkml = await fixture('xyf-himetric.inkml');
+  const { fetchImpl, calls } = fakeFetch({ [url]: () => multipartResponse(inkml) });
+
+  const content = await new GraphPageContent(tokens, fetchImpl).fetchContent(PAGE_ID);
+
+  assert.equal(calls.length, 1, 'the caller must not pay two round trips');
+  assert.equal(content.html, '<html><body><p>typed</p></body></html>');
+  assert.equal(content.ink?.strokeCount, 2);
+});
+
+test('a typed page comes back as HTML with no ink, which is normal', async () => {
+  const url = pageContentUrl(PAGE_ID);
+  const { fetchImpl } = fakeFetch({
+    [url]: () =>
+      new Response('<html><body><p id="p:1"><span style="color:red">typed</span></p></body></html>', {
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+      }),
+  });
+
+  // A response with no ink is not multipart at all, so the HTML is the whole body.
+  const content = await new GraphPageContent(tokens, fetchImpl).fetchContent(PAGE_ID);
+
+  assert.equal(content.html, '<html><body><p id="p:1">typed</p></body></html>');
+  assert.equal(content.ink, null);
+});
+
+test('the HTML half is found in a multipart body and in a plain one', () => {
+  const part = {
+    headers: 'Content-Type: text/html',
+    contentType: 'text/html',
+    body: '<p>from the part</p>',
+  };
+
+  assert.equal(
+    pageHtml({ raw: 'whole body', contentType: 'multipart/mixed', parts: [part] }),
+    '<p>from the part</p>',
+  );
+  assert.equal(pageHtml({ raw: '<p>whole body</p>', contentType: 'text/html', parts: [] }), '<p>whole body</p>');
+  assert.equal(
+    pageHtml({
+      raw: 'x',
+      contentType: 'multipart/mixed',
+      parts: [{ headers: '', contentType: 'application/inkml+xml', body: '<ink/>' }],
+    }),
+    null,
+  );
 });

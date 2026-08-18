@@ -29,7 +29,8 @@ onenote-mcp/
 │   ├── graph-structure.ts     # Graph reads: notebooks, section groups, sections, pages (issue #11)
 │   ├── ink.ts                 # InkML -> strokes -> SVG -> PNG (issue #12)
 │   ├── multipart.ts           # splits the multipart/mixed content response (issue #12)
-│   ├── page-content.ts        # the includeInkML=true fetch, and ink out of it (issue #12)
+│   ├── page-content.ts        # the includeInkML=true fetch, and both halves out of it (#12, #13)
+│   ├── page-html.ts           # trims Graph's page markup to readable structure (issue #13)
 │   ├── token-cache.ts         # Firestore-backed MSAL ICachePlugin (issue #7)
 │   └── version.ts             # SERVICE_NAME, VERSION
 │
@@ -41,9 +42,11 @@ onenote-mcp/
 │   ├── ink.test.ts            # drives the pipeline from the fixtures to PNG dimensions
 │   ├── multipart.test.ts
 │   ├── page-content.test.ts   # drives the fetch through a fake fetch
-│   ├── fixtures/              # hand-authored InkML; never a captured page dump
+│   ├── page-html.test.ts      # trims the styled fixture; asserts no word is lost
+│   ├── fixtures/              # hand-authored InkML and HTML; never a captured page dump
 │   │   ├── xyf-himetric.inkml
-│   │   └── two-roots-nested.inkml
+│   │   ├── two-roots-nested.inkml
+│   │   └── styled-page.html
 │   ├── server.test.ts
 │   ├── token-cache.test.ts    # covers readCache only; see the note below
 │   └── version.test.ts
@@ -96,6 +99,13 @@ ink is legible personal notes. What no test covers is whether Graph's InkML matc
 fixtures' shape — the channel order, the units, and the multipart framing come from the
 validated recon script in Appendix A, and nothing confirms them against the service until
 an operator runs the server against the real tenant.
+
+`test/page-html.test.ts` runs the trimmer over `test/fixtures/styled-page.html`, which is
+hand-authored in the shape Graph emits — absolutely positioned outline divs, a styling
+span around every text run, `data-tag` list items, a table, and the InkNode comments. A
+real page dump may not be committed. What no test covers is whether Graph's markup
+matches that shape; the trimmer is tolerant rather than strict for that reason, and
+nothing confirms the shape until an operator runs the server against the real tenant.
 
 `test/token-cache.test.ts` covers `readCache` and nothing else. `readCache` is a pure
 function over a document snapshot, so it runs without a backend. `beforeCacheAccess`,
@@ -243,8 +253,35 @@ discards the thrown parser error for that reason: `fast-xml-parser` puts the off
 markup in its message.
 
 **One fetch serves both halves of a page.** `GraphPageContent.fetchRaw` is the only
-`includeInkML=true` call, and it returns the split parts. The HTML work in issue #13 builds
-on that same response rather than fetching again.
+`includeInkML=true` call, and it returns the split parts. `fetchContent` turns that one
+response into `{ html, ink }` — the trimmed HTML and the rendered PNG — and is what the
+`get_page_content` tool in issue #16 wraps. A page with no ink comes back as plain
+`text/html` rather than as `multipart/mixed`, so `pageHtml` falls back to the whole body
+when there are no parts; dropping it because there are no parts to search would lose the
+text of every typed page.
+
+**The HTML trimmer rewrites tags and never touches text.** `trimPageHtml` in
+`src/page-html.ts` parses to a small tree, filters attributes, drops comments, and
+removes or unwraps elements. Text nodes are copied to the output verbatim, so no entity
+and no character of the user's writing can be lost to a parser's escaping rules. The one
+exception is `collapseBlankLines`, which closes the gaps removed elements leave behind.
+`test/page-html.test.ts` asserts the word sequence of the fixture is identical before and
+after.
+
+**Three things survive the trim that look like noise.** `id` and `data-id`, because the
+PATCH write model in issue #18 targets an element by id. The `position`, `left`, `top`,
+`width`, and `height` style declarations, because page content is laid out absolutely in
+px at 96 dpi and that is the coordinate space `src/ink.ts` renders strokes into — nothing
+needs it today and it cannot be recovered later. Empty `<td>` elements, because dropping
+one shifts every cell after it into the wrong column. An element carrying an id is kept
+whatever it holds; what gets dropped is the wrapper whose only attribute was `style`.
+
+**The trimmer's parser is tolerant, not strict.** An unmatched close tag is ignored, an
+unclosed element is closed when its parent ends, and an unterminated `<` is text. A page
+whose text is readable must not become a failed request over a stray tag. It also does
+not decode entities, imply end tags, or treat `<pre>`, `<script>`, and `<style>` as raw
+text; Graph emits none of those, and adding an HTML library for this would be a
+dependency for one endpoint.
 
 **Never call the account-wide page list.** `GET /me/onenote/pages` fails with error
 20266, "maximum sections exceeded", once the account has enough sections across all
