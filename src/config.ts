@@ -219,7 +219,9 @@ function required(values: Map<string, string>, name: string): string {
 }
 
 function formatConfigError(missing: string[], invalid: string[]): string {
-  const lines: string[] = ['Configuration error. The server did not start.', ''];
+  // Deliberately does not say "the server did not start" — the bootstrap CLI (#9) uses
+  // this same error, and it is not a server.
+  const lines: string[] = ['Configuration error. Startup aborted.', ''];
 
   if (missing.length > 0) {
     lines.push(`Missing required environment variable${missing.length === 1 ? '' : 's'}:`);
