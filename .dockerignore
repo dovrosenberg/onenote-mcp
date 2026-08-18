@@ -1,0 +1,18 @@
+# Denylist, not an allowlist: a new source directory is included by default rather
+# than silently dropped from the build context.
+node_modules
+.git
+.gitignore
+dist
+output
+test
+docs
+scripts
+.env
+.env.*
+*.token-cache.json
+.msal-cache*
+npm-debug.log*
+.DS_Store
+Dockerfile
+.dockerignore
