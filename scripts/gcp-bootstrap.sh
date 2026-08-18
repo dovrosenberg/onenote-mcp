@@ -275,7 +275,7 @@ gh variable set DEPLOY_SA    --body "$DEPLOY_SA"
 gh variable set RUNTIME_SA   --body "$RUNTIME_SA"
 GH_VARS
 echo
-log "These this script cannot know. Fill in the client ID from issue #1;"
+log "These values this script cannot know. Fill in the client ID from issue #1;"
 log "the openssl commands generate the rest."
 echo
 cat <<'GH_MANUAL'
