@@ -102,3 +102,45 @@ ensure_resource() {
     "${create_cmd[@]}"
   fi
 }
+
+# ---------------------------------------------------------------------------
+# APIs. `services enable` is idempotent, so this needs no guard. One call so
+# the operator waits once rather than six times.
+# ---------------------------------------------------------------------------
+log "enabling APIs"
+gcloud services enable \
+  run.googleapis.com \
+  artifactregistry.googleapis.com \
+  firestore.googleapis.com \
+  iamcredentials.googleapis.com \
+  sts.googleapis.com \
+  cloudresourcemanager.googleapis.com \
+  --project="$PROJECT"
+
+# ---------------------------------------------------------------------------
+# Artifact Registry
+# ---------------------------------------------------------------------------
+ensure_resource "Artifact Registry repo $GAR_REPO ($GAR_REGION)" \
+  gcloud artifacts repositories describe "$GAR_REPO" \
+    --location="$GAR_REGION" --project="$PROJECT" \
+  -- \
+  gcloud artifacts repositories create "$GAR_REPO" \
+    --repository-format=docker \
+    --location="$GAR_REGION" \
+    --project="$PROJECT" \
+    --description="Container images for $SERVICE"
+
+# ---------------------------------------------------------------------------
+# Firestore, Native mode.
+#
+# --location must be a Firestore location name, not any Cloud Run region.
+# The database's location cannot be changed after creation; moving it means
+# deleting and recreating the database.
+# ---------------------------------------------------------------------------
+ensure_resource "Firestore Native database ($REGION)" \
+  gcloud firestore databases describe --database='(default)' --project="$PROJECT" \
+  -- \
+  gcloud firestore databases create \
+    --location="$REGION" \
+    --type=firestore-native \
+    --project="$PROJECT"

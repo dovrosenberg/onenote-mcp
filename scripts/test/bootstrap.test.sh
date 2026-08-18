@@ -85,6 +85,30 @@ assert_status 0 "PROJECT set exits 0"
 run_bootstrap PROJECT=test-project REGION=europe-west1
 assert_out "europe-west1" "REGION override appears in the parameter summary"
 
+echo "--- Phase 2: APIs, Artifact Registry, Firestore ---"
+
+run_bootstrap PROJECT=test-project STUB_MISSING="$ALL_MISSING"
+assert_status 0 "fresh project run exits 0"
+for api in run artifactregistry firestore iamcredentials sts cloudresourcemanager; do
+  assert_logged "${api}.googleapis.com" "services enable includes ${api}.googleapis.com"
+done
+assert_logged "artifacts repositories create onenote-mcp" "fresh run creates the Artifact Registry repo"
+assert_logged "--repository-format=docker" "Artifact Registry repo is a Docker repo"
+assert_logged "firestore databases create" "fresh run creates the Firestore database"
+assert_logged "--type=firestore-native" "Firestore database is Native mode"
+
+run_bootstrap PROJECT=test-project STUB_MISSING=
+assert_status 0 "already-configured run exits 0"
+assert_logged "services enable" "already-configured run still enables APIs"
+assert_not_logged "artifacts repositories create" "already-configured run skips repo create"
+assert_not_logged "firestore databases create" "already-configured run skips database create"
+
+run_bootstrap PROJECT=test-project REGION=nam5 GAR_REGION=europe-west4 STUB_MISSING="$ALL_MISSING"
+assert_logged "artifacts repositories create onenote-mcp --repository-format=docker --location=europe-west4" \
+  "GAR_REGION drives the Artifact Registry location"
+assert_logged "firestore databases create --location=nam5" \
+  "REGION drives the Firestore location, independently of GAR_REGION"
+
 if [[ "$FAILURES" -ne 0 ]]; then
   printf '\n%s assertion(s) failed\n' "$FAILURES"
   exit 1
