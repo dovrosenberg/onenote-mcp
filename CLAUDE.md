@@ -28,6 +28,9 @@ onenote-mcp/
 │   ├── graph-auth.ts          # Layer-2 Graph auth: silent token acquisition (issue #8)
 │   ├── graph-structure.ts     # Graph reads: notebooks, section groups, sections, pages (issue #11)
 │   ├── ink.ts                 # InkML -> strokes -> SVG -> PNG (issue #12)
+│   ├── logging.ts             # one JSON line per request; fixes what may be in it (#14)
+│   ├── mcp-server.ts          # MCP JSON-RPC surface and the POST /mcp route (issue #14)
+│   ├── mcp-tools.ts           # tool contract, registry, error mapping, arg helpers (#14)
 │   ├── multipart.ts           # splits the multipart/mixed content response (issue #12)
 │   ├── page-content.ts        # the includeInkML=true fetch, and both halves out of it (#12, #13)
 │   ├── page-html.ts           # trims Graph's page markup to readable structure (issue #13)
@@ -40,6 +43,9 @@ onenote-mcp/
 │   ├── graph-auth.test.ts     # drives acquireGraphToken through a fake client
 │   ├── graph-structure.test.ts # drives the client through a fake fetch; bans the account-wide page list
 │   ├── ink.test.ts            # drives the pipeline from the fixtures to PNG dimensions
+│   ├── logging.test.ts        # asserts a log line carries no argument, header, or query
+│   ├── mcp-server.test.ts     # drives initialize and tools/call over real HTTP
+│   ├── mcp-tools.test.ts      # covers the error mapping and the argument helpers
 │   ├── multipart.test.ts
 │   ├── page-content.test.ts   # drives the fetch through a fake fetch
 │   ├── page-html.test.ts      # trims the styled fixture; asserts no word is lost
@@ -106,6 +112,14 @@ span around every text run, `data-tag` list items, a table, and the InkNode comm
 real page dump may not be committed. What no test covers is whether Graph's markup
 matches that shape; the trimmer is tolerant rather than strict for that reason, and
 nothing confirms the shape until an operator runs the server against the real tenant.
+
+`test/mcp-server.test.ts` starts a real HTTP server and speaks JSON-RPC to it, so the
+transport is exercised rather than mocked: the assertions about statelessness (no
+`Mcp-Session-Id` header, `tools/list` answered by a server that saw no `initialize`) are
+only meaningful over the wire. It covers the empty tool list through `createApp`, and the
+failure paths through `mcpRouter` with hand-written tools injected. What no test covers
+is whether a real MCP client accepts the responses; nothing confirms that until an
+operator points one at the deployed URL.
 
 `test/token-cache.test.ts` covers `readCache` and nothing else. `readCache` is a pure
 function over a document snapshot, so it runs without a backend. `beforeCacheAccess`,
@@ -282,6 +296,53 @@ whose text is readable must not become a failed request over a stray tag. It als
 not decode entities, imply end tags, or treat `<pre>`, `<script>`, and `<style>` as raw
 text; Graph emits none of those, and adding an HTML library for this would be a
 dependency for one endpoint.
+
+**Stateless Streamable HTTP, one server per request.** Every `POST /mcp` builds its own
+SDK `Server` and its own `StreamableHTTPServerTransport`, answers, and closes both.
+Nothing carries to the next request, and no session id is issued. `--max-instances=1`
+does not make the instance permanent: a revision change replaces it, and a client holding
+a session id against a dead instance has no way to recover. Omitting
+`sessionIdGenerator` is what selects stateless mode — it is omitted rather than set to
+`undefined` because `exactOptionalPropertyTypes` rejects the explicit `undefined` the
+SDK's own example passes.
+
+**SSE is refused in two places.** `enableJsonResponse: true` makes a POST answer with a
+JSON body instead of opening a stream, and `GET /mcp` is answered 405 by the router
+before the transport sees it. The second is not redundant: the SDK's stateless mode still
+opens a standalone SSE stream on GET, and that open stream is what holds a Cloud Run
+instance alive and bills for idle time. `DELETE` is 405 for the same reason it is
+meaningless — there is no session to close.
+
+**The MCP surface is built on the SDK's low-level `Server`, not on `McpServer`.**
+`McpServer` installs its `tools/list` and `tools/call` handlers as a side effect of the
+first `registerTool` call, so a server with no tools answers `tools/list` with "method not
+found" rather than an empty list, and issue #14 has to ship the empty list working. The
+low-level class also puts the `tools/call` error mapping in one place. The cost is that
+`ToolDefinition` carries hand-written JSON Schema and receives unvalidated arguments,
+which is what the `requiredString` / `optionalString` / `optionalInteger` helpers in
+`src/mcp-tools.ts` exist for. Use them rather than reaching into the arguments object.
+
+**A tool failure is an `isError` result; a protocol fault is a JSON-RPC error.** Every
+error a tool throws goes through `toolErrorResult`, because an expired refresh token, a
+page that is gone, and a document resvg rejects are normal outcomes the calling model is
+meant to read and act on. Calling a tool that `tools/list` never offered is the one thing
+that comes back as a JSON-RPC error. Nothing reaches the transport as an unhandled
+rejection.
+
+**No tool error quotes a body, and an unrecognised error quotes nothing.** A Graph
+failure is reduced to its status and the `error.code` / `error.message` of the OData
+body, which is where "20266, maximum sections exceeded" lives; a body that is not that
+shape is dropped rather than pasted through. An error type this repository does not model
+yields "the server hit an unexpected error" and nothing else — an arbitrary message may
+carry a request body, and a tool result reaches a client that may log it.
+
+**What a request log line may contain is fixed in `src/logging.ts`.** The HTTP verb, the
+path, the status, the duration, the JSON-RPC method, and the tool name on a `tools/call`.
+Not headers, not bodies, not tool arguments, not results, and not the query string — the
+MCP auth spec forbids a token in a query string and issue #23 rejects one that arrives
+anyway, so logging the query would put the rejected token in the log. The path is
+captured when the request arrives, not on finish: Express rewrites `req.url` when a
+request enters a mounted router.
 
 **Never call the account-wide page list.** `GET /me/onenote/pages` fails with error
 20266, "maximum sections exceeded", once the account has enough sections across all

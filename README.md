@@ -181,6 +181,39 @@ of the document, because stroke coordinates are the user's handwriting.
 units, one file with two `<ink>` roots and nested `<traceGroup>` elements. No captured
 page dump may be committed: rendered ink is fully legible personal notes.
 
+## MCP endpoint
+
+The server speaks MCP over **stateless Streamable HTTP** at `POST /mcp`. Every request
+builds its own MCP server, answers, and tears it down; nothing survives to the next one.
+There is no session id, and there is no SSE — `GET /mcp` and `DELETE /mcp` are answered
+405, and a POST replies with a JSON body rather than opening a stream. An open stream
+would hold a Cloud Run instance alive and bill for idle time.
+
+```bash
+curl -s -X POST localhost:8080/mcp \
+  -H 'content-type: application/json' \
+  -H 'accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+# {"result":{"tools":[]},"jsonrpc":"2.0","id":1}
+```
+
+Both `Accept` types are required by the Streamable HTTP spec even though this server
+never streams. The tool list is empty until issue #15; `createTools` in
+`src/mcp-tools.ts` is where tools are added, and `src/mcp-server.ts` is the JSON-RPC
+surface around them.
+
+A tool that throws comes back as a tool result with `isError: true` and a readable
+message — an expired refresh token, a page that is gone, and a document resvg rejects are
+all normal outcomes, not protocol faults. Only a call to a tool that was never registered
+is a JSON-RPC error.
+
+Every request writes one JSON log line: the HTTP verb, the path, the status, the
+duration, the JSON-RPC method, and the tool name on a `tools/call`. Never the query
+string, the headers, the arguments, or the result — see `src/logging.ts`.
+
+Nothing on `/mcp` is authenticated yet. Issue #23's bearer-token middleware goes in front
+of the router; `/healthz` stays open.
+
 ## Bootstrap
 
 `npm run bootstrap` is the only interactive Microsoft sign-in in the project, and it runs
