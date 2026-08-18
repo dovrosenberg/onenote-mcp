@@ -27,6 +27,9 @@ onenote-mcp/
 │   ├── bootstrap.ts           # device-code CLI that seeds the Firestore token cache (issue #9)
 │   ├── graph-auth.ts          # Layer-2 Graph auth: silent token acquisition (issue #8)
 │   ├── graph-structure.ts     # Graph reads: notebooks, section groups, sections, pages (issue #11)
+│   ├── ink.ts                 # InkML -> strokes -> SVG -> PNG (issue #12)
+│   ├── multipart.ts           # splits the multipart/mixed content response (issue #12)
+│   ├── page-content.ts        # the includeInkML=true fetch, and ink out of it (issue #12)
 │   ├── token-cache.ts         # Firestore-backed MSAL ICachePlugin (issue #7)
 │   └── version.ts             # SERVICE_NAME, VERSION
 │
@@ -35,6 +38,12 @@ onenote-mcp/
 │   ├── config.test.ts
 │   ├── graph-auth.test.ts     # drives acquireGraphToken through a fake client
 │   ├── graph-structure.test.ts # drives the client through a fake fetch; bans the account-wide page list
+│   ├── ink.test.ts            # drives the pipeline from the fixtures to PNG dimensions
+│   ├── multipart.test.ts
+│   ├── page-content.test.ts   # drives the fetch through a fake fetch
+│   ├── fixtures/              # hand-authored InkML; never a captured page dump
+│   │   ├── xyf-himetric.inkml
+│   │   └── two-roots-nested.inkml
 │   ├── server.test.ts
 │   ├── token-cache.test.ts    # covers readCache only; see the note below
 │   └── version.test.ts
@@ -79,6 +88,14 @@ copied from the validated recon script in Appendix A, and nothing verifies them 
 the service until an operator runs the server against the real tenant. The paging and
 nesting fixtures are hand-written, because a page of Graph results large enough to carry
 an `@odata.nextLink` cannot be captured without real notebook names in it.
+
+`test/ink.test.ts` renders the committed fixtures all the way to PNG bytes and checks the
+dimensions in the PNG header, so the resvg dependency is exercised rather than mocked.
+The fixtures are hand-authored and small. A real page dump may not be committed: rendered
+ink is legible personal notes. What no test covers is whether Graph's InkML matches the
+fixtures' shape — the channel order, the units, and the multipart framing come from the
+validated recon script in Appendix A, and nothing confirms them against the service until
+an operator runs the server against the real tenant.
 
 `test/token-cache.test.ts` covers `readCache` and nothing else. `readCache` is a pure
 function over a document snapshot, so it runs without a backend. `beforeCacheAccess`,
@@ -204,6 +221,30 @@ the account's home tenant — the tenant because a device-code sign-in into the 
 directory succeeds with no error, and that line is the only thing that catches it. The
 CLI's own output therefore carries a tenant id and must not be pasted into an issue, a
 pull request, or a workflow log; it says so itself.
+
+**The ink pipeline is a port, not a design.** `src/ink.ts` reproduces the recon script in
+Appendix A of `project-spec.md`, which is validated against a real 440-stroke page. Four
+things in it look arbitrary and are not: namespaces are stripped because Graph emits
+`inkml:ink`; channel order is read from `<traceFormat>` because this account's points are
+X, Y, F and F is pressure; coordinates are himetric and become px at 96 dpi; and traces
+are collected from every `<ink>` root and every nesting level of `<traceGroup>`. Changing
+any of the four produces a picture that is wrong rather than an error.
+
+**A page with no ink is `null`, not an error.** Most pages are typed. `renderInk` returns
+null whenever no `<ink>` root yields a stroke, including when a root parses to nothing:
+`fast-xml-parser` accepts unclosed and mismatched tags without throwing, so "damaged" and
+"holds no traces" cannot be told apart, and guessing would turn ordinary pages into failed
+requests. The two errors that do exist are `InkParseError` for trace groups nested past 50
+levels and `InkRenderError` for a document resvg rejects.
+
+**No ink error message quotes the document.** Stroke coordinates are the user's
+handwriting and this repository's output can reach a public log. The parse failure path
+discards the thrown parser error for that reason: `fast-xml-parser` puts the offending
+markup in its message.
+
+**One fetch serves both halves of a page.** `GraphPageContent.fetchRaw` is the only
+`includeInkML=true` call, and it returns the split parts. The HTML work in issue #13 builds
+on that same response rather than fetching again.
 
 **Never call the account-wide page list.** `GET /me/onenote/pages` fails with error
 20266, "maximum sections exceeded", once the account has enough sections across all

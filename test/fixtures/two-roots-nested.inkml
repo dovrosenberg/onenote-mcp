@@ -1,0 +1,48 @@
+<!--
+  Hand-authored, not a page dump. Two <ink> roots in one document, and traces buried
+  inside nested <traceGroup> elements. A page written in more than one sitting comes
+  back this way, and a walk that read only the first root, or only the traces directly
+  under it, would silently drop most of the handwriting.
+
+  Six traces in total: two loose in the first root, three at three depths inside its
+  nested groups, and one in the second root. Coordinates are himetric with an X, Y, F
+  channel order, as in xyf-himetric.inkml.
+-->
+<inkml:ink xmlns:inkml="http://www.w3.org/2003/InkML">
+  <inkml:definitions>
+    <inkml:context xml:id="ctx0">
+      <inkml:inkSource xml:id="src0">
+        <inkml:traceFormat>
+          <inkml:channel name="X" type="integer" units="himetric" />
+          <inkml:channel name="Y" type="integer" units="himetric" />
+          <inkml:channel name="F" type="integer" units="dev" />
+        </inkml:traceFormat>
+      </inkml:inkSource>
+    </inkml:context>
+  </inkml:definitions>
+  <inkml:trace contextRef="#ctx0">0 0 500, 100 100 500</inkml:trace>
+  <inkml:trace contextRef="#ctx0">100 0 500, 200 100 500</inkml:trace>
+  <inkml:traceGroup>
+    <inkml:trace contextRef="#ctx0">200 0 500, 300 100 500</inkml:trace>
+    <inkml:traceGroup>
+      <inkml:trace contextRef="#ctx0">300 0 500, 400 100 500</inkml:trace>
+      <inkml:traceGroup>
+        <inkml:trace contextRef="#ctx0">400 0 500, 500 100 500</inkml:trace>
+      </inkml:traceGroup>
+    </inkml:traceGroup>
+  </inkml:traceGroup>
+</inkml:ink>
+<inkml:ink xmlns:inkml="http://www.w3.org/2003/InkML">
+  <inkml:definitions>
+    <inkml:context xml:id="ctx1">
+      <inkml:inkSource xml:id="src1">
+        <inkml:traceFormat>
+          <inkml:channel name="X" type="integer" units="himetric" />
+          <inkml:channel name="Y" type="integer" units="himetric" />
+          <inkml:channel name="F" type="integer" units="dev" />
+        </inkml:traceFormat>
+      </inkml:inkSource>
+    </inkml:context>
+  </inkml:definitions>
+  <inkml:trace contextRef="#ctx1">500 0 500, 600 100 500</inkml:trace>
+</inkml:ink>

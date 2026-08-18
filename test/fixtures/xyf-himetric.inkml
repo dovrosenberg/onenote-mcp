@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Hand-authored InkML, not a page dump. Real stroke data is legible handwriting and
+  this repository is public, so no captured ink may be committed.
+
+  It reproduces the two things that make real Graph output awkward: the `inkml:`
+  namespace prefix on every element, and a channel order of X, Y, F. The F values are
+  deliberately far outside the X/Y range, so a parser that took the first two numbers
+  of each point would draw a bounding box that is obviously wrong.
+
+  Coordinates are himetric (1/100 mm). 2540 himetric = 1 inch = 96 px, so the square
+  below spans exactly 1 inch, which is 96 px, in each direction.
+-->
+<inkml:ink xmlns:inkml="http://www.w3.org/2003/InkML">
+  <inkml:definitions>
+    <inkml:context xml:id="ctx0">
+      <inkml:inkSource xml:id="src0">
+        <inkml:traceFormat>
+          <inkml:channel name="X" type="integer" units="himetric" />
+          <inkml:channel name="Y" type="integer" units="himetric" />
+          <inkml:channel name="F" type="integer" units="dev" />
+        </inkml:traceFormat>
+      </inkml:inkSource>
+    </inkml:context>
+  </inkml:definitions>
+  <inkml:trace contextRef="#ctx0">0 0 9000, 2540 0 9100, 2540 2540 9200</inkml:trace>
+  <inkml:trace contextRef="#ctx0">2540 2540 8000, 0 2540 8100, 0 0 8200</inkml:trace>
+</inkml:ink>

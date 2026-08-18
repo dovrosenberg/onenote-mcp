@@ -141,6 +141,46 @@ check is whether Graph accepts those URLs; the query strings come from the valid
 recon script in Appendix A of `project-spec.md` and are confirmed only by running against
 the real tenant.
 
+## Ink
+
+Graph's normal page-content endpoint drops handwriting and leaves
+`<!-- InkNode is not supported -->` behind, and Graph cannot export a page as an image or
+a PDF. Handwriting is therefore rebuilt from raw stroke data:
+`GET /me/onenote/pages/{id}/content?includeInkML=true` answers `multipart/mixed`, one
+part the same HTML and another the InkML. The strokes become an SVG and then a PNG, which
+goes to the calling model as an image for its own vision to read. No OCR service is
+involved.
+
+| Module | What it does |
+|---|---|
+| `src/multipart.ts` | `splitMultipart(body, contentType)` → the parts, or `null` when the response is not multipart |
+| `src/ink.ts` | `parseInkStrokes(text)` → strokes; `strokesToSvg`; `rasterizeSvg`; `renderInk(text, width?)` → a PNG or `null` |
+| `src/page-content.ts` | `GraphPageContent.fetchRaw(pageId)` → the split response; `.fetchInk(pageId)` → the PNG or `null` |
+
+Four details decide whether this works at all, and all four come from the validated recon
+script in Appendix A of `project-spec.md`:
+
+- **Namespaces are stripped.** Graph emits `inkml:ink`, `inkml:trace`, `inkml:traceFormat`.
+  `fast-xml-parser` is configured with `removeNSPrefix: true` and every lookup uses the
+  bare name.
+- **Channel order comes from `<traceFormat>`.** This account's points are X, Y, F, where F
+  is pen pressure. Reading the first two numbers of each point draws pressure as a
+  coordinate.
+- **Coordinates are himetric.** `px = himetric * 96 / 2540`. That is the same coordinate
+  space the page HTML positions typed content in, so ink and typed content could later be
+  registered against each other by arithmetic.
+- **Traces are anywhere in the tree.** A page can carry more than one `<ink>` root, and
+  `<traceGroup>` elements nest. All of them are collected.
+
+A page with no ink renders to `null`. That is the normal answer for a typed page, not an
+error. The failures that do raise are `InkParseError` for trace groups nested past 50
+levels and `InkRenderError` for a document resvg rejects; neither message reproduces any
+of the document, because stroke coordinates are the user's handwriting.
+
+`test/fixtures/*.inkml` are hand-authored — a few strokes, X/Y/F channel order, himetric
+units, one file with two `<ink>` roots and nested `<traceGroup>` elements. No captured
+page dump may be committed: rendered ink is fully legible personal notes.
+
 ## Bootstrap
 
 `npm run bootstrap` is the only interactive Microsoft sign-in in the project, and it runs
