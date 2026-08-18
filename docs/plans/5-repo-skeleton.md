@@ -10,7 +10,7 @@
 |-------|--------|--------|
 | Phase 1: Project skeleton, dependencies, build and test wiring | ☑ | `e6f00dc` |
 | Phase 2: `src/config.ts` — grouped env schema and fail-fast validation | ☑ | `7a06ac7` |
-| Phase 3: `src/index.ts` entrypoint, `/healthz`, bootstrap placeholder | ☑ | pending |
+| Phase 3: `src/index.ts` entrypoint, `/healthz`, bootstrap placeholder | ☑ | `53824c3` |
 
 ## Acceptance Criteria
 
@@ -184,11 +184,11 @@ The repo has no JavaScript linter and this issue does not ask for one, so adding
 - `src/version.test.ts` — asserts `SERVICE_NAME === 'onenote-mcp'` and that `VERSION` matches `/^\d+\.\d+\.\d+$/`. Its real job is proving the `node --test` + type-stripping + `./version.ts` import path works end to end before any logic depends on it.
 
 **Verification:**
-- [ ] `rm -rf node_modules dist && npm ci && npm run build` exits 0 and produces `dist/version.js` (AC-8)
-- [ ] `npm test` exits 0 with 1 passing test (AC-6)
-- [ ] `npm run typecheck` exits 0 (lint)
-- [ ] `git status --porcelain` shows no `node_modules/` or `dist/` entries after a build (AC-1)
-- [ ] `node -e "const p=require('./package.json'); if(p.type!=='module') process.exit(1)"` confirms ESM (AC-2)
+- [x] `rm -rf node_modules dist && npm ci && npm run build` exits 0 and produces `dist/version.js` (AC-8)
+- [x] `npm test` exits 0 with 1 passing test (AC-6)
+- [x] `npm run typecheck` exits 0 (lint)
+- [x] `git status --porcelain` shows no `node_modules/` or `dist/` entries after a build (AC-1)
+- [x] `node -e "const p=require('./package.json'); if(p.type!=='module') process.exit(1)"` confirms ESM (AC-2)
 
 ---
 
@@ -246,10 +246,10 @@ The repo has no JavaScript linter and this issue does not ask for one, so adding
   - a variable set to `'   '` is reported as missing
 
 **Verification:**
-- [ ] `npm test` exits 0, all `config.test.ts` cases pass
-- [ ] `npm run typecheck` exits 0 (lint)
-- [ ] `npm run build` exits 0
-- [ ] `grep -n 'process.exit\|process\.env' src/config.ts` shows `process.env` only as the `loadConfig` default parameter value, and `process.exit` only inside `exitOnConfigError` (pulled forward from Phase 3 step 4 so both entrypoints share one implementation)
+- [x] `npm test` exits 0, all `config.test.ts` cases pass
+- [x] `npm run typecheck` exits 0 (lint)
+- [x] `npm run build` exits 0
+- [x] `grep -n 'process.exit\|process\.env' src/config.ts` shows `process.env` only as the `loadConfig` default parameter value, and `process.exit` only inside `exitOnConfigError` (pulled forward from Phase 3 step 4 so both entrypoints share one implementation)
 
 ---
 
@@ -289,25 +289,25 @@ The repo has no JavaScript linter and this issue does not ask for one, so adding
 - `src/config.test.ts` gains one case: `exitOnConfigError` is not unit-tested directly (it calls `process.exit`); instead the entrypoint behavior is verified by the Phase 3 command-line check below.
 
 **Verification:**
-- [ ] `npm test` exits 0, all cases pass
-- [ ] `npm run typecheck` exits 0 (lint)
-- [ ] `npm run build && env -u ONENOTE_CLIENT_ID -u ONENOTE_AUTHORITY -u MCP_OAUTH_CLIENT_ID -u MCP_OAUTH_CLIENT_SECRET -u MCP_TOKEN_SIGNING_KEY npm start` exits non-zero, prints all five missing names, and prints no line matching `` `at .*\(` `` (AC-9)
-- [ ] with all required vars set and `PORT=8081`, `npm start` logs `listening on port 8081` and `curl -s -o /dev/null -w '%{http_code}' localhost:8081/healthz` returns `200` (AC-5)
-- [ ] with all required vars set and `PORT` unset, startup logs `listening on port 8080` (default path). ⚠️ Not measurable as an HTTP 200 on this machine — an unrelated process holds port 8080. The default *value* is covered by the `config.test.ts` case asserting `8080`, and the default being *read by the entrypoint* is covered by the startup log line. The HTTP 200 is verified on `PORT=8081`, which is the same code path with a different value.
-- [ ] a bind failure (`EADDRINUSE`, `EACCES`) prints one readable line and exits 1 with no stack trace — added during Phase 3, see Findings during execution
-- [ ] `grep -rnE '\b(8080|3000)\b' src/index.ts src/server.ts` returns nothing — the only `8080` in the tree is the documented default inside the `config.ts` table (AC-5, "never a hardcoded port")
-- [ ] `npm run bootstrap` with the graph and firestore vars set prints the issue-#9 message and exits 1
+- [x] `npm test` exits 0, all cases pass
+- [x] `npm run typecheck` exits 0 (lint)
+- [x] `npm run build && env -u ONENOTE_CLIENT_ID -u ONENOTE_AUTHORITY -u MCP_OAUTH_CLIENT_ID -u MCP_OAUTH_CLIENT_SECRET -u MCP_TOKEN_SIGNING_KEY npm start` exits non-zero, prints all five missing names, and prints no line matching `` `at .*\(` `` (AC-9)
+- [x] with all required vars set and `PORT=8081`, `npm start` logs `listening on port 8081` and `curl -s -o /dev/null -w '%{http_code}' localhost:8081/healthz` returns `200` (AC-5)
+- [x] with all required vars set and `PORT` unset, startup logs `listening on port 8080` (default path). ⚠️ Not measurable as an HTTP 200 on this machine — an unrelated process holds port 8080. The default *value* is covered by the `config.test.ts` case asserting `8080`, and the default being *read by the entrypoint* is covered by the startup log line. The HTTP 200 is verified on `PORT=8081`, which is the same code path with a different value.
+- [x] a bind failure (`EADDRINUSE`, `EACCES`) prints one readable line and exits 1 with no stack trace — added during Phase 3, see Findings during execution
+- [x] `grep -rnE '\b(8080|3000)\b' src/index.ts src/server.ts` returns nothing — the only `8080` in the tree is the documented default inside the `config.ts` table (AC-5, "never a hardcoded port")
+- [x] `npm run bootstrap` with the graph and firestore vars set prints the issue-#9 message and exits 1
 
 ---
 
 ## Final Verification
 
-- [ ] `rm -rf node_modules dist && npm ci && npm run build` exits 0 from a clean checkout
-- [ ] `npm test` exits 0 — all unit tests across `version`, `config`, and `server` pass
-- [ ] `npm run typecheck` exits 0 (lint substitute; see Context → Lint)
+- [x] `rm -rf node_modules dist && npm ci && npm run build` exits 0 from a clean checkout
+- [x] `npm test` exits 0 — all unit tests across `version`, `config`, and `server` pass
+- [x] `npm run typecheck` exits 0 (lint substitute; see Context → Lint)
 - [ ] No E2E tests exist yet; the first end-to-end check is issue #6's container run and issue #25's deploy
-- [ ] `git status --porcelain` is clean after a full build and test run
-- [ ] Acceptance criteria traceability:
+- [x] `git status --porcelain` is clean after a full build and test run
+- [x] Acceptance criteria traceability:
   - **AC-1:** covered by Phase 1 — `.gitignore` written with all six required entries plus `.env.*`; verified by `git status --porcelain` being clean after a build
   - **AC-2:** covered by Phase 1 — `package.json` with `"type": "module"`, `engines.node: ">=24"` (deviation, finding 1), and all five required scripts
   - **AC-3:** covered by Phase 1 — `tsconfig.json` with `moduleResolution: nodenext` and `target: es2024` (deviation, finding 1)
