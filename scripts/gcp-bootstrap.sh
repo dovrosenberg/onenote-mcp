@@ -19,8 +19,10 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Parameters. Override any of these from the environment, or edit in place.
 #
-# PROJECT has no default on purpose -- pointing this at the wrong project
-# would create resources you did not ask for.
+# PROJECT defaults to the project this repository deploys to. Set PROJECT in
+# the environment to provision a different one; the script creates resources
+# in whichever project it resolves, so check the "Project:" line it prints
+# before letting it run.
 #
 # REGION is used both for Cloud Run and for the Firestore database, so it
 # must be a valid Firestore location name (e.g. us-central1, europe-west1,

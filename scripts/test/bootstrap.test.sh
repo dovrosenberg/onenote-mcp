@@ -75,12 +75,16 @@ ALL_MISSING="artifacts_repositories_describe firestore_databases_describe iam_se
 
 echo "--- Phase 1: parameters and preflight ---"
 
+# `env PROJECT=` sets it to the empty string, and ${PROJECT:-...} treats empty
+# as unset, so this exercises the default rather than the -n guard below it.
 run_bootstrap PROJECT=
-assert_status 1 "unset PROJECT exits non-zero"
-assert_out "PROJECT" "error message names PROJECT"
+assert_status 0 "unset PROJECT falls back to the default project"
+assert_out "onenote-mcp-505918" "the default project appears in the parameter summary"
 
 run_bootstrap PROJECT=test-project
 assert_status 0 "PROJECT set exits 0"
+assert_out "test-project" "an explicit PROJECT overrides the default"
+assert_not_out "onenote-mcp-505918" "the default project is absent once PROJECT is set"
 
 run_bootstrap PROJECT=test-project REGION=europe-west1
 assert_out "europe-west1" "REGION override appears in the parameter summary"
