@@ -253,3 +253,39 @@ gcloud iam service-accounts add-iam-policy-binding "$DEPLOY_SA" \
   --member="$PRINCIPAL_SET" \
   --role="roles/iam.workloadIdentityUser" \
   --project="$PROJECT" --quiet >/dev/null
+
+# ---------------------------------------------------------------------------
+# Output block for issue #4.
+#
+# These variable names must stay byte-identical to the vars.* references in
+# the deploy workflow (see the workflow sketch in project-spec.md).
+# ---------------------------------------------------------------------------
+echo
+log "Provisioning complete. No service-account key was created; Workload"
+log "Identity Federation replaces it, and none is needed anywhere."
+echo
+log "Run these from a clone of ${GITHUB_REPO} to complete issue #4:"
+echo
+cat <<GH_VARS
+gh variable set GCP_PROJECT --body "$PROJECT"
+gh variable set GCP_REGION  --body "$REGION"
+gh variable set GAR_REGION  --body "$GAR_REGION"
+gh variable set WIF_PROVIDER --body "$WIF_PROVIDER"
+gh variable set DEPLOY_SA    --body "$DEPLOY_SA"
+gh variable set RUNTIME_SA   --body "$RUNTIME_SA"
+GH_VARS
+echo
+log "These this script cannot know. Fill in the client ID from issue #1;"
+log "the openssl commands generate the rest."
+echo
+cat <<'GH_MANUAL'
+gh variable set ONENOTE_CLIENT_ID   --body "<Azure app registration client ID from #1>"
+gh variable set ONENOTE_AUTHORITY   --body "https://login.microsoftonline.com/common"
+gh variable set MCP_OAUTH_CLIENT_ID --body "$(openssl rand -hex 16)"
+gh secret   set MCP_OAUTH_CLIENT_SECRET --body "$(openssl rand -base64 32)"
+gh secret   set MCP_TOKEN_SIGNING_KEY   --body "$(openssl rand -base64 48)"
+GH_MANUAL
+echo
+log "Save MCP_OAUTH_CLIENT_ID and MCP_OAUTH_CLIENT_SECRET somewhere you can"
+log "retrieve them. Both get typed into Claude's connector settings in issue"
+log "#26, and GitHub will not show you the secret again."

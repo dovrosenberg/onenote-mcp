@@ -165,6 +165,60 @@ assert_logged "--attribute-condition=assertion.repository == \"someone/else\"" \
 assert_logged "attribute.repository/someone/else --role=roles/iam.workloadIdentityUser" \
   "GITHUB_REPO override drives the principalSet"
 
+echo "--- Phase 5: output block, no-key guarantee, idempotency ---"
+
+WIF_RES="$POOL_RES/providers/github-provider"
+
+run_bootstrap PROJECT=test-project STUB_MISSING="$ALL_MISSING"
+assert_out "gh variable set GCP_PROJECT --body \"test-project\"" "GCP_PROJECT line"
+assert_out "gh variable set GCP_REGION  --body \"us-central1\"" "GCP_REGION line"
+assert_out "gh variable set GAR_REGION  --body \"us-central1\"" "GAR_REGION line"
+assert_out "gh variable set WIF_PROVIDER --body \"$WIF_RES\"" "WIF_PROVIDER line carries the full resource name"
+assert_out "gh variable set DEPLOY_SA    --body \"$DEP_SA\"" "DEPLOY_SA line"
+assert_out "gh variable set RUNTIME_SA   --body \"$RUN_SA\"" "RUNTIME_SA line"
+assert_out "gh variable set ONENOTE_CLIENT_ID" "ONENOTE_CLIENT_ID placeholder line"
+assert_out "gh variable set ONENOTE_AUTHORITY" "ONENOTE_AUTHORITY placeholder line"
+assert_out "gh variable set MCP_OAUTH_CLIENT_ID" "MCP_OAUTH_CLIENT_ID placeholder line"
+assert_out "gh secret   set MCP_OAUTH_CLIENT_SECRET" "MCP_OAUTH_CLIENT_SECRET line"
+assert_out "gh secret   set MCP_TOKEN_SIGNING_KEY" "MCP_TOKEN_SIGNING_KEY line"
+# shellcheck disable=SC2016  # the literal, unexpanded string is the assertion
+assert_out '--body "$(openssl rand -base64 32)"' "openssl generators are printed literally, not executed"
+
+assert_not_out "BEGIN PRIVATE KEY" "output contains no PEM key material"
+assert_not_out '"private_key"' "output contains no service-account key JSON"
+
+if grep -q "keys create" scripts/gcp-bootstrap.sh; then
+  fail "script never creates a service-account key"
+else
+  pass "script never creates a service-account key"
+fi
+
+marker="$(mktemp)"
+run_bootstrap PROJECT=test-project STUB_MISSING="$ALL_MISSING"
+new_json="$(find . -name '*.json' -newer "$marker" -not -path './.git/*' 2>/dev/null)"
+rm -f "$marker"
+if [[ -z "$new_json" ]]; then
+  pass "no .json file appears in the tree after a run"
+else
+  fail "no .json file appears in the tree after a run"
+  printf '       found: %s\n' "$new_json"
+fi
+
+# Two runs against one log: fresh, then already-configured.
+run_bootstrap PROJECT=test-project STUB_MISSING="$ALL_MISSING"
+first_status="$BOOTSTRAP_STATUS"
+KEEP_LOG=1 run_bootstrap PROJECT=test-project STUB_MISSING=
+if [[ "$first_status" == "0" ]]; then
+  pass "first run of the pair exits 0"
+else
+  fail "first run of the pair exits 0"
+fi
+assert_status 0 "second consecutive run exits 0"
+assert_out "gh variable set WIF_PROVIDER --body \"$WIF_RES\"" \
+  "second run still prints the complete output block"
+assert_logged "providers create-oidc" "the pair's first run created the provider"
+assert_logged "providers update-oidc" "the pair's second run updated the provider"
+
 if [[ "$FAILURES" -ne 0 ]]; then
   printf '\n%s assertion(s) failed\n' "$FAILURES"
   exit 1
