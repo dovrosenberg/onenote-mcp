@@ -144,3 +144,52 @@ ensure_resource "Firestore Native database ($REGION)" \
     --location="$REGION" \
     --type=firestore-native \
     --project="$PROJECT"
+
+# ---------------------------------------------------------------------------
+# Service accounts
+# ---------------------------------------------------------------------------
+ensure_resource "runtime service account $RUNTIME_SA" \
+  gcloud iam service-accounts describe "$RUNTIME_SA" --project="$PROJECT" \
+  -- \
+  gcloud iam service-accounts create "$RUNTIME_SA_ID" \
+    --display-name="$SERVICE Cloud Run runtime" \
+    --project="$PROJECT"
+
+ensure_resource "deploy service account $DEPLOY_SA" \
+  gcloud iam service-accounts describe "$DEPLOY_SA" --project="$PROJECT" \
+  -- \
+  gcloud iam service-accounts create "$DEPLOY_SA_ID" \
+    --display-name="$SERVICE GitHub Actions deployer" \
+    --project="$PROJECT"
+
+# ---------------------------------------------------------------------------
+# Project-level role grants.
+#
+# add-iam-policy-binding is idempotent, so these are re-asserted on every run
+# rather than guarded. --condition=None suppresses the interactive prompt that
+# gcloud raises when the existing policy contains conditional bindings; without
+# it a re-run blocks waiting for input.
+# ---------------------------------------------------------------------------
+log "granting roles/datastore.user to $RUNTIME_SA"
+gcloud projects add-iam-policy-binding "$PROJECT" \
+  --member="serviceAccount:$RUNTIME_SA" \
+  --role="roles/datastore.user" \
+  --condition=None --quiet >/dev/null
+
+for role in roles/run.admin roles/artifactregistry.writer; do
+  log "granting $role to $DEPLOY_SA"
+  gcloud projects add-iam-policy-binding "$PROJECT" \
+    --member="serviceAccount:$DEPLOY_SA" \
+    --role="$role" \
+    --condition=None --quiet >/dev/null
+done
+
+# Scoped to the runtime service account resource, not the project. The deploy
+# job needs to act as the runtime SA when it passes --service-account to the
+# Cloud Run deploy; granting this at the project level would let the deploy SA
+# impersonate every service account in the project instead of just this one.
+log "granting roles/iam.serviceAccountUser on $RUNTIME_SA to $DEPLOY_SA"
+gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" \
+  --member="serviceAccount:$DEPLOY_SA" \
+  --role="roles/iam.serviceAccountUser" \
+  --project="$PROJECT" --quiet >/dev/null

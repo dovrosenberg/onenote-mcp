@@ -109,6 +109,32 @@ assert_logged "artifacts repositories create onenote-mcp --repository-format=doc
 assert_logged "firestore databases create --location=nam5" \
   "REGION drives the Firestore location, independently of GAR_REGION"
 
+echo "--- Phase 3: service accounts and IAM grants ---"
+
+RUN_SA="onenote-mcp-run@test-project.iam.gserviceaccount.com"
+DEP_SA="onenote-mcp-deploy@test-project.iam.gserviceaccount.com"
+
+run_bootstrap PROJECT=test-project STUB_MISSING="$ALL_MISSING"
+assert_logged "iam service-accounts create onenote-mcp-run" "fresh run creates the runtime SA"
+assert_logged "iam service-accounts create onenote-mcp-deploy" "fresh run creates the deploy SA"
+
+run_bootstrap PROJECT=test-project STUB_MISSING=
+assert_not_logged "iam service-accounts create" "already-configured run skips SA creates"
+assert_logged "projects add-iam-policy-binding test-project --member=serviceAccount:$RUN_SA --role=roles/datastore.user" \
+  "roles/datastore.user is granted to the runtime SA on every run"
+assert_logged "projects add-iam-policy-binding test-project --member=serviceAccount:$DEP_SA --role=roles/run.admin" \
+  "roles/run.admin is granted to the deploy SA on every run"
+assert_logged "projects add-iam-policy-binding test-project --member=serviceAccount:$DEP_SA --role=roles/artifactregistry.writer" \
+  "roles/artifactregistry.writer is granted to the deploy SA on every run"
+assert_logged "iam service-accounts add-iam-policy-binding $RUN_SA --member=serviceAccount:$DEP_SA --role=roles/iam.serviceAccountUser" \
+  "roles/iam.serviceAccountUser is scoped to the runtime SA"
+assert_not_logged "projects add-iam-policy-binding test-project --member=serviceAccount:$DEP_SA --role=roles/iam.serviceAccountUser" \
+  "roles/iam.serviceAccountUser is NOT granted at the project level"
+
+run_bootstrap PROJECT=test-project SERVICE=other-name STUB_MISSING="$ALL_MISSING"
+assert_logged "iam service-accounts create other-name-run" "SERVICE override drives the runtime SA id"
+assert_logged "iam service-accounts create other-name-deploy" "SERVICE override drives the deploy SA id"
+
 if [[ "$FAILURES" -ne 0 ]]; then
   printf '\n%s assertion(s) failed\n' "$FAILURES"
   exit 1
