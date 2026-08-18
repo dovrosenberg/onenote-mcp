@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { SERVICE_NAME, VERSION } from './version.ts';
+import { SERVICE_NAME, VERSION } from '../src/version.ts';
 
 test('service name is stable', () => {
   assert.equal(SERVICE_NAME, 'onenote-mcp');

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ConfigError, loadConfig, type ConfigGroup } from './config.ts';
+import { ConfigError, loadConfig, type ConfigGroup } from '../src/config.ts';
 
 const ALL_GROUPS: ConfigGroup[] = ['graph', 'firestore', 'oauth', 'server'];
 

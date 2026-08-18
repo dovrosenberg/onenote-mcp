@@ -1,4 +1,13 @@
 {
+  // Emit config. Narrows tsconfig.json to src/ only, so no test file reaches dist/
+  // and therefore no test file reaches the container image built in issue #6.
   "extends": "./tsconfig.json",
-  "exclude": ["dist", "node_modules", "src/**/*.test.ts"]
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["dist", "node_modules", "test"]
 }

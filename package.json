@@ -10,11 +10,11 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json",
     "dev": "node --watch src/index.ts",
     "start": "node dist/index.js",
     "bootstrap": "node src/bootstrap.ts",
-    "test": "node --test \"src/**/*.test.ts\""
+    "test": "node --test \"test/**/*.test.ts\""
   },
   "dependencies": {
     "@azure/msal-node": "^5.5.0",

@@ -2,8 +2,8 @@ import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 
-import type { Config } from './config.ts';
-import { createApp } from './server.ts';
+import type { Config } from '../src/config.ts';
+import { createApp } from '../src/server.ts';
 
 const STUB_CONFIG: Config = {
   graph: { clientId: 'client-id', authority: 'https://login.microsoftonline.com/common' },

@@ -31,12 +31,16 @@ npm test
 | `npm run dev` | Run the server from source with `--watch` |
 | `npm start` | Run the compiled server from `dist/` (run `build` first) |
 | `npm run bootstrap` | Local device-code sign-in that seeds the Firestore token cache |
-| `npm test` | `node --test` over `src/**/*.test.ts` |
+| `npm test` | `node --test` over `test/**/*.test.ts` |
 
-Tests run directly against TypeScript source using Node's native type stripping, so
-`npm test` does not need a build. That constrains the source: no `enum`, no `namespace`,
-no constructor parameter properties, and type-only imports must be written `import type`.
-The `erasableSyntaxOnly` and `verbatimModuleSyntax` compiler options enforce this.
+Tests live in `test/` and mirror `src/`. They run directly against TypeScript source
+using Node's native type stripping, so `npm test` does not need a build. That constrains
+the source: no `enum`, no `namespace`, no constructor parameter properties, and type-only
+imports must be written `import type`. The `erasableSyntaxOnly` and `verbatimModuleSyntax`
+compiler options enforce this.
+
+See [`CLAUDE.md`](./CLAUDE.md) for the directory layout and the conventions that go with
+it.
 
 ## Configuration
 
