@@ -8,7 +8,7 @@
 
 | Phase | Status | Commit |
 |-------|--------|--------|
-| Phase 1: Project skeleton, dependencies, build and test wiring | ☐ | — |
+| Phase 1: Project skeleton, dependencies, build and test wiring | ☑ | `e6f00dc` |
 | Phase 2: `src/config.ts` — grouped env schema and fail-fast validation | ☐ | — |
 | Phase 3: `src/index.ts` entrypoint, `/healthz`, bootstrap placeholder | ☐ | — |
 
@@ -249,7 +249,7 @@ The repo has no JavaScript linter and this issue does not ask for one, so adding
 - [ ] `npm test` exits 0, all `config.test.ts` cases pass
 - [ ] `npm run typecheck` exits 0 (lint)
 - [ ] `npm run build` exits 0
-- [ ] `grep -n 'process.exit\|process\.env' src/config.ts` shows `process.env` only as the default parameter value and no `process.exit`
+- [ ] `grep -n 'process.exit\|process\.env' src/config.ts` shows `process.env` only as the `loadConfig` default parameter value, and `process.exit` only inside `exitOnConfigError` (pulled forward from Phase 3 step 4 so both entrypoints share one implementation)
 
 ---
 
