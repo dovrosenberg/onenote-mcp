@@ -336,15 +336,27 @@ not fit: an image too small to read is a better answer than a failed request, an
 result says which width it got so the model can tell "illegible handwriting" from
 "rendered too small".
 
-**The `_by_name` tools resolve names in one request, and refuse rather than guess.**
-`resolveSection` in `src/name-lookup.ts` matches exactly and case-insensitively on every
-name, so `'monthly log'` finds `'Monthly Log'` and `'Monthly'` finds nothing — substring
-matching is what `search_pages` is for, and a lookup that accepted a prefix would return a
-different section than the caller named. A name matching nothing is a `NameLookupError`
-listing the sibling names, never an empty result: a caller cannot tell an empty section
-from a section that does not exist. A name matching twice is a `NameLookupError` carrying
-the candidates. `sectionGroupName` omitted means the section is a direct child of the
-notebook, not "search everywhere".
+**Container names are matched by a ladder, and the result says which rung answered.**
+`matchNodes` in `src/name-lookup.ts` tries exact and case-insensitive, then the same
+comparison against the candidate with a leading ordering prefix removed, then a
+case-insensitive substring. The middle rung is the one this account needs: its section
+groups are named `062 - February` and a caller knows the month, not the number. A rung is
+only tried when the one above it matched nothing, so an exact match can never lose to a
+looser one — the test for that is two groups where only one strips to `February`.
+`matchedBy` in every `_by_name` result names the rung, so a caller that asked for
+`February` can see it got `062 - February` and why. Page titles do not use the ladder;
+they are matched in full, ignoring case, and `search_pages` is the substring tool.
+
+**A `_by_name` tool refuses rather than guesses.** A name matching nothing is a
+`NameLookupError` listing the sibling names, never an empty result: a caller cannot tell
+an empty section from a section that does not exist. A name matching more than once on
+the same rung is a `NameLookupError` carrying the candidates. `sectionGroupName` omitted
+means the section is a direct child of the notebook, not "search everywhere".
+
+**`list_pages_by_name` is the answer to "which page is it?".** It returns every title in
+a named section with its page id, so a model reads the titles, picks one, and passes that
+id straight to `get_page_content`. Nothing else is needed in between, and the tool
+description says so — a caller that re-resolved the name would pay for the lookup twice.
 
 **The fallback below a named section group is one filtered request, not a walk.**
 `getExpandedTree` reaches a notebook's sections and one level of section group, because

@@ -14,9 +14,11 @@ import assert from 'node:assert/strict';
 import type { ExpandedNotebook, SectionWithParents } from '../src/graph-structure.ts';
 import {
   NameLookupError,
+  matchNodes,
   matchOne,
   namesMatch,
   resolveSection,
+  withoutOrderingPrefix,
   type LookupStructure,
 } from '../src/name-lookup.ts';
 
@@ -100,7 +102,8 @@ test('names match in full and ignore case and surrounding whitespace', () => {
 
 test('matchOne returns only id and display name, whatever the node carried', () => {
   const matched = matchOne(EXPANDED, 'bullet journal - 2026', 'notebookName');
-  assert.deepEqual(matched, { id: 'nb-2026', displayName: 'Bullet Journal - 2026' });
+  assert.deepEqual(matched.node, { id: 'nb-2026', displayName: 'Bullet Journal - 2026' });
+  assert.equal(matched.rule, 'exact');
 });
 
 test('a section inside a named group resolves in exactly one request', async () => {
@@ -171,7 +174,7 @@ test('a missing notebook name lists the notebooks that were there', async () => 
   assert.equal(error.kind, 'not-found');
   assert.equal(error.argument, 'notebookName');
   assert.match(error.message, /Bullet Journal - 2026/);
-  assert.match(error.message, /matched in full, ignoring case/);
+  assert.match(error.message, /matched in full ignoring case/);
 });
 
 test('a section nested below the named group is found by one filtered request', async () => {
@@ -234,4 +237,88 @@ test('an empty container yields an error that says there was nothing to match', 
 
   assert.ok(error instanceof NameLookupError);
   assert.match(error.message, /nothing there to match/);
+});
+
+// ---------------------------------------------------------------------------
+// The matching ladder. The case it exists for: this account names its section groups
+// '062 - February', and a caller knows the month, not the number.
+// ---------------------------------------------------------------------------
+
+test('an ordering prefix comes off the stored name, in the forms people write one', () => {
+  assert.equal(withoutOrderingPrefix('062 - February'), 'February');
+  assert.equal(withoutOrderingPrefix('02. February'), 'February');
+  assert.equal(withoutOrderingPrefix('2) February'), 'February');
+  assert.equal(withoutOrderingPrefix('03 February'), 'February');
+  assert.equal(withoutOrderingPrefix('2026: Review'), 'Review');
+  assert.equal(withoutOrderingPrefix('February'), 'February');
+  // A name that is only digits keeps them; stripping it would leave nothing to match on.
+  assert.equal(withoutOrderingPrefix('2026'), '2026');
+});
+
+test('the ladder prefers an exact match over a looser one', () => {
+  const nodes = [
+    { id: 'a', displayName: 'February' },
+    { id: 'b', displayName: '062 - February' },
+    { id: 'c', displayName: 'February planning' },
+  ];
+
+  const matched = matchNodes(nodes, 'february');
+  assert.equal(matched.rule, 'exact');
+  assert.deepEqual(
+    matched.matches.map((node) => node.id),
+    ['a'],
+    'the prefixed and the substring candidates must not compete with an exact match',
+  );
+});
+
+test("a month name finds the section group that carries a number in front of it", async () => {
+  const structure = fake();
+  const resolved = await resolveSection(structure, {
+    notebookName: 'Bullet Journal - 2026',
+    sectionGroupName: 'February',
+    sectionName: 'Monthly Log',
+  });
+
+  assert.deepEqual(resolved.sectionGroup, { id: 'grp-feb', displayName: '062 - February' });
+  assert.equal(resolved.matchedBy.sectionGroup, 'without-prefix');
+  assert.equal(resolved.matchedBy.notebook, 'exact');
+  assert.equal(resolved.matchedBy.section, 'exact');
+});
+
+test('a partial name falls to the substring rung and says so', async () => {
+  const resolved = await resolveSection(fake(), {
+    notebookName: 'Bullet Journal - 2026',
+    sectionGroupName: 'febr',
+    sectionName: 'Monthly Log',
+  });
+
+  assert.deepEqual(resolved.sectionGroup, { id: 'grp-feb', displayName: '062 - February' });
+  assert.equal(resolved.matchedBy.sectionGroup, 'substring');
+});
+
+test('two groups that tie on the same rung are refused rather than guessed', async () => {
+  // Both strip to 'February', so the without-prefix rung matches both and neither is
+  // more exact than the other. A group whose stripped name were 'February review'
+  // would lose to this rung instead of competing with it.
+  const tree: ExpandedNotebook[] = [
+    {
+      id: 'nb',
+      displayName: 'Journal',
+      sections: [],
+      sectionGroups: [
+        { id: 'g1', displayName: '062 - February', sections: [] },
+        { id: 'g2', displayName: '07. February', sections: [] },
+      ],
+    },
+  ];
+
+  const error = await resolveSection(fake(tree), {
+    notebookName: 'Journal',
+    sectionGroupName: 'february',
+    sectionName: 'anything',
+  }).catch((err: unknown) => err);
+
+  assert.ok(error instanceof NameLookupError);
+  assert.equal(error.kind, 'ambiguous');
+  assert.equal(error.argument, 'sectionGroupName');
 });

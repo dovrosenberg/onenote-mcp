@@ -292,13 +292,16 @@ export function createStructureTools(
         'Find a page when you already know where it lives: the notebook, the section ' +
         'group if it is in one, the section, and the page title. Saves the ' +
         'list_notebooks -> list_sections -> list_pages walk that reaching the same page ' +
-        'by id would cost. Every name is matched in full and case-insensitively, so ' +
-        "'monthly log' finds 'Monthly Log' and 'Monthly' finds nothing — use " +
-        'search_pages when you only remember part of a title. Omit sectionGroupName ' +
-        'when the section sits directly in the notebook; it is not a wildcard. A name ' +
-        'that matches nothing comes back as an error listing what was there, and a name ' +
-        'that matches more than one thing comes back as an error listing the ' +
-        'candidates. Returns the page id to pass to get_page_content.',
+        'by id would cost. Container names are matched in full and case-insensitively ' +
+        'first, then against the name with any leading number stripped, so ' +
+        "'February' finds a section group named '062 - February'; a substring is tried " +
+        'last. matchedBy in the result says which of those matched. The page title is ' +
+        'matched in full, ignoring case — use search_pages when you only remember part ' +
+        'of one, or list_pages_by_name to see every title in the section. Omit ' +
+        'sectionGroupName when the section sits directly in the notebook; it is not a ' +
+        'wildcard. A name that matches nothing, or matches more than one thing, comes ' +
+        'back as an error listing the candidates. Returns the page id to pass to ' +
+        'get_page_content.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -335,10 +338,14 @@ export function createStructureTools(
       name: 'list_pages_by_name',
       title: 'List a section\'s pages by name',
       description:
-        'List the pages in a section you can name, most recently modified first. Takes ' +
-        'the notebook name, the section group name if the section is in one, and the ' +
-        'section name, all matched in full and case-insensitively. This is list_pages ' +
-        'without the two calls it would take to turn those names into a section id. top ' +
+        'List the pages in a section you can name, most recently modified first, as ' +
+        'titles with their page ids. Use this when you know the section but not which ' +
+        'page you want: read the titles, pick one, and pass its id straight to ' +
+        'get_page_content — no further lookup is needed. Takes the notebook name, the ' +
+        'section group name if the section is in one, and the section name. Names are ' +
+        "matched in full ignoring case, then with any leading number stripped ('February' " +
+        "finds '062 - February'), then as a substring. This is list_pages without the " +
+        'two calls it would take to turn those names into a section id. top ' +
         `bounds the result (${TOP_RANGE.min}-${TOP_RANGE.max}, default ${DEFAULT_TOP}) ` +
         'and moreAvailable reports whether older pages exist beyond it.',
       inputSchema: {
@@ -441,6 +448,10 @@ function resolvedPayload(resolved: ResolvedPath): Record<string, unknown> {
     notebook: resolved.notebook,
     sectionGroup: resolved.sectionGroup,
     section: resolved.section,
+    // Which rung of the matching ladder answered each name. A caller that asked for
+    // 'February' and got '062 - February' can see that it was matched without its
+    // leading number rather than wonder whether it got the right group.
+    matchedBy: resolved.matchedBy,
   };
 }
 

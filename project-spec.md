@@ -121,9 +121,13 @@ the alignment is arithmetic, not guesswork.
 - Page titles are matched by Graph, not read and compared locally:
   `/sections/{id}/pages?$filter=tolower(title) eq '…'`. Nothing bounds how many
   pages a section may hold before a match could be missed.
-- Matching is exact and case-insensitive on every name, including the page
-  title. `search_pages` is the substring tool; a lookup that quietly accepted a
-  prefix would return a different section than the caller named.
+- Container names go through a ladder: exact and case-insensitive, then the
+  same against the stored name with a leading ordering prefix removed, then a
+  substring. The middle rung is what lets `February` find the section group
+  named `062 - February`, which is how this account names its months. A rung is
+  tried only when the one above it matched nothing, and `matchedBy` in the
+  result says which one answered. Page titles stay exact; `search_pages` is the
+  substring tool for those.
 - A name that matches nothing is an error listing the names that were there,
   not an empty result. A caller cannot tell an empty section from a
   non-existent one otherwise.

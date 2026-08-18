@@ -7,10 +7,12 @@
 //
 // Three rules the tools built on this depend on:
 //
-// Matching is exact and case-insensitive, on every name. `"monthly log"` finds
-// `"Monthly Log"` and `"Monthly"` finds nothing. A caller that only half-remembers a
-// name has `search_pages`, which matches substrings; a lookup that silently accepted a
-// prefix would return a different section than the caller named.
+// Container names are matched by a ladder, and the result says which rung matched. Exact
+// and case-insensitive first. Then the same comparison against the candidate with an
+// ordering prefix removed, because this account names its section groups `062 - February`
+// and a caller knows the month, not the number. Then a case-insensitive substring. Each
+// rung is tried only when the one above it found nothing, so a name that matches exactly
+// can never be beaten by a looser match on something else.
 //
 // Ambiguity is reported, never resolved. Two sections with the same name in one notebook
 // are a real possibility, and picking the first would give a confidently wrong answer.
@@ -39,6 +41,16 @@ export interface ResolvedNode {
   readonly displayName: string;
 }
 
+/** Which rung of the ladder produced a match. */
+export type MatchRule = 'exact' | 'without-prefix' | 'substring';
+
+/** How each name in the path was matched. */
+export interface MatchRules {
+  readonly notebook: MatchRule;
+  readonly sectionGroup: MatchRule | null;
+  readonly section: MatchRule;
+}
+
 /** A path resolved all the way to a section. */
 export interface ResolvedPath {
   readonly notebook: ResolvedNode;
@@ -46,6 +58,8 @@ export interface ResolvedPath {
   readonly section: ResolvedNode;
   /** True when the section was found only by walking past the expanded tree. */
   readonly deepSearchUsed: boolean;
+  /** Which rung matched each name, so a caller can see what it actually got. */
+  readonly matchedBy: MatchRules;
 }
 
 /** Which name failed, and what was there instead. */
@@ -102,6 +116,52 @@ export function namesMatch(a: string, b: string): boolean {
 }
 
 /**
+ * A leading ordering prefix, as OneNote users write one to force a sort order.
+ *
+ * Covers `062 - February`, `02. February`, `2) February`, `03 February`. The digits and
+ * the separator go; a name that is only digits is left alone, because removing the whole
+ * name would make every such candidate match everything.
+ */
+const ORDERING_PREFIX = /^\s*\d+\s*(?:[-–—.):]\s*|\s+)(?=\S)/;
+
+/** The candidate name with any ordering prefix removed. */
+export function withoutOrderingPrefix(name: string): string {
+  return name.replace(ORDERING_PREFIX, '').trim();
+}
+
+/** The rungs, in the order they are tried. */
+const RULES: readonly { rule: MatchRule; test: (candidate: string, wanted: string) => boolean }[] = [
+  { rule: 'exact', test: namesMatch },
+  {
+    rule: 'without-prefix',
+    // `062 - February` matched by `February`. The prefix comes off the stored name, not
+    // off what the caller typed: the caller is the one who does not know the number.
+    test: (candidate, wanted) => namesMatch(withoutOrderingPrefix(candidate), wanted),
+  },
+  {
+    rule: 'substring',
+    test: (candidate, wanted) =>
+      wanted.trim() !== '' && candidate.trim().toLowerCase().includes(wanted.trim().toLowerCase()),
+  },
+];
+
+/**
+ * Everything that matches `wanted`, by the strictest rung that matches anything.
+ *
+ * @returns the matches and the rung, or an empty list and a null rung.
+ */
+export function matchNodes(
+  nodes: readonly ResolvedNode[],
+  wanted: string,
+): { matches: ResolvedNode[]; rule: MatchRule | null } {
+  for (const { rule, test } of RULES) {
+    const matches = nodes.filter((node) => test(node.displayName, wanted));
+    if (matches.length > 0) return { matches, rule };
+  }
+  return { matches: [], rule: null };
+}
+
+/**
  * The one match for `wanted` among `nodes`.
  *
  * @throws {NameLookupError} when nothing matches or more than one does.
@@ -110,12 +170,15 @@ export function matchOne(
   nodes: readonly ResolvedNode[],
   wanted: string,
   argument: string,
-): ResolvedNode {
-  const matches = nodes.filter((node) => namesMatch(node.displayName, wanted));
+): { node: ResolvedNode; rule: MatchRule } {
+  const { matches, rule } = matchNodes(nodes, wanted);
+
   // Narrowed to id and display name: the nodes coming in are expanded notebooks and
   // section groups carrying their children, and a ResolvedPath that leaked those would
   // put the whole subtree into every tool result.
-  if (matches.length === 1) return plain(matches[0] as ResolvedNode);
+  if (matches.length === 1 && rule !== null) {
+    return { node: plain(matches[0] as ResolvedNode), rule };
+  }
   if (matches.length === 0) {
     throw new NameLookupError('not-found', argument, wanted, nodes.map(plain));
   }
@@ -125,10 +188,13 @@ export function matchOne(
 /**
  * Resolve notebook → section group → section, in one Graph request where possible.
  *
+ * Each name goes through the ladder in `matchNodes`, and `matchedBy` in the result says
+ * which rung answered. That is what lets `February` find `062 - February` without ever
+ * letting a loose match win over an exact one.
+ *
  * The expanded tree covers a notebook's own sections and one level of section group. A
- * section that is not there may still exist deeper, so the notebook that matched — and
- * only that notebook — is walked before the lookup is called a failure. The real account
- * has no such nesting, so the walk does not run on the common path.
+ * section that is not there may still exist deeper, so one filtered account-wide request
+ * settles that case before the lookup is called a failure.
  *
  * @throws {NameLookupError} when a name matches nothing or matches more than once.
  */
@@ -137,77 +203,82 @@ export async function resolveSection(
   path: NamePath,
 ): Promise<ResolvedPath> {
   const tree = await structure.getExpandedTree();
-  const notebook = matchOne(tree, path.notebookName, 'notebookName');
+  const notebookMatch = matchOne(tree, path.notebookName, 'notebookName');
+  const notebook = notebookMatch.node;
   const expanded = tree.find((candidate) => candidate.id === notebook.id) as ExpandedNotebook;
 
   if (path.sectionGroupName === undefined) {
-    const direct = expanded.sections.filter((section) =>
-      namesMatch(section.displayName, path.sectionName),
-    );
-    if (direct.length === 1) {
+    const direct = matchNodes(expanded.sections, path.sectionName);
+    if (direct.matches.length === 1 && direct.rule !== null) {
       return {
         notebook,
         sectionGroup: null,
-        section: plain(direct[0] as ResolvedNode),
+        section: plain(direct.matches[0] as ResolvedNode),
         deepSearchUsed: false,
+        matchedBy: { notebook: notebookMatch.rule, sectionGroup: null, section: direct.rule },
       };
     }
-    if (direct.length > 1) {
-      throw new NameLookupError('ambiguous', 'sectionName', path.sectionName, direct);
+    if (direct.matches.length > 1) {
+      throw new NameLookupError('ambiguous', 'sectionName', path.sectionName, direct.matches);
     }
     // Not among the notebook's own sections. It may sit inside a section group the
     // caller did not name, which is worth saying rather than reporting a bare miss.
-    throw new NameLookupError(
-      'not-found',
-      'sectionName',
-      path.sectionName,
-      expanded.sections,
-    );
+    throw new NameLookupError('not-found', 'sectionName', path.sectionName, expanded.sections);
   }
 
-  const group = matchOne(expanded.sectionGroups, path.sectionGroupName, 'sectionGroupName');
+  const groupMatch = matchOne(expanded.sectionGroups, path.sectionGroupName, 'sectionGroupName');
+  const group = groupMatch.node;
   const expandedGroup = expanded.sectionGroups.find((candidate) => candidate.id === group.id);
   const sections = expandedGroup?.sections ?? [];
 
-  const matches = sections.filter((section) => namesMatch(section.displayName, path.sectionName));
-  if (matches.length === 1) {
+  const inGroup = matchNodes(sections, path.sectionName);
+  if (inGroup.matches.length === 1 && inGroup.rule !== null) {
     return {
       notebook,
       sectionGroup: group,
-      section: plain(matches[0] as ResolvedNode),
+      section: plain(inGroup.matches[0] as ResolvedNode),
       deepSearchUsed: false,
+      matchedBy: {
+        notebook: notebookMatch.rule,
+        sectionGroup: groupMatch.rule,
+        section: inGroup.rule,
+      },
     };
   }
-  if (matches.length > 1) {
-    throw new NameLookupError('ambiguous', 'sectionName', path.sectionName, matches);
+  if (inGroup.matches.length > 1) {
+    throw new NameLookupError('ambiguous', 'sectionName', path.sectionName, inGroup.matches);
   }
 
   // The expanded response stops at this group's sections, so a section nested below it
   // is absent from that response rather than known to be absent. One filtered request
   // settles it at any depth, and only runs when the cheap answer came back empty.
-  const deep = (await structure.findSectionsByName(path.sectionName)).filter(
+  const candidates = (await structure.findSectionsByName(path.sectionName)).filter(
     (section) =>
-      // Graph matched a substring; the full-name rule is this module's, so it is applied
-      // here rather than left to the service.
-      namesMatch(section.displayName, path.sectionName) &&
       section.parentSectionGroup !== null &&
-      namesMatch(section.parentSectionGroup.displayName, path.sectionGroupName as string) &&
+      namesMatch(section.parentSectionGroup.displayName, group.displayName) &&
       // Two notebooks can hold a section group of the same name, so the notebook is
       // checked too rather than assumed from the group.
       section.parentNotebook !== null &&
       namesMatch(section.parentNotebook.displayName, notebook.displayName),
   );
 
-  if (deep.length === 1) {
+  // Graph matched a substring of its own; the ladder is this module's rule, applied here.
+  const deep = matchNodes(candidates, path.sectionName);
+  if (deep.matches.length === 1 && deep.rule !== null) {
     return {
       notebook,
       sectionGroup: group,
-      section: plain(deep[0] as ResolvedNode),
+      section: plain(deep.matches[0] as ResolvedNode),
       deepSearchUsed: true,
+      matchedBy: {
+        notebook: notebookMatch.rule,
+        sectionGroup: groupMatch.rule,
+        section: deep.rule,
+      },
     };
   }
-  if (deep.length > 1) {
-    throw new NameLookupError('ambiguous', 'sectionName', path.sectionName, deep.map(plain));
+  if (deep.matches.length > 1) {
+    throw new NameLookupError('ambiguous', 'sectionName', path.sectionName, deep.matches);
   }
   throw new NameLookupError('not-found', 'sectionName', path.sectionName, sections);
 }
@@ -240,7 +311,8 @@ function buildMessage(
     return `${argument} '${wanted}' matched nothing, and there was nothing there to match.`;
   }
   return (
-    `${argument} '${wanted}' matched nothing. Names are matched in full, ignoring case. ` +
-    `What was there: ${shown}${more}.`
+    `${argument} '${wanted}' matched nothing. A name is matched in full ignoring case, ` +
+    `then against the name with any leading number removed ('February' finds ` +
+    `'062 - February'), then as a substring. What was there: ${shown}${more}.`
   );
 }
