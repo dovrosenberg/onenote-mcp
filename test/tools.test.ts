@@ -1,0 +1,30 @@
+// The registry. This constructs the real MSAL and Firestore clients, which is what the
+// deployed server does at startup; neither opens a connection until a token is asked
+// for, so no credential and no backend is needed to run this.
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import type { Config } from '../src/config.ts';
+import { indexTools } from '../src/mcp-tools.ts';
+import { createTools } from '../src/tools.ts';
+
+const STUB_CONFIG: Config = {
+  graph: { clientId: 'client-id', authority: 'https://login.microsoftonline.com/common' },
+  firestore: { cacheDocumentPath: 'tokencache/msal', projectId: 'proj' },
+  oauth: { clientId: 'mcp-client', clientSecret: 'mcp-secret', tokenSigningKey: 'x'.repeat(32) },
+  server: { port: 0 },
+};
+
+test('createTools exposes the browsing tools issue #15 adds', () => {
+  const tools = createTools(STUB_CONFIG);
+  assert.deepEqual(
+    tools.map((tool) => tool.name),
+    ['list_notebooks', 'list_sections', 'list_pages', 'search_pages'],
+  );
+  assert.doesNotThrow(() => indexTools(tools));
+});
+
+test('createTools refuses a config that was loaded without the Graph groups', () => {
+  assert.throws(() => createTools({ server: { port: 0 } }), /graph/);
+});

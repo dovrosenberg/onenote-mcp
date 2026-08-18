@@ -7,12 +7,12 @@
 // bottom of this file are what turn raw arguments into typed values, and a bad argument
 // into a readable failure rather than a TypeError.
 //
-// `createTools` returns an empty list. Issue #14 is the transport and the scaffolding;
-// the tools themselves arrive in #15 (structure), #16 (reading), and #18 (writing).
+// The registry of which tool modules the server exposes lives in ./tools.ts, not here:
+// those modules import this one for `ToolDefinition` and the argument helpers, and
+// wiring them up here as well would make the two files import each other.
 
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 
-import type { Config } from './config.ts';
 import { GraphAuthError } from './graph-auth.ts';
 import { GraphRequestError, GraphResponseError } from './graph-structure.ts';
 import { InkParseError, InkRenderError } from './ink.ts';
@@ -45,11 +45,6 @@ export class ToolInputError extends Error {
     this.name = 'ToolInputError';
     this.argument = argument;
   }
-}
-
-/** The tools this server exposes. Empty until issue #15; see the file header. */
-export function createTools(_config: Config): ToolDefinition[] {
-  return [];
 }
 
 /** The `tools/list` payload. Drops `handle` and keeps the declared shape. */
@@ -151,9 +146,11 @@ function graphErrorDetail(body: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// Argument helpers. Every tool in project-spec.md takes ids as strings and one
+// Argument helpers. Every tool in project-spec.md takes ids and short strings plus one
 // optional count, so these three cover the surface; each throws ToolInputError, which
-// toolErrorResult turns into a message naming the argument.
+// toolErrorResult turns into a message naming the argument. A tool with a fixed set of
+// allowed values checks it itself and throws the same error — see `containerType` in
+// ./structure-tools.ts.
 // ---------------------------------------------------------------------------
 
 /** A non-empty string. Whitespace-only is treated as missing: an id cannot be blank. */

@@ -35,7 +35,7 @@ const INITIALIZE = {
   },
 };
 
-// The service under test, with no tools registered — the state issue #14 ships in.
+// The service under test, wired to the real tool registry.
 const serviceServer = createApp(STUB_CONFIG).listen(0);
 const serviceReady = new Promise<void>((resolve) =>
   serviceServer.once('listening', () => resolve()),
@@ -79,14 +79,17 @@ test('the initialize response carries no session id', async () => {
   assert.equal(res.headers.get('mcp-session-id'), null);
 });
 
-test('tools/list answers with an empty list on a request that never initialised', async () => {
+test('tools/list answers on a request that never initialised', async () => {
   // The acceptance criterion for issue #14: a second request holds no state from the
   // first, so tools/list has to work on a server that saw no initialize of its own.
   const res = await mcp({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
   assert.equal(res.status, 200);
 
-  const body = (await res.json()) as { result: { tools: unknown[] } };
-  assert.deepEqual(body.result.tools, []);
+  const body = (await res.json()) as { result: { tools: { name: string }[] } };
+  assert.deepEqual(
+    body.result.tools.map((tool) => tool.name),
+    ['list_notebooks', 'list_sections', 'list_pages', 'search_pages'],
+  );
 });
 
 test('GET is refused with 405 rather than opening an SSE stream', async () => {
@@ -128,13 +131,13 @@ test('calling a tool that was never registered is a JSON-RPC error', async () =>
     jsonrpc: '2.0',
     id: 3,
     method: 'tools/call',
-    params: { name: 'list_notebooks', arguments: {} },
+    params: { name: 'no_such_tool', arguments: {} },
   });
   assert.equal(res.status, 200);
 
   const body = (await res.json()) as { error: { code: number; message: string } };
   assert.equal(body.error.code, -32602);
-  assert.match(body.error.message, /list_notebooks/);
+  assert.match(body.error.message, /no_such_tool/);
 });
 
 // ---------------------------------------------------------------------------

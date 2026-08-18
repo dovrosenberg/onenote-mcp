@@ -6,7 +6,6 @@ import { GraphRequestError, GraphResponseError } from '../src/graph-structure.ts
 import { InkRenderError } from '../src/ink.ts';
 import {
   ToolInputError,
-  createTools,
   indexTools,
   optionalInteger,
   optionalString,
@@ -15,13 +14,6 @@ import {
   toolErrorResult,
   type ToolDefinition,
 } from '../src/mcp-tools.ts';
-
-const STUB_CONFIG = {
-  graph: { clientId: 'client-id', authority: 'https://login.microsoftonline.com/common' },
-  firestore: { cacheDocumentPath: 'tokencache/msal', projectId: 'proj' },
-  oauth: { clientId: 'mcp-client', clientSecret: 'mcp-secret', tokenSigningKey: 'x'.repeat(32) },
-  server: { port: 0 },
-};
 
 function tool(name: string): ToolDefinition {
   return {
@@ -40,10 +32,6 @@ function errorText(err: unknown): string {
   assert.equal(first?.type, 'text');
   return first?.type === 'text' ? first.text : '';
 }
-
-test('createTools registers no tools yet', () => {
-  assert.deepEqual(createTools(STUB_CONFIG), []);
-});
 
 test('toolDescriptors drops the handler and keeps the declared shape', () => {
   const descriptors = toolDescriptors([tool('list_notebooks')]);

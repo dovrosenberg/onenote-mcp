@@ -3,7 +3,7 @@ import express, { type Application, type Request, type Response } from 'express'
 import type { Config } from './config.ts';
 import { requestLogger } from './logging.ts';
 import { MCP_PATH, mcpRouter } from './mcp-server.ts';
-import { createTools } from './mcp-tools.ts';
+import { createTools } from './tools.ts';
 import { SERVICE_NAME, VERSION } from './version.ts';
 
 /**

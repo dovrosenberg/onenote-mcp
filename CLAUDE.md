@@ -63,10 +63,25 @@ nothing confirms the shape until an operator runs the server against the real te
 `test/mcp-server.test.ts` starts a real HTTP server and speaks JSON-RPC to it, so the
 transport is exercised rather than mocked: the assertions about statelessness (no
 `Mcp-Session-Id` header, `tools/list` answered by a server that saw no `initialize`) are
-only meaningful over the wire. It covers the empty tool list through `createApp`, and the
+only meaningful over the wire. It covers the real tool list through `createApp`, and the
 failure paths through `mcpRouter` with hand-written tools injected. What no test covers
 is whether a real MCP client accepts the responses; nothing confirms that until an
 operator points one at the deployed URL.
+
+`test/structure-tools.test.ts` and `test/page-search.test.ts` drive plain fake objects
+rather than a fake `fetch`: `StructureClient` and `SearchableStructure` are the narrow
+slices of `GraphStructure` those modules call, and the URLs are already asserted in
+`test/graph-structure.test.ts`. The fake tree is a notebook per year with a section group
+per month, nested twice, because a one-level tree would pass a walk that does not recurse.
+What no test covers is whether the search bounds are the right size — 200 sections and 25
+seconds are chosen against the account described in `project-spec.md`, not measured, and
+nothing says whether an unscoped search finishes inside an MCP client's timeout until an
+operator runs one against the real tenant.
+
+`test/tools.test.ts` covers the registry, and it constructs the real MSAL and Firestore
+clients while doing so. Neither opens a connection until a token is asked for, so it
+needs no credential and no backend; if that ever stops being true, this test is where it
+will show up first.
 
 `test/token-cache.test.ts` covers `readCache` and nothing else. `readCache` is a pure
 function over a document snapshot, so it runs without a backend. `beforeCacheAccess`,
@@ -268,6 +283,31 @@ low-level class also puts the `tools/call` error mapping in one place. The cost 
 `ToolDefinition` carries hand-written JSON Schema and receives unvalidated arguments,
 which is what the `requiredString` / `optionalString` / `optionalInteger` helpers in
 `src/mcp-tools.ts` exist for. Use them rather than reaching into the arguments object.
+
+**The tool registry is `src/tools.ts`, not `src/mcp-tools.ts`.** A tool module imports
+`ToolDefinition` and the argument helpers from `src/mcp-tools.ts`, so listing the modules
+there as well would make the two files import each other. `src/mcp-tools.ts` holds the
+contract, the error mapping, and the helpers; `src/tools.ts` builds the shared Graph
+client and concatenates the lists each tool module returns. `#16` and `#18` append there.
+
+**A tool answers with one JSON text block, and every count it reports is real.**
+`list_pages` says `moreAvailable` when Graph returned exactly `top` items, and
+`search_pages` says how many sections it searched out of how many it found. A model
+cannot tell a truncated search that matched nothing from a complete one, so a bounded
+result that omitted the bound would be read as "no such page".
+
+**`list_sections` returns sections and section groups in one tagged list.** Graph exposes
+them as two relationships and the caller has to recurse through both — this account is a
+notebook per year with a section group per month — so a result that carried only sections
+would make a caller guess that the second relationship exists.
+
+**An unscoped `search_pages` walks sections, and the walk is bounded twice.** At most
+`MAX_SECTIONS_SEARCHED` sections and `SEARCH_TIME_BUDGET_MS` of wall clock, both in
+`src/page-search.ts`. The account-wide page list is not an option — it is the endpoint
+that fails with 20266 — so there is nothing cheaper to fall back on. The time budget is
+checked before each section is fetched rather than during, so an overrun costs one round
+trip. A failure listing one section aborts the whole search: an expired refresh token
+fails every section identically, and returning "no matches" for it would be an answer.
 
 **A tool failure is an `isError` result; a protocol fault is a JSON-RPC error.** Every
 error a tool throws goes through `toolErrorResult`, because an expired refresh token, a
