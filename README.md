@@ -94,8 +94,52 @@ tenant id, neither of which belongs in a log.
 `npm test` covers the acquisition logic through a fake client. `createGraphAuth` itself
 has no automated test: it needs a cache seeded by a real device-code sign-in, and no
 credential that could seed one may be committed. Run `npm run bootstrap` and then the
-server against the same document to exercise it. Nothing wires the module into
-`createApp` yet; the first consumer is the Graph structure client, issue #11.
+server against the same document to exercise it. Its consumer is the Graph structure
+client below; nothing wires either into `createApp` yet.
+
+## Graph structure
+
+`src/graph-structure.ts` reads the OneNote tree: notebooks, section groups, sections, and
+the page list inside one section. `new GraphStructure(auth)` takes anything with a
+`getAccessToken()`, so the server passes it the `GraphAuth` above.
+
+| Method | Returns |
+|---|---|
+| `listNotebooks()` | Every notebook, by display name |
+| `listSections(containerKind, containerId)` | Sections directly under a notebook or section group |
+| `listSectionGroups(containerKind, containerId)` | Section groups directly under a notebook or section group |
+| `listContainerChildren(containerKind, containerId)` | Both of the above, fetched together |
+| `listPagesInSection(sectionId, top?)` | Pages in one section, most recently modified first, at most `top` (default 50) |
+| `getNotebookTree(notebook)` | One notebook with every nested section group resolved |
+| `getFullTree()` | Every notebook, each with its tree resolved |
+
+`containerKind` is `notebooks` or `sectionGroups` — the two Graph relationship names.
+Both container kinds expose the same child relationships, which is why the list methods
+take the kind instead of existing twice.
+
+Three things the traversal handles that a single Graph call does not:
+
+- **Nesting.** Section groups are the UI's "tab groups", and they contain further section
+  groups. `getNotebookTree` recurses.
+- **Paging.** Every list call follows `@odata.nextLink` until it stops appearing. Graph
+  chooses its own page size and ignores a larger `$top`, so one response is never proof
+  that a collection is complete. `listPagesInSection` stops as soon as `top` items are in
+  hand, so `top` is a result count rather than a page size.
+- **The account-wide page list is never called.** `GET /me/onenote/pages` fails with
+  error 20266, "maximum sections exceeded", on a notebook-per-year structure. Page
+  listing is always scoped to `/me/onenote/sections/{id}/pages`, and a test scans `src/`
+  for the account-wide path.
+
+Failures are `GraphRequestError` for a non-2xx response — it carries `status`,
+`statusText`, and the response `body`, because error 20266 is only distinguishable from
+any other 400 by that text — and `GraphResponseError` for a 2xx whose body is not the
+expected shape, a listing that will not terminate, or section groups nested past 20
+levels. No message contains a notebook, section, or page name.
+
+`npm test` drives all of it through a fake `fetch` keyed by exact URL. What that cannot
+check is whether Graph accepts those URLs; the query strings come from the validated
+recon script in Appendix A of `project-spec.md` and are confirmed only by running against
+the real tenant.
 
 ## Bootstrap
 

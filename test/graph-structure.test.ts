@@ -1,0 +1,355 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFile, readdir } from 'node:fs/promises';
+import path from 'node:path';
+
+import {
+  GRAPH_ROOT,
+  GraphRequestError,
+  GraphResponseError,
+  GraphStructure,
+  graphGet,
+  type FetchLike,
+  type TokenSource,
+} from '../src/graph-structure.ts';
+
+const TOKEN = 'fake-access-token';
+const NODE_QUERY = '$select=id,displayName&$orderby=displayName';
+
+const tokens: TokenSource = { getAccessToken: () => Promise.resolve(TOKEN) };
+
+interface Call {
+  url: string;
+  authorization: string | undefined;
+}
+
+/**
+ * A fetch whose routes are keyed by the exact URL. An unrouted URL fails the test, so
+ * every assertion about behaviour is also an assertion about the URL that was built.
+ */
+function fakeFetch(routes: Record<string, () => Response>): {
+  fetchImpl: FetchLike;
+  calls: Call[];
+} {
+  const calls: Call[] = [];
+  const fetchImpl: FetchLike = (url, init) => {
+    calls.push({ url, authorization: init.headers['Authorization'] });
+    const route = routes[url];
+    if (route === undefined) {
+      return Promise.reject(new Error(`no route for ${url}\nrouted: ${Object.keys(routes).join('\n        ')}`));
+    }
+    return Promise.resolve(route());
+  };
+  return { fetchImpl, calls };
+}
+
+function json(body: unknown, init: ResponseInit = {}): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+    ...init,
+  });
+}
+
+function childUrl(kind: 'notebooks' | 'sectionGroups', id: string, child: string): string {
+  return `${GRAPH_ROOT}/me/onenote/${kind}/${id}/${child}?${NODE_QUERY}`;
+}
+
+function pagesUrl(sectionId: string, top: number): string {
+  return (
+    `${GRAPH_ROOT}/me/onenote/sections/${sectionId}/pages` +
+    `?$top=${top}&$orderby=lastModifiedDateTime desc&$select=id,title,lastModifiedDateTime`
+  );
+}
+
+async function caught(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise;
+  } catch (err) {
+    return err;
+  }
+  assert.fail('expected the call to reject');
+}
+
+test('graphGet sends the bearer token and returns the parsed object', async () => {
+  const url = `${GRAPH_ROOT}/me/onenote/notebooks`;
+  const { fetchImpl, calls } = fakeFetch({ [url]: () => json({ value: [] }) });
+
+  assert.deepEqual(await graphGet(url, TOKEN, fetchImpl), { value: [] });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.authorization, `Bearer ${TOKEN}`);
+});
+
+test('a non-2xx response throws GraphRequestError carrying the status and the body', async () => {
+  // Shaped like the account-wide page list failure this module exists to avoid, because
+  // that error is only distinguishable from any other 400 by the body text.
+  const body = JSON.stringify({
+    error: { code: '20266', message: 'Maximum number of sections exceeded.' },
+  });
+  const url = `${GRAPH_ROOT}/me/onenote/notebooks`;
+  const { fetchImpl } = fakeFetch({
+    [url]: () => new Response(body, { status: 400, statusText: 'Bad Request' }),
+  });
+
+  const err = await caught(graphGet(url, TOKEN, fetchImpl));
+
+  assert.ok(err instanceof GraphRequestError, `expected GraphRequestError, got ${String(err)}`);
+  assert.equal(err.name, 'GraphRequestError');
+  assert.equal(err.status, 400);
+  assert.equal(err.statusText, 'Bad Request');
+  assert.equal(err.body, body);
+  assert.match(err.message, /400 Bad Request/);
+  assert.match(err.message, /20266/);
+});
+
+test('a 2xx body that is not a JSON object throws GraphResponseError', async () => {
+  const url = `${GRAPH_ROOT}/me/onenote/notebooks`;
+  const cases: Array<() => Response> = [
+    () => new Response('<html>sign in</html>', { status: 200 }),
+    () => json([{ id: 'nb-1' }]),
+  ];
+
+  for (const route of cases) {
+    const { fetchImpl } = fakeFetch({ [url]: route });
+    const err = await caught(graphGet(url, TOKEN, fetchImpl));
+    assert.ok(err instanceof GraphResponseError, `expected GraphResponseError, got ${String(err)}`);
+    assert.equal(err.url, url);
+  }
+});
+
+test('listNotebooks follows @odata.nextLink instead of stopping at the first page', async () => {
+  const first = `${GRAPH_ROOT}/me/onenote/notebooks?${NODE_QUERY}`;
+  const second = `${GRAPH_ROOT}/me/onenote/notebooks?${NODE_QUERY}&$skiptoken=fake-cursor`;
+  const { fetchImpl, calls } = fakeFetch({
+    [first]: () =>
+      json({
+        value: [{ id: 'nb-1', displayName: '2025' }],
+        '@odata.nextLink': second,
+      }),
+    [second]: () => json({ value: [{ id: 'nb-2', displayName: '2026' }] }),
+  });
+
+  const notebooks = await new GraphStructure(tokens, fetchImpl).listNotebooks();
+
+  assert.deepEqual(notebooks, [
+    { id: 'nb-1', displayName: '2025' },
+    { id: 'nb-2', displayName: '2026' },
+  ]);
+  assert.deepEqual(
+    calls.map((call) => call.url),
+    [first, second],
+  );
+});
+
+test('a nextLink that never stops is abandoned rather than followed forever', async () => {
+  const url = `${GRAPH_ROOT}/me/onenote/notebooks?${NODE_QUERY}`;
+  const { fetchImpl, calls } = fakeFetch({
+    [url]: () => json({ value: [{ id: 'nb-1', displayName: '2025' }], '@odata.nextLink': url }),
+  });
+
+  const err = await caught(new GraphStructure(tokens, fetchImpl).listNotebooks());
+
+  assert.ok(err instanceof GraphResponseError, `expected GraphResponseError, got ${String(err)}`);
+  assert.match(err.message, /@odata.nextLink/);
+  assert.ok(calls.length < 100, `expected the walk to stop, made ${calls.length} requests`);
+});
+
+test('listSections and listSectionGroups address both container kinds and encode the id', async () => {
+  // Real OneNote ids contain characters that must not reach the path raw.
+  const groupId = '1-abc!def/ghi';
+  const encoded = encodeURIComponent(groupId);
+  const { fetchImpl, calls } = fakeFetch({
+    [childUrl('notebooks', 'nb-1', 'sections')]: () =>
+      json({ value: [{ id: 's-1', displayName: 'Daily todo' }] }),
+    [childUrl('sectionGroups', encoded, 'sectionGroups')]: () =>
+      json({ value: [{ id: 'g-2', displayName: 'Week 1' }] }),
+  });
+  const client = new GraphStructure(tokens, fetchImpl);
+
+  assert.deepEqual(await client.listSections('notebooks', 'nb-1'), [
+    { id: 's-1', displayName: 'Daily todo' },
+  ]);
+  assert.deepEqual(await client.listSectionGroups('sectionGroups', groupId), [
+    { id: 'g-2', displayName: 'Week 1' },
+  ]);
+  assert.equal(calls.length, 2);
+  // The slash is the character that matters: raw, it would add a path segment and
+  // address a different resource.
+  assert.match(calls[1]?.url ?? '', /sectionGroups\/1-abc!def%2Fghi\/sectionGroups\?/);
+});
+
+test('listPagesInSection scopes to the section and sorts by last modified, newest first', async () => {
+  const url = pagesUrl('s-1', 50);
+  const { fetchImpl, calls } = fakeFetch({
+    [url]: () =>
+      json({
+        value: [
+          { id: 'p-1', title: 'Fake page', lastModifiedDateTime: '2026-02-01T00:00:00Z' },
+          { id: 'p-2', title: '', lastModifiedDateTime: '2026-01-01T00:00:00Z' },
+        ],
+      }),
+  });
+
+  const pages = await new GraphStructure(tokens, fetchImpl).listPagesInSection('s-1');
+
+  assert.deepEqual(pages, [
+    { id: 'p-1', title: 'Fake page', lastModifiedDateTime: '2026-02-01T00:00:00Z' },
+    { id: 'p-2', title: '', lastModifiedDateTime: '2026-01-01T00:00:00Z' },
+  ]);
+  const requested = calls[0]?.url ?? '';
+  assert.match(requested, /\/sections\/s-1\/pages\?/);
+  assert.match(requested, /\$orderby=lastModifiedDateTime desc/);
+});
+
+test('listPagesInSection stops once top items are in hand', async () => {
+  const first = pagesUrl('s-1', 3);
+  const second = `${first}&$skiptoken=fake-cursor`;
+  const page = (id: string): Record<string, string> => ({
+    id,
+    title: `Fake ${id}`,
+    lastModifiedDateTime: '2026-02-01T00:00:00Z',
+  });
+  const { fetchImpl, calls } = fakeFetch({
+    [first]: () => json({ value: [page('p-1'), page('p-2')], '@odata.nextLink': second }),
+    [second]: () => json({ value: [page('p-3'), page('p-4')], '@odata.nextLink': `${second}&more` }),
+  });
+
+  const pages = await new GraphStructure(tokens, fetchImpl).listPagesInSection('s-1', 3);
+
+  assert.deepEqual(
+    pages.map((p) => p.id),
+    ['p-1', 'p-2', 'p-3'],
+  );
+  assert.equal(calls.length, 2, 'the third page must not be requested');
+});
+
+test('listPagesInSection rejects a top that is not a positive integer', async () => {
+  const { fetchImpl, calls } = fakeFetch({});
+  const client = new GraphStructure(tokens, fetchImpl);
+
+  for (const top of [0, -1, 1.5, Number.NaN]) {
+    assert.ok((await caught(client.listPagesInSection('s-1', top))) instanceof RangeError);
+  }
+  assert.equal(calls.length, 0);
+});
+
+test('getNotebookTree returns the full tree through a nested section group', async () => {
+  // The acceptance case from issue #11: a notebook whose section group contains a
+  // further section group. A walk that stopped one level down would miss s-3 entirely.
+  const empty = { value: [] };
+  const { fetchImpl } = fakeFetch({
+    [childUrl('notebooks', 'nb-1', 'sections')]: () =>
+      json({ value: [{ id: 's-1', displayName: 'Year overview' }] }),
+    [childUrl('notebooks', 'nb-1', 'sectionGroups')]: () =>
+      json({ value: [{ id: 'g-1', displayName: 'March' }] }),
+    [childUrl('sectionGroups', 'g-1', 'sections')]: () =>
+      json({ value: [{ id: 's-2', displayName: 'Monthly calendar' }] }),
+    [childUrl('sectionGroups', 'g-1', 'sectionGroups')]: () =>
+      json({ value: [{ id: 'g-2', displayName: 'Week 1' }] }),
+    [childUrl('sectionGroups', 'g-2', 'sections')]: () =>
+      json({ value: [{ id: 's-3', displayName: 'Daily todo' }] }),
+    [childUrl('sectionGroups', 'g-2', 'sectionGroups')]: () => json(empty),
+  });
+
+  const tree = await new GraphStructure(tokens, fetchImpl).getNotebookTree({
+    id: 'nb-1',
+    displayName: '2026',
+  });
+
+  assert.deepEqual(tree, {
+    id: 'nb-1',
+    displayName: '2026',
+    sections: [{ id: 's-1', displayName: 'Year overview' }],
+    sectionGroups: [
+      {
+        id: 'g-1',
+        displayName: 'March',
+        sections: [{ id: 's-2', displayName: 'Monthly calendar' }],
+        sectionGroups: [
+          {
+            id: 'g-2',
+            displayName: 'Week 1',
+            sections: [{ id: 's-3', displayName: 'Daily todo' }],
+            sectionGroups: [],
+          },
+        ],
+      },
+    ],
+  });
+});
+
+test('a section group that contains itself is abandoned rather than recursed forever', async () => {
+  const { fetchImpl, calls } = fakeFetch({
+    [childUrl('notebooks', 'nb-1', 'sections')]: () => json({ value: [] }),
+    [childUrl('notebooks', 'nb-1', 'sectionGroups')]: () =>
+      json({ value: [{ id: 'g-1', displayName: 'March' }] }),
+    [childUrl('sectionGroups', 'g-1', 'sections')]: () => json({ value: [] }),
+    [childUrl('sectionGroups', 'g-1', 'sectionGroups')]: () =>
+      json({ value: [{ id: 'g-1', displayName: 'March' }] }),
+  });
+
+  const err = await caught(
+    new GraphStructure(tokens, fetchImpl).getNotebookTree({ id: 'nb-1', displayName: '2026' }),
+  );
+
+  assert.ok(err instanceof GraphResponseError, `expected GraphResponseError, got ${String(err)}`);
+  assert.match(err.message, /nested deeper/);
+  assert.ok(calls.length < 100, `expected the walk to stop, made ${calls.length} requests`);
+});
+
+test('a collection body with no value array, or an unusable item, throws GraphResponseError', async () => {
+  const url = `${GRAPH_ROOT}/me/onenote/notebooks?${NODE_QUERY}`;
+  const bodies: unknown[] = [
+    { notValue: [] },
+    { value: [{ displayName: 'no id' }] },
+    { value: ['not an object'] },
+  ];
+
+  for (const body of bodies) {
+    const { fetchImpl } = fakeFetch({ [url]: () => json(body) });
+    const err = await caught(new GraphStructure(tokens, fetchImpl).listNotebooks());
+    assert.ok(err instanceof GraphResponseError, `expected GraphResponseError, got ${String(err)}`);
+  }
+});
+
+test('no module under src/ calls the account-wide page list', async () => {
+  // The hard constraint of issue #11. `/me/onenote/pages` (the collection) fails with
+  // error 20266 once the account has enough sections, and nothing at runtime can observe
+  // a call that is absent, so this is a source-text check like the device-code one in
+  // test/graph-auth.test.ts.
+  //
+  // `/me/onenote/pages/{id}/...` is a different endpoint and stays allowed: it addresses
+  // one page, and issue #12's content fetch needs it. So the pattern bans the path only
+  // when nothing follows the segment.
+  const banned = /\/me\/onenote\/pages(?![\w/])/;
+
+  const srcDir = path.join(import.meta.dirname, '..', 'src');
+  const files = (await readdir(srcDir)).filter((name) => name.endsWith('.ts'));
+  assert.ok(files.includes('graph-structure.ts'), 'expected to have scanned graph-structure.ts');
+
+  for (const name of files) {
+    const source = await readFile(path.join(srcDir, name), 'utf8');
+    const code = stripComments(source);
+    assert.doesNotMatch(
+      code,
+      banned,
+      `src/${name} must not call the account-wide /me/onenote/pages list; scope page listing to /sections/{id}/pages`,
+    );
+  }
+
+  // The stripper must not be what makes the check pass.
+  assert.match(stripComments("const url = 'https://graph.microsoft.com/v1.0/me/onenote/pages'"), banned);
+  assert.doesNotMatch(stripComments('// never call /me/onenote/pages'), banned);
+  assert.doesNotMatch(stripComments('/* never call /me/onenote/pages */'), banned);
+});
+
+/**
+ * Remove comments so a prose mention of the banned path is not read as a call site.
+ *
+ * `//` is only treated as a line comment when it is not preceded by a colon, so the
+ * `https://` inside a URL literal does not truncate the rest of its own line — which is
+ * the line a real violation would be on.
+ */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+}

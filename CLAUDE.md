@@ -26,6 +26,7 @@ onenote-mcp/
 │   ├── config.ts              # env-var schema, grouped validation, ConfigError
 │   ├── bootstrap.ts           # device-code CLI that seeds the Firestore token cache (issue #9)
 │   ├── graph-auth.ts          # Layer-2 Graph auth: silent token acquisition (issue #8)
+│   ├── graph-structure.ts     # Graph reads: notebooks, section groups, sections, pages (issue #11)
 │   ├── token-cache.ts         # Firestore-backed MSAL ICachePlugin (issue #7)
 │   └── version.ts             # SERVICE_NAME, VERSION
 │
@@ -33,6 +34,7 @@ onenote-mcp/
 │   ├── bootstrap.test.ts      # spawns the CLI; covers its refusals only
 │   ├── config.test.ts
 │   ├── graph-auth.test.ts     # drives acquireGraphToken through a fake client
+│   ├── graph-structure.test.ts # drives the client through a fake fetch; bans the account-wide page list
 │   ├── server.test.ts
 │   ├── token-cache.test.ts    # covers readCache only; see the note below
 │   └── version.test.ts
@@ -68,6 +70,15 @@ credential that could stand in for one may be committed. Verify them by running 
 device-code sign-in, and no credential that could seed one may be committed. Nothing
 verifies it until an operator runs `npm run bootstrap` and then the server against the
 same document.
+
+`test/graph-structure.test.ts` drives every call through a fake `fetch` whose routes
+are keyed by the exact URL, so an unrouted URL fails the test and each behavioural
+assertion is also an assertion about the URL that was built. What it cannot check is
+whether Graph accepts those URLs: the `$select`, `$orderby`, and `$top` strings are
+copied from the validated recon script in Appendix A, and nothing verifies them against
+the service until an operator runs the server against the real tenant. The paging and
+nesting fixtures are hand-written, because a page of Graph results large enough to carry
+an `@odata.nextLink` cannot be captured without real notebook names in it.
 
 `test/token-cache.test.ts` covers `readCache` and nothing else. `readCache` is a pure
 function over a document snapshot, so it runs without a backend. `beforeCacheAccess`,
@@ -193,6 +204,39 @@ the account's home tenant — the tenant because a device-code sign-in into the 
 directory succeeds with no error, and that line is the only thing that catches it. The
 CLI's own output therefore carries a tenant id and must not be pasted into an issue, a
 pull request, or a workflow log; it says so itself.
+
+**Never call the account-wide page list.** `GET /me/onenote/pages` fails with error
+20266, "maximum sections exceeded", once the account has enough sections across all
+notebooks — a notebook-per-year with a section-group-per-month reaches that. Page
+listing is always scoped to `/me/onenote/sections/{id}/pages`. A test in
+`test/graph-structure.test.ts` scans every file under `src/` for the path and fails on
+it; it strips comments first, so prose mentions are fine, and it bans the path only when
+no further segment follows it, because `/me/onenote/pages/{id}/content` is a different
+endpoint that the page-content work needs.
+
+**List calls follow `@odata.nextLink`.** Graph chooses its own page size and ignores a
+`$top` larger than it, so one response is never proof that a collection is complete.
+`collectValues` in `src/graph-structure.ts` follows the link verbatim — it carries
+Graph's own paging cursor and cannot be rebuilt from parts. `listPagesInSection` stops
+following once `top` items are in hand, so `top` is a result count and not a page size.
+Both walks have a bound: 50 followed links, and 20 levels of section-group nesting.
+Neither is a real structure Graph produces; each exists so a self-referencing response
+ends as one named error rather than as an unbounded loop.
+
+**Structure traversal recurses.** A notebook holds sections and section groups, and a
+section group holds further sections and section groups — the UI's "tab groups". Both
+container kinds expose the same two child relationship names, which is why
+`listSections` and `listSectionGroups` take a `containerKind` of `notebooks` or
+`sectionGroups` rather than existing twice. A walk that stopped at a notebook's direct
+children would miss most of this account's sections.
+
+**Graph read failures split into two error types.** `GraphRequestError` is a non-2xx
+response and carries the status and the body; error 20266 is only distinguishable from
+any other 400 by that body text. `GraphResponseError` is a 2xx whose body is not the
+shape the caller needs, or a listing that would not terminate. The split is about what a
+caller can do: a status can be retried or mapped, and a malformed body cannot. Neither
+message prints a notebook, section, or page name — those are user content, and this
+repository's output can reach a public log.
 
 **The server never signs in interactively.** `acquireTokenByDeviceCode` belongs to
 `src/bootstrap.ts` alone. The deployed service acquires silently from the Firestore
