@@ -11,6 +11,15 @@ import { createGraphAuthFor, createTools } from './tools.ts';
 import { SERVICE_NAME, VERSION } from './version.ts';
 
 /**
+ * Every path the health endpoint answers on.
+ *
+ * Exported because the fail-closed route test in test/server.test.ts enumerates what may
+ * answer without a bearer token, and a second health path added here has to show up
+ * there rather than be remembered.
+ */
+export const HEALTH_PATHS = ['/healthz', '/health'] as const;
+
+/**
  * Build the Express application without binding a port.
  *
  * Construction is separate from listening so tests can exercise routes on an ephemeral
@@ -33,9 +42,18 @@ export function createApp(config: Config): Application {
 
   // Deliberately reports no configuration. The service deploys with
   // --allow-unauthenticated, so anything this returns is public.
-  app.get('/healthz', (_req: Request, res: Response) => {
-    res.status(200).json({ status: 'ok', service: SERVICE_NAME, version: VERSION });
-  });
+  //
+  // Two paths, same handler. `/healthz` is the conventional name and is what Cloud Run's
+  // own probes use, which reach the container directly. It is not reachable from
+  // outside: measured 2026-08-19 against the deployed service, Google's frontend answers
+  // `https://<service>.run.app/healthz` with its own 404 page and the request never
+  // appears in the Cloud Run request log, while `/health`, `/healthz2` and `/Healthz`
+  // all arrive. So `/health` is the one an external check can call.
+  for (const path of HEALTH_PATHS) {
+    app.get(path, (_req: Request, res: Response) => {
+      res.status(200).json({ status: 'ok', service: SERVICE_NAME, version: VERSION });
+    });
+  }
 
   // Layer-1 OAuth discovery, /authorize and /token. Mounted at the root because
   // mcpAuthRouter builds its paths from the issuer URL rather than from a mount point,

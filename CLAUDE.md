@@ -276,9 +276,18 @@ the documented default in the `SPECS` table in `config.ts`.
 **`createApp()` does not listen.** Construction is separate from binding so tests can
 drive routes on an ephemeral port. Mount new routes there, not in `index.ts`.
 
-**`/healthz` reports no configuration.** The service deploys `--allow-unauthenticated`,
-so its response body is public. A test asserts no key or value in that body matches the
-stub config's secrets; do not add config echo to it.
+**The health endpoint answers on `/healthz` and on `/health`, and the second one is not
+redundant.** Measured against the deployed service on 2026-08-19: Google's frontend
+answers `https://<service>.run.app/healthz` with its own 404 page and the request never
+reaches Cloud Run — it appears in no request log — while `/health`, `/healthz2` and
+`/Healthz` all arrive. So `/healthz` works for Cloud Run's own probes, which reach the
+container directly, and `/health` is the only one an external check can call.
+`HEALTH_PATHS` in `src/server.ts` is exported so the fail-closed route test enumerates
+both rather than someone remembering to add the second.
+
+**The health response reports no configuration.** The service deploys
+`--allow-unauthenticated`, so its body is public. A test asserts no key or value in that
+body matches the stub config's secrets; do not add config echo to it.
 
 **The container's runtime base is Debian `-slim`, never Alpine.**
 `@resvg/resvg-js-linux-x64-gnu` declares `libc: ["glibc"]` and ships no musl prebuild.
@@ -655,7 +664,7 @@ anyone who finds the URL can spend the token endpoint's 50 requests — is state
 necessity.** The middleware is mounted in `createApp` between `MCP_PATH` and the router,
 with `resourceMetadataUrl` set to `protectedResourceMetadataUrl` — that option is what
 puts `resource_metadata=` in the 401's `WWW-Authenticate` header, and without it the 401
-is a dead end rather than a sign-in prompt. The exempt list is `/healthz`, both
+is a dead end rather than a sign-in prompt. The exempt list is both health paths, both
 `.well-known` documents, `/authorize`, `/consent` and `/token`: everything `mcpAuthRouter`
 mounts is reached by a client that holds no token yet. No `requiredScopes` is passed,
 because passing any makes the middleware enforce them and `offline_access` is about

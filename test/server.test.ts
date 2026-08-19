@@ -9,7 +9,7 @@ import type { Config } from '../src/config.ts';
 import { MCP_PATH } from '../src/mcp-server.ts';
 import { CONSENT_PATH } from '../src/oauth-provider.ts';
 import { AUTHORIZATION_SERVER_METADATA_PATH } from '../src/oauth-router.ts';
-import { createApp } from '../src/server.ts';
+import { createApp, HEALTH_PATHS } from '../src/server.ts';
 
 const STUB_CONFIG: Config = {
   graph: { clientId: 'client-id', authority: 'https://login.microsoftonline.com/common' },
@@ -38,23 +38,29 @@ async function get(path: string): Promise<Response> {
   return fetch(`http://127.0.0.1:${port}${path}`);
 }
 
-test('GET /healthz returns 200 with the service identity', async () => {
-  const res = await get('/healthz');
-  assert.equal(res.status, 200);
+// Both paths, not just /healthz. Google's frontend answers `<service>.run.app/healthz`
+// with its own 404 and the request never reaches the container — measured against the
+// deployed service on 2026-08-19 — so /health is the only one an external check can use,
+// and it has to answer the same thing rather than merely exist.
+for (const path of HEALTH_PATHS) {
+  test(`GET ${path} returns 200 with the service identity`, async () => {
+    const res = await get(path);
+    assert.equal(res.status, 200);
 
-  const body = (await res.json()) as Record<string, unknown>;
-  assert.equal(body['status'], 'ok');
-  assert.equal(body['service'], 'onenote-mcp');
-  assert.match(String(body['version']), /^\d+\.\d+\.\d+$/);
-});
+    const body = (await res.json()) as Record<string, unknown>;
+    assert.equal(body['status'], 'ok');
+    assert.equal(body['service'], 'onenote-mcp');
+    assert.match(String(body['version']), /^\d+\.\d+\.\d+$/);
+  });
+}
 
 test('GET / returns 404 — no catch-all is exposed', async () => {
   const res = await get('/');
   assert.equal(res.status, 404);
 });
 
-test('/healthz leaks no configuration', async () => {
-  const body = (await (await get('/healthz')).json()) as Record<string, unknown>;
+test('the health response leaks no configuration', async () => {
+  const body = (await (await get('/health')).json()) as Record<string, unknown>;
 
   // The service deploys with --allow-unauthenticated, so this response is public.
   // Guards against a later phase adding config echo to the health endpoint.
@@ -218,8 +224,9 @@ test('the 401 repeats nothing of the token it refused', async () => {
  * client reaches those URLs precisely because it does not hold a token yet.
  */
 const EXEMPT_PATHS = new Set([
-  // Cloud Run's health check. Reports no configuration — see the test above.
-  '/healthz',
+  // The health endpoint, on both of its paths. Reports no configuration — see the test
+  // above.
+  ...HEALTH_PATHS,
   // Discovery. Read before a client holds anything.
   AUTHORIZATION_SERVER_METADATA_PATH,
   `/.well-known/oauth-protected-resource${MCP_PATH}`,

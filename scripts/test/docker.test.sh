@@ -120,7 +120,7 @@ else
   printf '%s\n' "$render_out" | sed 's/^/       /'
 fi
 
-echo "== container startup and /healthz =="
+echo "== container startup and the health endpoint =="
 
 # Port 0 on the host: the daemon picks a free one, so a busy host port cannot make
 # this flaky. The container side is CONTAINER_PORT, passed in as PORT.
@@ -167,6 +167,22 @@ else
       fail "/healthz body reports status ok"
       sed 's/^/       /' "$body"
     fi
+
+    # The alias, checked in the image rather than only in the unit test. It is the
+    # path an external check has to use: Google's frontend swallows /healthz on a
+    # run.app URL, so a build that served only /healthz would look healthy here and
+    # be unmonitorable once deployed.
+    alias_body=$(mktemp)
+    alias_code=$(curl -s -o "$alias_body" -w '%{http_code}' \
+      "http://127.0.0.1:$hostport/health" 2>/dev/null)
+    if [[ "$alias_code" == "200" ]] && grep -q '"status":"ok"' "$alias_body"; then
+      pass "/health answers the same 200"
+    else
+      fail "/health answers the same 200"
+      printf '       status code: %s\n' "${alias_code:-none}"
+      sed 's/^/       /' "$alias_body"
+    fi
+    rm -f "$alias_body"
 
     # No Firestore or Graph variable was set, so a 200 here also shows the
     # endpoint reaches neither.

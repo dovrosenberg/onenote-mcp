@@ -282,7 +282,7 @@ duration, the JSON-RPC method, and the tool name on a `tools/call`. Never the qu
 string, the headers, the arguments, or the result — see `src/logging.ts`.
 
 `/mcp` is closed behind a bearer token — see [Bearer tokens on the MCP
-endpoint](#bearer-tokens-on-the-mcp-endpoint). `/healthz` stays open.
+endpoint](#bearer-tokens-on-the-mcp-endpoint). The health endpoint stays open.
 
 ## OAuth discovery
 
@@ -377,7 +377,8 @@ in the query string is not honoured — the MCP authorization spec forbids it, a
 
 Which routes are open is the exempt list, and it is longer than "everything except
 `/mcp`" because the whole authorization flow has to answer callers who hold no token yet:
-`/healthz`, both `.well-known` documents, `/authorize`, `/consent`, and `/token`. A test
+`/healthz` and `/health`, both `.well-known` documents, `/authorize`, `/consent`, and
+`/token`. A test
 in `test/server.test.ts` enumerates the routes `createApp` actually registers and asserts
 that every one not on that list answers 401 without a token, so a route added later is
 closed unless someone opens it deliberately.
@@ -625,8 +626,15 @@ docker run --rm -p 8080:8080 \
   -e MCP_PUBLIC_URL=https://onenote-mcp.example.run.app \
   onenote-mcp
 
-curl -i localhost:8080/healthz    # 200, {"status":"ok",...}
+curl -i localhost:8080/health     # 200, {"status":"ok",...}
 ```
+
+`/healthz` answers the same thing and is what Cloud Run's own probes use. Do not call it
+from outside: Google's frontend answers `https://<service>.run.app/healthz` with its own
+404 page and the request never reaches the container, so an external uptime check has to
+use `/health`. Measured against the deployed service on 2026-08-19 — `/health`,
+`/healthz2` and even `/Healthz` all arrive, and only the exact lowercase `/healthz` is
+swallowed.
 
 Those values are placeholders that are only well-formed enough to pass startup
 validation; they authenticate against nothing. On Cloud Run, `PORT` is supplied by the
