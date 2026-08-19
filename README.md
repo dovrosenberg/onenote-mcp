@@ -288,17 +288,108 @@ no redirect and no code minted.
 days. Both are an HMAC-SHA256 over a compact payload under `MCP_TOKEN_SIGNING_KEY` and
 nothing else — no store is consulted to verify one, which is what keeps a Cloud Run
 revision replacement from forcing a reconnect. The payload carries the audience, which is
-`MCP_PUBLIC_URL` plus `/mcp`, so a token is good for this MCP endpoint and no other.
-Each refresh also returns a new refresh token with a fresh 30-day expiry, so the 30 days
-bound how long the connector may sit unused rather than how long it may stay connected —
-Claude refreshes on its own, and a connector in regular use never goes back to the consent
-screen. The refresh token it replaces keeps working until its own expiry: a stateless
-token has no record to mark as spent, so this is a sliding window and not rotation in the
-security sense. Rotation is required for public clients, and the configured client secret
-makes this a confidential one. There is no revocation
-endpoint for the same reason — **changing `MCP_TOKEN_SIGNING_KEY` and redeploying
-invalidates every outstanding access token, refresh token and open consent page at
-once**, which is the lever if a credential ever needs cutting off.
+`MCP_PUBLIC_URL` plus `/mcp`, so a token is good for this MCP endpoint and no other. How
+long those tokens live, and how to make a human approve more often, is the next section.
+
+## Token lifetime and forcing revalidation
+
+This server is built to run unattended. The default settings reflect that, and they trade
+away some ability to cut off a leaked credential. Read this before deploying it somewhere
+that matters, and change the numbers if the trade is wrong for you.
+
+### What the defaults do
+
+| Token | Lifetime | What renews it |
+|---|---|---|
+| Access token | 1 hour | The refresh token, automatically |
+| Refresh token | 30 days | Every refresh mints a new one with a fresh 30 days |
+| Consent form | 10 minutes | Nothing; a stale form is refused and the flow restarts |
+
+Claude refreshes on its own — proactively before the hour is up, and reactively on a 401.
+So a human clicks Approve when the connector is first added, and then only if the
+connector goes unused for 30 days. That is the sliding window: the 30 days bound how long
+the connection may sit **idle**, not how long it may live.
+
+### Why sliding, and what it costs
+
+Every token this server issues is stateless. It is a signed payload and nothing more — no
+database row, no session record, nothing to look up when it comes back. That is what makes
+a Cloud Run revision replacement invisible: the new instance verifies a token the old
+instance issued, with no shared state between them. A token store would mean a reconnect on
+every deploy.
+
+The cost is that **nothing can be revoked individually**. There is no revocation endpoint
+because there is nothing for it to delete. Specifically:
+
+- A refresh token that leaks grants access for up to 30 days, and each use extends its
+  holder's access by another 30. There is no server-side record to invalidate, and no way
+  to tell a stolen refresh token from the legitimate one — both are the same bytes signed
+  by the same key.
+- Sliding the window is **not** rotation. When a refresh mints a new refresh token, the
+  one it replaces keeps working until the expiry stamped inside it. Real rotation means
+  marking the old token spent, which needs the store this design does not have.
+- An access token cannot be cut off inside its hour, for the same reason.
+
+What is left is one blunt lever, and it works immediately: **change
+`MCP_TOKEN_SIGNING_KEY` and redeploy.** Every access token, every refresh token and every
+open consent page is invalidated at once, because all of them are verified against that
+key. The next Claude request gets a 401 and the operator clicks Approve once. Rotating the
+key on a schedule is a reasonable policy on its own.
+
+The consent screen, for what it is worth, authenticates nobody — it has one button and no
+password. What stands between a stranger and your notebooks is `MCP_OAUTH_CLIENT_SECRET`,
+which `POST /token` requires, the redirect-URI allowlist that sends every authorization
+code to `claude.ai` or to loopback, and PKCE binding the code to the client that started
+the flow.
+
+### Making a human approve more often
+
+Each of these is a source change, not a configuration value. That is deliberate: an
+operator who shortens the window is changing the security posture of the deployment, and
+that belongs in a commit somebody can read rather than in an environment variable somebody
+can forget.
+
+**Shorten the idle window.** In `src/oauth-provider.ts`:
+
+```ts
+const REFRESH_TOKEN_TTL_S = 30 * 24 * 60 * 60;   // 30 days
+const REFRESH_TOKEN_TTL_S = 7 * 24 * 60 * 60;    // a week
+```
+
+Unused for that long, the connector needs a click. Used regularly, it still never asks —
+the window keeps sliding forward. This bounds how long a leaked refresh token survives
+after the leak stops being used, and nothing more.
+
+**Stop the window sliding.** This is what issue #22 originally specified, and it caps the
+total life of a connection rather than its idle time: a human approves every 30 days no
+matter how busy the connector is. One line in `exchangeRefreshToken`, in
+`src/oauth-provider.ts`:
+
+```ts
+// Sliding: a new refresh token, 30 days from now.
+return issueTokens(client.client_id, requested, mintRefreshToken(client.client_id, granted));
+
+// Fixed: hand back the same token, expiring 30 days after the consent click.
+return issueTokens(client.client_id, requested, refreshToken);
+```
+
+**Refuse to issue refresh tokens at all.** The strictest setting: a human approves every
+hour, because an expired access token has nothing to renew it. Two edits, both needed —
+the metadata switch alone does not stop the token being issued.
+
+1. In `src/oauth-router.ts`, empty `SCOPES_SUPPORTED`. Claude appends `offline_access` to
+   an authorization request only when the metadata advertises it, and that is the switch
+   deciding whether it asks for a refresh token.
+2. In `src/oauth-provider.ts`, drop the `refresh_token` field from what `issueTokens`
+   returns. It is issued today regardless of the scopes requested.
+
+Expect this one to be visible in use: Claude sends the browser back to the consent screen
+mid-session when the hour runs out.
+
+**Shorten the access token.** `ACCESS_TOKEN_TTL_S` in `src/oauth-provider.ts` narrows the
+window in which a leaked *access* token works. It costs a token request per expiry and no
+human involvement at all, so it is cheap — but it does nothing about a leaked refresh
+token, which is the credential worth worrying about.
 
 ## Bootstrap
 
