@@ -91,6 +91,75 @@ The separator inside one clause carrying both `$select` and `$expand` is a **sem
 `$select` inside every expand clause is worth 5.7x — 441 KB without it, 78 KB with it, for
 the same tree.
 
+**Measured 2026-08-19.** `lastModifiedDateTime` is returned inside an `$expand` clause,
+and at the top level, on every entity asked for:
+
+```
+GET /me/onenote/notebooks?$select=id,displayName,lastModifiedDateTime
+    &$expand=sections($select=id,displayName,lastModifiedDateTime),
+             sectionGroups($select=id,displayName;$expand=sections($select=id,displayName,lastModifiedDateTime))
+```
+
+55 of 55 notebooks and 568 of 568 sections carried the field. The account has grown since
+the 78 KB measurement above; the same tree is 111,615 bytes with the timestamps added and
+79,660 bytes without them, so the field costs about 40%.
+
+**Measured 2026-08-19, and this is an availability property, not a syntax one.**
+`$expand` on `/notebooks` returned `500` with code `19999` — *"Something failed, the API
+cannot share any more information at the time of the request"* — continuously for about
+seven minutes, then recovered on its own with no change to the request:
+
+| Request | During the window |
+|---|---|
+| `/notebooks?$select=id,displayName` | **200** |
+| `/notebooks?$select=id,displayName,lastModifiedDateTime` | **200** |
+| `/notebooks?$expand=sections($select=id,displayName)` | 500, 19999 |
+| `/notebooks?$expand=sectionGroups($select=id,displayName)` | 500, 19999 |
+| the full `getExpandedTree()` URL, unchanged | 500, 19999 |
+
+18 attempts spanning 19:34:53Z to 19:40:45Z all failed; 19:41:35Z answered 200. So any
+`$expand` on the notebooks collection can be unavailable for minutes at a time while
+un-expanded calls on the same collection succeed. `src/graph-throttle.ts` retries only
+`429` and `503`, so a `500` here is not retried and aborts whatever asked for it — which
+is `search_pages`, `find_page_by_name`, `list_pages_by_name`, `create_page_by_name` and
+`append_to_page_by_name`, all of which go through `getExpandedTree()`.
+
+## `lastModifiedDateTime` on a section rolls up from its pages
+
+**Measured 2026-08-19**, against a section in a scratch notebook, reading
+`/me/onenote/sections/{id}?$select=id,lastModifiedDateTime` between each step:
+
+| Step | Section `lastModifiedDateTime` |
+|---|---|
+| before | `2026-08-19T14:38:36Z` |
+| after `POST /sections/{id}/pages` (201) | `2026-08-19T19:32:39Z` |
+| after `PATCH /pages/{id}/content` (204) | `2026-08-19T19:32:48Z` |
+| after `DELETE /pages/{id}` (204) | `2026-08-19T19:32:57Z` |
+
+So creating, editing **and deleting** a page all move the parent section's timestamp.
+Microsoft documents the field on `onenoteSection` without saying it rolls up; it does.
+
+The control matters, because the three deltas above track wall clock and would look the
+same if the field simply reported "now". It does not: three reads of the same section 20
+seconds apart with no write of any kind in between all returned `2026-08-19T19:32:57Z`
+unchanged. The field moves on a write and only on a write.
+
+A re-read of the deleted page answered `404`.
+
+## `$filter` on a datetime
+
+**Measured 2026-08-19.** Unquoted ISO-8601 UTC is accepted on a section's pages:
+
+```
+GET /me/onenote/sections/{id}/pages?$select=id,title,lastModifiedDateTime&$top=100
+    &$filter=lastModifiedDateTime ge 2026-05-21T19:32:31Z
+```
+
+200, and the filter is applied. The unfiltered control on the same section confirmed the
+documented default sort — `lastModifiedTime desc` — holds in practice, so a client-side
+cutoff on the first page of results costs the same one request and is a working fallback
+if this filter ever stops being accepted.
+
 ## Case sensitivity in `$filter`
 
 The doc says property names and string comparisons are case-sensitive, and recommends
