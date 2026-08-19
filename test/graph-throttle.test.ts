@@ -165,6 +165,85 @@ test('a throttled request gives up its slot while it waits', async () => {
   assert.equal(started, 3);
 });
 
+// The 500 rule is narrow on purpose, so these four cases are the specification of it.
+// Measured 2026-08-19 and recorded in api-overview.md: every `$expand` on /notebooks
+// answered 500 with code 19999 for seven minutes across 18 attempts and then recovered
+// untouched, while un-expanded calls on the same collection answered 200 throughout. A
+// 500 that is not 19999 is a real server error and is not retried, and no 500 is retried
+// on a method other than GET — PATCH /pages/{id}/content is not safe to repeat blindly.
+
+const TRANSIENT_500 = JSON.stringify({
+  error: { code: '19999', message: 'Something failed, the API cannot share any more information at the time of the request.' },
+});
+
+test('a 500 with OData code 19999 on a GET is retried, because it recovers on its own', async () => {
+  const clock = fakeClock();
+  const gate = createGate({ maxConcurrent: 2, minIntervalMs: 0, ...clock });
+
+  let attempts = 0;
+  const result = await gate.run(() => {
+    attempts += 1;
+    if (attempts < 3) {
+      return Promise.reject(
+        Object.assign(new Error('server error'), {
+          status: 500,
+          method: 'GET',
+          body: TRANSIENT_500,
+        }),
+      );
+    }
+    return Promise.resolve('the tree');
+  });
+
+  assert.equal(result, 'the tree');
+  assert.equal(attempts, 3);
+  assert.deepEqual(clock.slept, [2_000, 4_000]);
+});
+
+test('a 500 that is not 19999 is not retried', async () => {
+  const clock = fakeClock();
+  const gate = createGate({ maxConcurrent: 2, minIntervalMs: 0, ...clock });
+
+  let attempts = 0;
+  await assert.rejects(() =>
+    gate.run(() => {
+      attempts += 1;
+      return Promise.reject(
+        Object.assign(new Error('server error'), {
+          status: 500,
+          method: 'GET',
+          body: JSON.stringify({ error: { code: '20001', message: 'something else' } }),
+        }),
+      );
+    }),
+  );
+
+  assert.equal(attempts, 1);
+  assert.deepEqual(clock.slept, []);
+});
+
+test('a 500/19999 on a write is not retried, because repeating a PATCH is not safe', async () => {
+  const clock = fakeClock();
+  const gate = createGate({ maxConcurrent: 2, minIntervalMs: 0, ...clock });
+
+  let attempts = 0;
+  await assert.rejects(() =>
+    gate.run(() => {
+      attempts += 1;
+      return Promise.reject(
+        Object.assign(new Error('server error'), {
+          status: 500,
+          method: 'PATCH',
+          body: TRANSIENT_500,
+        }),
+      );
+    }),
+  );
+
+  assert.equal(attempts, 1);
+  assert.deepEqual(clock.slept, []);
+});
+
 test('retryWait covers what the gate decides', () => {
   assert.equal(retryWait({ status: 429 }, 0, 3, 1_000), 1_000);
   assert.equal(retryWait({ status: 503 }, 2, 3, 1_000), 4_000);
@@ -172,6 +251,19 @@ test('retryWait covers what the gate decides', () => {
   assert.equal(retryWait({ status: 429 }, 3, 3, 1_000), null, 'attempts are capped');
   assert.equal(retryWait({ status: 404 }, 0, 3, 1_000), null);
   assert.equal(retryWait(new Error('network'), 0, 3, 1_000), null);
+
+  const transient = { status: 500, method: 'GET', body: TRANSIENT_500 };
+  assert.equal(retryWait(transient, 0, 3, 1_000), 1_000);
+  assert.equal(retryWait(transient, 2, 3, 1_000), 4_000);
+  assert.equal(retryWait(transient, 3, 3, 1_000), null, 'attempts are capped');
+  // A GraphRequestError built without a method defaults to GET, so an absent method is
+  // a read rather than an unknown.
+  assert.equal(retryWait({ status: 500, body: TRANSIENT_500 }, 0, 3, 1_000), 1_000);
+  assert.equal(retryWait({ ...transient, method: 'POST' }, 0, 3, 1_000), null);
+  assert.equal(retryWait({ status: 500, method: 'GET', body: 'not json' }, 0, 3, 1_000), null);
+  assert.equal(retryWait({ status: 500, method: 'GET' }, 0, 3, 1_000), null);
+  // Retry-After has no meaning on a 500 here; the doubling backoff is what applies.
+  assert.equal(retryWait({ ...transient, retryAfterMs: 250 }, 0, 3, 1_000), 1_000);
 });
 
 test('Retry-After is read as seconds or as an HTTP date', () => {

@@ -6,10 +6,22 @@
 // below caps concurrency and spaces request starts, and it is the thing that 
 // makes a walk survive rather than any retry.
 //
-// Retrying is the second half. Only 429 and 503 are retried: a 400 or a 404 means the
+// Retrying is the second half. 429 and 503 are retried: a 400 or a 404 means the
 // request itself is wrong, and repeating it spends quota to fail again — that is the
 // second best practice in Microsoft's own throttling guidance. `Retry-After` is honoured
 // when Graph sends one, and a doubling backoff is used when it does not.
+//
+// One 500 is retried, and the rule around it is deliberately narrow. Measured 2026-08-19
+// and recorded in api-overview.md: every `$expand` on /me/onenote/notebooks answered 500
+// with OData code 19999 for seven minutes across 18 attempts, then recovered with no
+// change to the request, while un-expanded calls on the same collection answered 200
+// throughout. That is a transient service fault rather than a wrong request, and without
+// a retry it takes down search_pages, find_page_by_name, list_pages_by_name,
+// create_page_by_name and append_to_page_by_name, all of which go through
+// getExpandedTree(). So a 500 is retried only when the body carries code 19999 and only
+// on a GET — 19999 is the code the service uses when it will not say what went wrong, so
+// it can also mean something permanent, and PATCH /pages/{id}/content is not safe to
+// repeat blindly.
 //
 // The gate is injected rather than global so a test can run without waiting: the
 // `createGraph*` factories pass PRODUCTION_GATE, and a bare constructor gets UNGATED.
@@ -24,7 +36,21 @@ export interface RetryableError {
   readonly status?: number;
   /** From the `Retry-After` header, already in milliseconds. */
   readonly retryAfterMs?: number;
+  /** The response body, read for the OData code on a 500. */
+  readonly body?: string;
+  /** The HTTP verb. Absent means GET, which is what `GraphRequestError` defaults to. */
+  readonly method?: string;
 }
+
+/**
+ * The OData code Graph returns when it will not say what went wrong.
+ *
+ * "Something failed, the API cannot share any more information at the time of the
+ * request." It covers both the transient `$expand` fault above and permanent ones — an
+ * account-wide `/sections` request with no `$filter` answers 500/19999 every time — which
+ * is why the retry is capped rather than open-ended.
+ */
+export const OPAQUE_SERVER_ERROR_CODE = '19999';
 
 export interface GateOptions {
   /** At most this many requests in flight. The documented limit is 5. */
@@ -122,13 +148,42 @@ export function retryWait(
 ): number | null {
   if (attempt >= maxRetries) return null;
 
-  const status = (err as RetryableError).status;
+  const failure = err as RetryableError;
+  const status = failure.status;
+
+  if (status === 500) {
+    // No Retry-After branch: the service sends none on this, and the doubling backoff is
+    // what carried a request through the seven-minute window that motivated the rule.
+    return isTransientServerError(failure) ? baseBackoffMs * 2 ** attempt : null;
+  }
+
   if (status !== 429 && status !== 503) return null;
 
-  const retryAfterMs = (err as RetryableError).retryAfterMs;
+  const retryAfterMs = failure.retryAfterMs;
   if (typeof retryAfterMs === 'number' && retryAfterMs > 0) return retryAfterMs;
 
   return baseBackoffMs * 2 ** attempt;
+}
+
+/**
+ * True for the one 500 worth repeating: OData code 19999, on a read.
+ *
+ * A body that is not JSON, or is JSON of another shape, answers false — an unrecognised
+ * 500 is left alone rather than guessed at.
+ */
+function isTransientServerError(failure: RetryableError): boolean {
+  const method = failure.method ?? 'GET';
+  if (method !== 'GET') return false;
+
+  const body = failure.body;
+  if (body === undefined) return false;
+
+  try {
+    const parsed = JSON.parse(body) as { error?: { code?: unknown } };
+    return parsed.error?.code === OPAQUE_SERVER_ERROR_CODE;
+  } catch {
+    return false;
+  }
 }
 
 /** `Retry-After` in seconds, or an HTTP date, converted to milliseconds. */
