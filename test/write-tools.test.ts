@@ -160,18 +160,20 @@ test('an append to a page with ink below the text is pushed below the strokes', 
 
   assert.deepEqual(layout.reads, [PAGE_ID]);
   const sent = client.calls[0]?.[2] ?? '';
-  assert.equal((sent.match(/<br \/>/g) ?? []).length, 20);
+  assert.equal((sent.match(/<br \/>/g) ?? []).length, 18);
   assert.ok(
-    sent.endsWith(`<div data-id="${CLEARANCE_ID_PREFIX}490"><p>appended</p></div>`),
+    sent.endsWith(`<div data-id="${CLEARANCE_ID_PREFIX}478"><p>appended</p></div>`),
     "the caller's fragment goes last, unchanged, inside the marker",
   );
 
   const clearance = payload(result)['inkClearance'] as Record<string, unknown>;
   assert.deepEqual(clearance, {
-    blankLines: 20,
+    blankLines: 18,
     inkBottomPx: 466,
-    measuredFromPx: 120,
-    contentStartsAtPx: 490,
+    // The outline holds one paragraph, so the text is estimated to end 16px below its
+    // top and the padding is measured from there rather than from the top itself.
+    measuredFromPx: 136,
+    contentStartsAtPx: 478,
     clearsTheInk: true,
   });
 });

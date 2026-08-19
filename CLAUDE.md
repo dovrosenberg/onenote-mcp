@@ -419,15 +419,21 @@ outline's `top` and the ink's bounding box and decides how many breaks go in fro
 caller's fragment; `append_to_page` pays one extra Graph read per call for it, and the
 result JSON reports the padding rather than hiding it.
 
-**The padding is measured from the outline's top, and marked so it happens once.** No
-endpoint reports an outline's rendered height, so where its text currently ends is
-unknown; measuring from the top clears the ink whatever the height is, at the cost of a
-gap. The fragment is wrapped in `<div data-id="ink-clearance-{px}">`, recording the page
+**The padding is measured from an estimate of where the text ends, and marked so it
+happens once.** No endpoint reports an outline's rendered height, so `estimateContentHeight`
+counts block elements at deliberately low heights — `p`, `li` and `br` at 16px, `h1` at
+24px, `tr` at 18px — plus the declared `height` of any `img`, which is the case a block
+count gets worst. Every constant is chosen low on purpose: an estimate that is too small
+pads a little too much, and one that is too large puts the new text back on the
+handwriting. Wrapping is not modelled, which errs the same safe way. Measured against the
+live page on 2026-08-19: 136px estimated where the real content was about 174px, so the
+padding ran two blank lines long. The deeper of the estimate and the marker wins, so a
+page whose content wraps is not padded twice. The fragment is wrapped in `<div data-id="ink-clearance-{px}">`, recording the page
 position the content was brought down to — not the ink bottom, which reads as new ink on
 the next call over rounding, and not on the padding itself, because the service discards a
-`data-id` from an element holding only line breaks. `LINE_HEIGHT_PX = 19` is a chosen
-number: nothing in the API reports a line height, and only looking at the page in OneNote
-can confirm it.
+`data-id` from an element holding only line breaks. `LINE_HEIGHT_PX = 19` and
+`INK_CLEARANCE_MARGIN_PX = 12` are chosen numbers: nothing in the API reports a line
+height, and only looking at the page in OneNote can confirm them.
 
 **A page created here has one outline, deliberately.** `createPageHtml` omits
 `data-absolute-enabled` from `<body>`, so Graph wraps the submission in a single

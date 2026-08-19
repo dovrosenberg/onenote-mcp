@@ -45,7 +45,43 @@ import type { InkBox } from './ink.ts';
 export const LINE_HEIGHT_PX = 19;
 
 /** How far below the lowest stroke the appended text starts. */
-export const INK_CLEARANCE_MARGIN_PX = 24;
+export const INK_CLEARANCE_MARGIN_PX = 12;
+
+/**
+ * What one block element is assumed to occupy, in px, when the text height is estimated.
+ *
+ * Deliberately under-estimates. Nothing reports an outline's rendered height, so the
+ * height of the text already in it is guessed from how many blocks it holds, and a guess
+ * that is too small pads a little too much while one that is too large puts the new text
+ * back on the handwriting. Wrapping is ignored for the same reason: a paragraph that
+ * wraps to three lines is counted as one, which errs towards a gap.
+ */
+const BLOCK_HEIGHT_PX: Readonly<Record<string, number>> = {
+  p: 16,
+  li: 16,
+  br: 16,
+  tr: 18,
+  h1: 24,
+  h2: 22,
+  h3: 20,
+  h4: 20,
+  h5: 20,
+  h6: 20,
+};
+
+/**
+ * Elements whose own `height` attribute is the height, and what to assume without one.
+ *
+ * These are the case the block table gets badly wrong. Graph returns `width` and `height`
+ * on an `img` in output HTML, and an image is hundreds of px tall where a paragraph is
+ * sixteen — counting one as nothing puts the estimate an entire screen too high and the
+ * padding an entire screen too long.
+ */
+const MEASURED_ELEMENTS: Readonly<Record<string, number>> = {
+  img: 100,
+  object: 60,
+  iframe: 200,
+};
 
 /** The width Graph gives an outline when the input HTML names none. */
 export const DEFAULT_OUTLINE_WIDTH_PX = 624;
@@ -72,6 +108,8 @@ export interface Outline {
   readonly top: number;
   /** Null when the div declares none; Graph's own default applies then. */
   readonly width: number | null;
+  /** The div's inner HTML, which is what `estimateContentHeight` measures. */
+  readonly content: string;
 }
 
 /** What an append has to do about the ink, and why. */
@@ -129,6 +167,9 @@ export function parseOutlines(html: string): Outline[] {
   // outline entirely. A close tag pops to the matching name, and one that matches nothing
   // open is ignored.
   const open: string[] = [];
+  // Where the outline currently being scanned starts, so its inner HTML can be sliced out
+  // when its div closes. -1 when the scan is between outlines.
+  let contentStart = -1;
 
   for (const match of body.matchAll(TAG_OR_COMMENT)) {
     const tag = match[0];
@@ -138,6 +179,13 @@ export function parseOutlines(html: string): Outline[] {
     if (tag.startsWith('</')) {
       const at = open.lastIndexOf(name);
       if (at !== -1) open.length = at;
+      if (open.length === 0 && contentStart !== -1) {
+        outlines[outlines.length - 1] = {
+          ...(outlines[outlines.length - 1] as Outline),
+          content: body.slice(contentStart, match.index),
+        };
+        contentStart = -1;
+      }
       continue;
     }
 
@@ -150,10 +198,20 @@ export function parseOutlines(html: string): Outline[] {
         left: pixels(style, 'left') ?? 0,
         top: pixels(style, 'top') ?? 0,
         width: pixels(style, 'width'),
+        content: '',
       });
+      contentStart = match.index + tag.length;
     }
 
     if (!VOID_ELEMENTS.has(name) && !tag.endsWith('/>')) open.push(name);
+  }
+
+  // An outline whose div was never closed still holds everything after it.
+  if (contentStart !== -1 && outlines.length > 0) {
+    outlines[outlines.length - 1] = {
+      ...(outlines[outlines.length - 1] as Outline),
+      content: body.slice(contentStart),
+    };
   }
 
   return outlines;
@@ -178,6 +236,42 @@ export function clearedTo(html: string): number | null {
 }
 
 /**
+ * Roughly how tall an outline's content renders, in px.
+ *
+ * This is the number that decides how big the gap above appended text is. Measuring from
+ * the outline's top instead — the only thing Graph actually reports — leaves a gap the
+ * size of everything already on the outline, which on a page with a few paragraphs of
+ * notes is most of a screen.
+ *
+ * It counts block elements and the declared height of images, and nothing else: no font
+ * metrics, no wrapping, no margins beyond what the per-element numbers absorb. Being wrong
+ * low costs some blank space; being wrong high puts text over the handwriting, so every
+ * constant here is chosen low. Measured against the live page on 2026-08-19: the estimate
+ * came out 136px for content whose real height was about 174px — two blank lines of
+ * over-padding, on the safe side.
+ */
+export function estimateContentHeight(content: string): number {
+  let height = 0;
+
+  for (const match of content.matchAll(TAG_OR_COMMENT)) {
+    const tag = match[0];
+    if (tag.startsWith('<!--') || tag.startsWith('</')) continue;
+
+    const name = (match[1] ?? '').toLowerCase();
+    const fallback = MEASURED_ELEMENTS[name];
+    if (fallback !== undefined) {
+      const declared = Number(attributeValue(match[2] ?? '', 'height'));
+      height += Number.isFinite(declared) && declared > 0 ? declared : fallback;
+      continue;
+    }
+
+    height += BLOCK_HEIGHT_PX[name] ?? 0;
+  }
+
+  return height;
+}
+
+/**
  * How much padding an append to `outline` needs, or null when it needs none.
  *
  * Null is the normal answer: a page with no ink, ink that sits beside the outline's
@@ -195,10 +289,12 @@ export function planInkClearance(
   const right = outline.left + (outline.width ?? DEFAULT_OUTLINE_WIDTH_PX);
   if (ink.right <= outline.left || ink.left >= right) return null;
 
-  // With no marker the only thing known about the text is where the outline starts, so
-  // the padding is measured from there. That clears the ink whatever the text height is,
-  // at the cost of a gap the size of the text already in the outline.
-  const clearedFrom = alreadyCleared ?? outline.top;
+  // Two signals for where the text in this outline currently ends, and the deeper one
+  // wins. The estimate is the one that keeps the gap small; the marker is what a previous
+  // append recorded, and it covers the case where the estimate reads low because the
+  // content wraps. Neither is measured — nothing in the API reports a rendered height.
+  const estimated = outline.top + estimateContentHeight(outline.content);
+  const clearedFrom = Math.max(estimated, alreadyCleared ?? 0);
   if (ink.bottom <= clearedFrom) return null;
 
   const wanted = Math.ceil((ink.bottom + INK_CLEARANCE_MARGIN_PX - clearedFrom) / LINE_HEIGHT_PX);
