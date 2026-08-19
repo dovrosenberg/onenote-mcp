@@ -20,6 +20,22 @@ import {
   parseRetryAfter,
   type RequestGate,
 } from './graph-throttle.ts';
+// Decoding lives in ./graph-decode.ts. That module imports GraphResponseError and the
+// result types from here, so the dependency runs one way and this file keeps the URLs,
+// the requests and the error types.
+import {
+  asRecord,
+  describeError,
+  mapWithLimit,
+  quoteOData,
+  safeText,
+  toExpandedNotebook,
+  toNode,
+  toNodeArray,
+  toPageSummary,
+  toSectionWithParents,
+  truncate,
+} from './graph-decode.ts';
 
 export const GRAPH_ROOT = 'https://graph.microsoft.com/v1.0';
 
@@ -606,147 +622,4 @@ export const PRODUCTION_GATE: RequestGate = createGate();
 /** Build the client from the server's Graph auth, sharing the process-wide gate. */
 export function createGraphStructure(auth: GraphAuth): GraphStructure {
   return new GraphStructure(auth, globalThis.fetch, PRODUCTION_GATE);
-}
-
-function toNode(item: unknown, url: string): { id: string; displayName: string } {
-  const record = asRecord(item, url);
-  return {
-    id: requireString(record, 'id', url),
-    // A notebook or section can come back with a null displayName; an empty string is
-    // preferable to `undefined` reaching a caller that only formats it.
-    displayName: optionalString(record, 'displayName') ?? '',
-  };
-}
-
-/**
- * One notebook out of the expanded response.
- *
- * An absent `sections` or `sectionGroups` is read as empty rather than raised on: Graph
- * omits an expanded relationship that holds nothing, and a notebook with no section
- * groups is ordinary.
- */
-function toExpandedNotebook(item: unknown, url: string): ExpandedNotebook {
-  const record = asRecord(item, url);
-  return {
-    ...toNode(record, url),
-    sections: toNodeArray(record['sections'], url).map((node) => toNode(node, url)),
-    sectionGroups: toNodeArray(record['sectionGroups'], url).map((group) => {
-      const groupRecord = asRecord(group, url);
-      return {
-        ...toNode(groupRecord, url),
-        sections: toNodeArray(groupRecord['sections'], url).map((node) => toNode(node, url)),
-      };
-    }),
-  };
-}
-
-/** An expanded relationship: absent means empty, anything but an array is a fault. */
-function toNodeArray(value: unknown, url: string): unknown[] {
-  if (value === undefined || value === null) return [];
-  if (!Array.isArray(value)) {
-    throw new GraphResponseError(
-      `GET ${url} returned an expanded relationship that is not an array.`,
-      url,
-    );
-  }
-  return value;
-}
-
-/**
- * `Promise.all` with a ceiling on how many run at once, preserving input order.
- *
- * Written out rather than pulled in as a dependency because it is fifteen lines and the
- * thing it prevents — an unbounded fan-out against an API that allows five concurrent
- * requests — is the most expensive mistake this repository has made.
- */
-async function mapWithLimit<T, R>(
-  items: readonly T[],
-  limit: number,
-  run: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array<R>(items.length);
-  let cursor = 0;
-
-  const worker = async (): Promise<void> => {
-    for (;;) {
-      const index = cursor;
-      if (index >= items.length) return;
-      cursor += 1;
-      results[index] = await run(items[index] as T);
-    }
-  };
-
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
-  return results;
-}
-
-/** A single-quoted OData string literal; an embedded quote is doubled. */
-export function quoteOData(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
-function toSectionWithParents(item: unknown, url: string): SectionWithParents {
-  const record = asRecord(item, url);
-  const notebook = record['parentNotebook'];
-  const group = record['parentSectionGroup'];
-  return {
-    ...toNode(record, url),
-    // A section directly under a notebook has no parent section group, and Graph returns
-    // null rather than omitting it. Both readings end as null here.
-    parentNotebook: isRecord(notebook) ? toNode(notebook, url) : null,
-    parentSectionGroup: isRecord(group) ? toNode(group, url) : null,
-  };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function toPageSummary(item: unknown, url: string): PageSummary {
-  const record = asRecord(item, url);
-  return {
-    id: requireString(record, 'id', url),
-    title: optionalString(record, 'title') ?? '',
-    lastModifiedDateTime: optionalString(record, 'lastModifiedDateTime') ?? '',
-  };
-}
-
-function asRecord(item: unknown, url: string): Record<string, unknown> {
-  if (typeof item !== 'object' || item === null || Array.isArray(item)) {
-    throw new GraphResponseError(`GET ${url} returned a non-object inside "value".`, url);
-  }
-  return item as Record<string, unknown>;
-}
-
-function requireString(record: Record<string, unknown>, key: string, url: string): string {
-  const value = record[key];
-  if (typeof value !== 'string' || value === '') {
-    // The offending value is not printed: these bodies carry user content, and the
-    // repository's hygiene rules keep page and notebook names out of anything loggable.
-    throw new GraphResponseError(`GET ${url} returned an item with no usable "${key}".`, url);
-  }
-  return value;
-}
-
-function optionalString(record: Record<string, unknown>, key: string): string | undefined {
-  const value = record[key];
-  return typeof value === 'string' ? value : undefined;
-}
-
-/** An error body that cannot be read must not mask the status that caused the throw. */
-async function safeText(response: Response): Promise<string> {
-  try {
-    return await response.text();
-  } catch {
-    return '';
-  }
-}
-
-function truncate(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, max)}… (${text.length} chars)`;
-}
-
-function describeError(err: unknown): string {
-  if (err instanceof Error) return `${err.name}: ${err.message}`;
-  return String(err);
 }

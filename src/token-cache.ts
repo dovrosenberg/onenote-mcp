@@ -26,10 +26,11 @@
 
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { FieldValue, Firestore, type DocumentReference } from '@google-cloud/firestore';
+import { FieldValue, type Firestore, type DocumentReference } from '@google-cloud/firestore';
 import type { ICachePlugin, TokenCacheContext } from '@azure/msal-node';
 
 import type { FirestoreConfig } from './config.ts';
+import { firestoreFor } from './firestore.ts';
 import { logEvent } from './logging.ts';
 
 const CACHE_FIELD = 'cache';
@@ -319,10 +320,7 @@ export class FirestoreTokenCachePlugin implements ICachePlugin {
 export function createFirestoreTokenCachePlugin(
   config: FirestoreConfig,
 ): FirestoreTokenCachePlugin {
-  // projectId is left off entirely rather than passed as undefined, so the client uses
-  // its own inference path — the Cloud Run metadata server.
-  const firestore = new Firestore(
-    config.projectId === undefined ? {} : { projectId: config.projectId },
-  );
-  return new FirestoreTokenCachePlugin(firestore, config.cacheDocumentPath);
+  // The client comes from ./firestore.ts rather than being built here, so the token
+  // cache and the page mirror share one connection to one database.
+  return new FirestoreTokenCachePlugin(firestoreFor(config), config.cacheDocumentPath);
 }
