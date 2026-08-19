@@ -420,10 +420,15 @@ function stripComments(source: string): string {
 // the real tenant; a comma there returns a 400 that no unit test would otherwise catch.
 // ---------------------------------------------------------------------------
 
+// lastModifiedDateTime is selected at the top level and inside both `sections` clauses,
+// and deliberately not inside `sectionGroups` — nothing compares a section group's
+// timestamp, and the field costs about 40% of the response (111,615 bytes against
+// 79,660, measured 2026-08-19). It is what lets the #30 mirror visit only the sections
+// that changed: a page create, edit or delete each move it, and nothing else does.
 const EXPANDED_URL =
-  `${GRAPH_ROOT}/me/onenote/notebooks?$select=id,displayName` +
-  `&$expand=sections($select=id,displayName),` +
-  `sectionGroups($select=id,displayName;$expand=sections($select=id,displayName))`;
+  `${GRAPH_ROOT}/me/onenote/notebooks?$select=id,displayName,lastModifiedDateTime` +
+  `&$expand=sections($select=id,displayName,lastModifiedDateTime),` +
+  `sectionGroups($select=id,displayName;$expand=sections($select=id,displayName,lastModifiedDateTime))`;
 
 test('getExpandedTree asks for the tree in one request and parses it', async () => {
   const { fetchImpl, calls } = fakeFetch({
@@ -433,12 +438,21 @@ test('getExpandedTree asks for the tree in one request and parses it', async () 
           {
             id: 'nb-1',
             displayName: '2026',
-            sections: [{ id: 'sec-1', displayName: 'Inbox' }],
+            lastModifiedDateTime: '2026-08-19T10:00:00Z',
+            sections: [
+              { id: 'sec-1', displayName: 'Inbox', lastModifiedDateTime: '2026-08-19T09:00:00Z' },
+            ],
             sectionGroups: [
               {
                 id: 'grp-1',
                 displayName: 'March',
-                sections: [{ id: 'sec-2', displayName: 'Daily' }],
+                sections: [
+                  {
+                    id: 'sec-2',
+                    displayName: 'Daily',
+                    lastModifiedDateTime: '2026-08-18T08:00:00Z',
+                  },
+                ],
               },
             ],
           },
@@ -453,12 +467,46 @@ test('getExpandedTree asks for the tree in one request and parses it', async () 
     {
       id: 'nb-1',
       displayName: '2026',
-      sections: [{ id: 'sec-1', displayName: 'Inbox' }],
+      lastModifiedDateTime: '2026-08-19T10:00:00Z',
+      sections: [
+        { id: 'sec-1', displayName: 'Inbox', lastModifiedDateTime: '2026-08-19T09:00:00Z' },
+      ],
       sectionGroups: [
-        { id: 'grp-1', displayName: 'March', sections: [{ id: 'sec-2', displayName: 'Daily' }] },
+        {
+          id: 'grp-1',
+          displayName: 'March',
+          // No timestamp on the group itself: the URL does not ask for one.
+          sections: [
+            { id: 'sec-2', displayName: 'Daily', lastModifiedDateTime: '2026-08-18T08:00:00Z' },
+          ],
+        },
       ],
     },
   ]);
+});
+
+test('a section with no lastModifiedDateTime decodes without the key, not with undefined', async () => {
+  // Absent is a real state, not a fault. The mirror reads it as "cannot tell whether this
+  // section changed" and visits the section anyway, which is the same branch it would
+  // take if the service stopped returning the field. `exactOptionalPropertyTypes` is why
+  // the key must be absent rather than present-and-undefined.
+  const { fetchImpl } = fakeFetch({
+    [EXPANDED_URL]: () =>
+      json({
+        value: [
+          {
+            id: 'nb-1',
+            displayName: '2026',
+            sections: [{ id: 'sec-1', displayName: 'Inbox' }],
+          },
+        ],
+      }),
+  });
+
+  const tree = await new GraphStructure(tokens, fetchImpl).getExpandedTree();
+
+  assert.equal('lastModifiedDateTime' in tree[0]!, false);
+  assert.equal('lastModifiedDateTime' in tree[0]!.sections[0]!, false);
 });
 
 test('an expanded relationship Graph omitted reads as empty, not as a fault', async () => {
@@ -648,4 +696,102 @@ test('listPagesInSection never asks Graph for more than 100, and pages to reach 
   assert.equal(pages.length, 150);
   assert.equal(calls.length, 2);
   assert.ok(calls.every((call) => !call.url.includes('$top=150')));
+});
+
+// ---------------------------------------------------------------------------
+// The two calls the #30 mirror adds. Both go through #collect, so both follow
+// @odata.nextLink and both pass the shared gate.
+// ---------------------------------------------------------------------------
+
+test('listPagesChangedSince sends the datetime filter and no $orderby', async () => {
+  // The filter is what makes the second tier one request per changed section rather than
+  // a read-and-discard of the section's first hundred pages. Measured accepted
+  // 2026-08-19; api-overview.md carries the run.
+  //
+  // No $orderby: the documented default for a section's pages is already
+  // lastModifiedTime desc, and adding one would be a second unverified query option on a
+  // call whose filter is the thing under suspicion.
+  const url =
+    `${GRAPH_ROOT}/me/onenote/sections/s-1/pages` +
+    `?$select=id,title,lastModifiedDateTime&$top=100` +
+    `&$filter=${encodeURIComponent('lastModifiedDateTime ge 2026-08-19T00:00:00Z')}`;
+
+  const { fetchImpl, calls } = fakeFetch({
+    [url]: () =>
+      json({
+        value: [
+          { id: 'p-1', title: 'Monday', lastModifiedDateTime: '2026-08-19T12:00:00Z' },
+          { id: 'p-2', title: 'Tuesday', lastModifiedDateTime: '2026-08-19T09:00:00Z' },
+        ],
+      }),
+  });
+
+  const pages = await new GraphStructure(tokens, fetchImpl).listPagesChangedSince(
+    's-1',
+    '2026-08-19T00:00:00Z',
+  );
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.url.includes('$orderby'), false);
+  assert.deepEqual(pages, [
+    { id: 'p-1', title: 'Monday', lastModifiedDateTime: '2026-08-19T12:00:00Z' },
+    { id: 'p-2', title: 'Tuesday', lastModifiedDateTime: '2026-08-19T09:00:00Z' },
+  ]);
+});
+
+test('listPagesChangedSince does no date arithmetic of its own', async () => {
+  // The watermark overlap belongs to the sync, which is the only thing that knows when
+  // its pass started. This method sends the string it was handed, so a test of the
+  // overlap rule cannot accidentally pass because two off-by-one hours cancelled out.
+  const sinceIso = '1999-12-31T23:59:59Z';
+  const url =
+    `${GRAPH_ROOT}/me/onenote/sections/s-1/pages` +
+    `?$select=id,title,lastModifiedDateTime&$top=100` +
+    `&$filter=${encodeURIComponent(`lastModifiedDateTime ge ${sinceIso}`)}`;
+
+  const { fetchImpl, calls } = fakeFetch({ [url]: () => json({ value: [] }) });
+
+  await new GraphStructure(tokens, fetchImpl).listPagesChangedSince('s-1', sinceIso);
+  assert.ok(calls[0]!.url.includes(encodeURIComponent(sinceIso)));
+});
+
+test('listPageIds asks for ids only and follows every nextLink to the end', async () => {
+  // A sweep that stopped early would report pages as deleted that are merely past the
+  // cutoff, which is the one mistake here that destroys data. So there is no `top`
+  // argument and no bound but @odata.nextLink running out.
+  const first = `${GRAPH_ROOT}/me/onenote/sections/s-1/pages?$select=id&$top=100`;
+  const next = `${GRAPH_ROOT}/me/onenote/sections/s-1/pages?$skiptoken=abc`;
+
+  const { fetchImpl, calls } = fakeFetch({
+    [first]: () =>
+      json({
+        value: Array.from({ length: 100 }, (_unused, index) => ({ id: `p-${index}` })),
+        '@odata.nextLink': next,
+      }),
+    [next]: () => json({ value: [{ id: 'p-100' }, { id: 'p-101' }] }),
+  });
+
+  const ids = await new GraphStructure(tokens, fetchImpl).listPageIds('s-1');
+
+  assert.equal(calls.length, 2);
+  assert.equal(ids.length, 102);
+  assert.equal(ids[0], 'p-0');
+  assert.equal(ids[101], 'p-101');
+  // Nothing but the id is asked for: the caller compares id sets and reads no other
+  // field, and a title in this response would be user content the sweep never needs.
+  assert.ok(calls.every((call) => !call.url.includes('title')));
+});
+
+test('listPageIds rejects an item with no usable id rather than dropping it', async () => {
+  // A dropped id reads as "this page is gone" and deletes the mirrored copy. Failing the
+  // whole sweep for that section is the safe direction.
+  const url = `${GRAPH_ROOT}/me/onenote/sections/s-1/pages?$select=id&$top=100`;
+  const { fetchImpl } = fakeFetch({
+    [url]: () => json({ value: [{ id: 'p-1' }, { title: 'no id here' }] }),
+  });
+
+  await assert.rejects(
+    () => new GraphStructure(tokens, fetchImpl).listPageIds('s-1'),
+    GraphResponseError,
+  );
 });

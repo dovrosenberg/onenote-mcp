@@ -43,6 +43,27 @@ export function toNode(item: unknown, url: string): { id: string; displayName: s
 }
 
 /**
+ * A node plus `lastModifiedDateTime`, when the request asked for it.
+ *
+ * Spread rather than assigned as possibly-undefined, per `exactOptionalPropertyTypes`.
+ * Absent is a real state and not a fault: only the expanded-tree URL selects the field,
+ * so every other call decodes nodes without it. The mirror reads an absent timestamp as
+ * "cannot tell whether this section changed" and falls back to visiting it, which is the
+ * same branch a service that stopped returning the field would take.
+ */
+export function toTimestampedNode(
+  item: unknown,
+  url: string,
+): { id: string; displayName: string; lastModifiedDateTime?: string } {
+  const record = asRecord(item, url);
+  const stamp = optionalString(record, 'lastModifiedDateTime');
+  return {
+    ...toNode(record, url),
+    ...(stamp === undefined ? {} : { lastModifiedDateTime: stamp }),
+  };
+}
+
+/**
  * One notebook out of the expanded response.
  *
  * An absent `sections` or `sectionGroups` is read as empty rather than raised on: Graph
@@ -52,13 +73,17 @@ export function toNode(item: unknown, url: string): { id: string; displayName: s
 export function toExpandedNotebook(item: unknown, url: string): ExpandedNotebook {
   const record = asRecord(item, url);
   return {
-    ...toNode(record, url),
-    sections: toNodeArray(record['sections'], url).map((node) => toNode(node, url)),
+    // Notebooks and sections carry the timestamp; section groups do not, because the
+    // expanded-tree URL does not select it for them and nothing compares one.
+    ...toTimestampedNode(record, url),
+    sections: toNodeArray(record['sections'], url).map((node) => toTimestampedNode(node, url)),
     sectionGroups: toNodeArray(record['sectionGroups'], url).map((group) => {
       const groupRecord = asRecord(group, url);
       return {
         ...toNode(groupRecord, url),
-        sections: toNodeArray(groupRecord['sections'], url).map((node) => toNode(node, url)),
+        sections: toNodeArray(groupRecord['sections'], url).map((node) =>
+          toTimestampedNode(node, url),
+        ),
       };
     }),
   };

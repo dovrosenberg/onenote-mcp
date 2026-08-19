@@ -28,6 +28,7 @@ import {
   describeError,
   mapWithLimit,
   quoteOData,
+  requireString,
   safeText,
   toExpandedNotebook,
   toNode,
@@ -65,9 +66,9 @@ const NODE_SELECT = '$select=id,displayName&$orderby=displayName';
  * `1 + 2 x containers`, which is 195 requests on the real account against this one.
  */
 const EXPANDED_TREE_URL =
-  `${GRAPH_ROOT}/me/onenote/notebooks?$select=id,displayName` +
-  `&$expand=sections($select=id,displayName),` +
-  `sectionGroups($select=id,displayName;$expand=sections($select=id,displayName))`;
+  `${GRAPH_ROOT}/me/onenote/notebooks?$select=id,displayName,lastModifiedDateTime` +
+  `&$expand=sections($select=id,displayName,lastModifiedDateTime),` +
+  `sectionGroups($select=id,displayName;$expand=sections($select=id,displayName,lastModifiedDateTime))`;
 
 /**
  * Sections anywhere in the account whose name contains the query, with their parents.
@@ -196,11 +197,24 @@ export type ContainerKind = 'notebooks' | 'sectionGroups';
 export interface Notebook {
   readonly id: string;
   readonly displayName: string;
+  /**
+   * Present only on the expanded-tree call, which is the one URL that asks for it.
+   * `NODE_SELECT` deliberately does not, so `list_notebooks` and `list_sections` keep
+   * the URLs their tests assert.
+   */
+  readonly lastModifiedDateTime?: string;
 }
 
 export interface Section {
   readonly id: string;
   readonly displayName: string;
+  /**
+   * Present only on the expanded-tree call. Measured 2026-08-19 (api-overview.md): this
+   * moves when a page in the section is created, edited or deleted, and does not move
+   * otherwise — which is what lets the mirror's incremental sync visit only the sections
+   * that changed instead of all of them.
+   */
+  readonly lastModifiedDateTime?: string;
 }
 
 export interface SectionGroup {
@@ -456,6 +470,56 @@ export class GraphStructure {
       `&$orderby=lastModifiedDateTime desc&$select=id,title,lastModifiedDateTime`;
 
     return (await this.#collect(url, top)).map((item) => toPageSummary(item, url));
+  }
+
+  /**
+   * Pages in one section modified at or after `sinceIso`, newest first.
+   *
+   * The mirror's second tier (issue #30). One request per section whose timestamp moved,
+   * against `listPagesInSection`'s "most recent N whatever their age".
+   *
+   * `$filter=lastModifiedDateTime ge {iso}` with an unquoted ISO-8601 UTC literal was
+   * measured accepted on 2026-08-19 (api-overview.md). If the service ever stops
+   * accepting it the answer is a 400, and the caller's fallback is
+   * `listPagesInSection` plus a client-side cutoff — the documented default sort for a
+   * section's pages is already `lastModifiedTime desc`, confirmed in the same run, so
+   * that fallback costs the same one request. No `$orderby` is sent here for that
+   * reason: it would be a second unverified query option on a call whose filter is the
+   * thing under suspicion.
+   *
+   * `sinceIso` must already carry the caller's overlap. This method does no date
+   * arithmetic — the watermark rule lives with the sync, which is the only thing that
+   * knows when its pass started.
+   */
+  async listPagesChangedSince(sectionId: string, sinceIso: string): Promise<PageSummary[]> {
+    const url =
+      `${GRAPH_ROOT}/me/onenote/sections/${encodeURIComponent(sectionId)}/pages` +
+      `?$select=id,title,lastModifiedDateTime&$top=${MAX_GRAPH_TOP}` +
+      `&$filter=${encodeURIComponent(`lastModifiedDateTime ge ${sinceIso}`)}`;
+
+    return (await this.#collect(url)).map((item) => toPageSummary(item, url));
+  }
+
+  /**
+   * Every page id in one section, and nothing else.
+   *
+   * This is the mirror's deletion sweep, and it is as cheap as deletion detection gets
+   * on this account. Graph has no /delta on any OneNote resource and no tombstone for a
+   * deleted page, and the account-wide page list — the one call that would enumerate
+   * everything in one request per 100 pages — is the banned one, error 20266. So the
+   * floor is one request per section plus one per additional 100 pages, and what makes
+   * that affordable is that only the mirrored notebooks are swept.
+   *
+   * `$select=id` alone, because the caller compares id sets and reads nothing else. No
+   * `top` argument: a sweep that stopped early would report pages as deleted that are
+   * merely past the cutoff, which is the one mistake here that destroys data.
+   */
+  async listPageIds(sectionId: string): Promise<string[]> {
+    const url =
+      `${GRAPH_ROOT}/me/onenote/sections/${encodeURIComponent(sectionId)}/pages` +
+      `?$select=id&$top=${MAX_GRAPH_TOP}`;
+
+    return (await this.#collect(url)).map((item) => requireString(asRecord(item, url), 'id', url));
   }
 
   /**
