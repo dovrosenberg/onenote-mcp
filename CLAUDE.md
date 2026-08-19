@@ -16,6 +16,7 @@ onenote-mcp/
 │   ├── fixtures/              # hand-authored InkML and HTML; never a captured page dump
 ├── scripts/                   # operational shell scripts, not part of the built artifact
 │   └── test/                  # bash tests, run by scripts/test/run.sh
+├── .github/workflows/         # deploy.yml, the only CI; builds, tests, pushes, deploys
 └── dist/                      # build output; gitignored, never edited, never committed
 ```
 
@@ -817,6 +818,31 @@ through `context.tokenCache.deserialize` before `serialize()` is called, because
 `deserialize` merges into the in-memory cache rather than replacing it. Removing the
 re-read turns an overlap into a lost refresh token, and the cache stays unusable until
 `npm run bootstrap` is run again.
+
+**The deploy workflow sets the service's whole environment, every time.**
+`.github/workflows/deploy.yml` passes `env_vars_update_strategy: overwrite` to
+`google-github-actions/deploy-cloudrun@v2`, whose default is `merge`. Under `merge`, a
+variable deleted from the workflow keeps whatever the previous revision had, so the
+running service and the file disagree and nothing says so. Under `overwrite` the list in
+the workflow is the environment. Two names are deliberately absent from it: `PORT`, which
+Cloud Run supplies and rejects as an input, and `GOOGLE_CLOUD_PROJECT`, which the metadata
+server supplies. `MCP_KEEPALIVE_SECRET` is always listed, because an unset repository
+secret interpolates to an empty string and `loadConfig` treats an empty value as unset —
+which is the same thing as not listing it, without the conditional.
+
+**`MCP_PUBLIC_URL` has three sources and the first deploy has none of them.** It is the
+OAuth issuer and the audience of every access token, and no Cloud Run service exists to
+have a URL before the first deploy. So the workflow takes the `MCP_PUBLIC_URL` repository
+variable, falls back to `gcloud run services describe`, and on a first deploy uses
+`https://placeholder.invalid` and then replaces it with `--update-env-vars` once the
+service exists. The placeholder is well-formed enough to pass `checkPublicUrl`, which is
+what lets the revision start and get a URL assigned. Setting the repository variable is
+still the right end state — it is the only one of the three that survives putting a custom
+domain in front of the service.
+
+**Nothing in the workflow echoes a value.** The preflight step prints the names of
+unconfigured variables and never their contents, and no step logs an environment. Two of
+the eleven are secrets, and GitHub's log masking is a backstop rather than the control.
 
 ## Graph request budget
 

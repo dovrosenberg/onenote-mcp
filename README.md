@@ -644,6 +644,89 @@ install and that no dev dependencies came with it, renders an SVG to PNG inside 
 container, and asserts `/healthz` answers 200 on the port given in `PORT`. Without
 `RUN_DOCKER_TESTS=1` the docker suite is skipped and the rest still runs.
 
+## Deploy
+
+`.github/workflows/deploy.yml` runs on every push to `main` and on `workflow_dispatch`.
+It type-checks, runs `npm test`, builds, builds and pushes the container image to
+Artifact Registry tagged with the commit sha, and deploys that image to Cloud Run. A
+failing type-check or test stops the run before an image is built.
+
+There is no long-lived credential in GitHub. The job authenticates through Workload
+Identity Federation: `permissions: id-token: write` lets it request a GitHub OIDC token,
+and `google-github-actions/auth@v2` exchanges that for short-lived Google credentials.
+No service-account JSON key is created by `scripts/gcp-bootstrap.sh` or needed anywhere.
+The provider only accepts tokens whose `repository` claim is this repository.
+
+The image is built on `ubuntu-latest`, which is `linux/amd64` — the platform Cloud Run
+runs, and the one the `@resvg/resvg-js` prebuild is compiled for. That is why the
+workflow builds the image itself rather than using `gcloud run deploy --source`, which
+would also mean enabling Cloud Build and granting the roles that go with it.
+
+The deploy runs at `--max-instances=1` with `--allow-unauthenticated`, as the runtime
+service account, which holds `roles/datastore.user` for the Firestore token cache.
+`--allow-unauthenticated` is what lets Claude reach the service at all; the MCP endpoint
+is closed by the bearer token instead. See **Bearer tokens on the MCP endpoint**.
+
+### What the repository has to hold
+
+`scripts/gcp-bootstrap.sh` provisions the GCP side and prints the `gh variable set`
+commands for the first six. The workflow fails on its first step, naming what is
+missing, rather than deploying half-configured.
+
+| Name | Kind | Value |
+|---|---|---|
+| `GCP_PROJECT` | variable | Project ID |
+| `GCP_REGION` | variable | Cloud Run region |
+| `GAR_REGION` | variable | Artifact Registry region |
+| `WIF_PROVIDER` | variable | Full workload identity provider resource name |
+| `DEPLOY_SA` | variable | Deploy service account email |
+| `RUNTIME_SA` | variable | Runtime service account email |
+| `ONENOTE_CLIENT_ID` | variable | Azure app registration client ID |
+| `ONENOTE_AUTHORITY` | variable | Entra authority URL |
+| `MCP_OAUTH_CLIENT_ID` | variable | Layer-1 OAuth client ID |
+| `MCP_PUBLIC_URL` | variable | The service's public URL; see below |
+| `FIRESTORE_CACHE_DOC` | variable | Optional; defaults to `tokencache/msal` |
+| `MCP_OAUTH_CLIENT_SECRET` | **secret** | Layer-1 OAuth client secret |
+| `MCP_TOKEN_SIGNING_KEY` | **secret** | Access-token signing key, at least 32 characters |
+| `MCP_KEEPALIVE_SECRET` | **secret** | Optional; unset means `POST /keepalive` is not mounted |
+
+Only three of these are credentials. The WIF provider name and the service account
+emails are identifiers, useless to anyone who cannot present this repository's OIDC
+identity, so they are variables rather than secrets.
+
+The deploy passes `env_vars_update_strategy: overwrite`, so the list in the workflow is
+the service's entire environment on every revision. The action's default is `merge`,
+under which a variable removed from the workflow would silently survive from the previous
+revision. `PORT` and `GOOGLE_CLOUD_PROJECT` are deliberately not in the list: Cloud Run
+supplies both, and it rejects `PORT` as an input.
+
+### The first deploy, and `MCP_PUBLIC_URL`
+
+`MCP_PUBLIC_URL` is the OAuth issuer and the audience of every access token this server
+issues, and no service exists to have a URL until the first deploy has happened. The
+workflow resolves it in three steps: the `MCP_PUBLIC_URL` repository variable, then the
+URL Cloud Run has already assigned to the service, then — only when neither exists —
+`https://placeholder.invalid`, which it replaces with the real URL immediately after the
+deploy. So a first run works unattended and finishes with the correct value in place. It
+leaves a warning naming the URL; set the repository variable to it, because that is the
+only one of the three sources that survives putting a custom domain in front of the
+service.
+
+Changing `MCP_PUBLIC_URL` invalidates nothing by itself, but every access token already
+issued is bound to the old audience and will be refused. Claude re-runs the authorization
+flow when that happens.
+
+### Rolling back
+
+The image tag is the commit sha, so an earlier image is still in Artifact Registry:
+
+```bash
+gcloud run services update-traffic onenote-mcp --region "$GCP_REGION" --to-revisions <revision>=100
+```
+
+Re-running the workflow from an earlier commit with `workflow_dispatch` also works, and
+is the one that keeps the deployed environment in step with that commit's workflow file.
+
 ## Configuration
 
 Every value comes from an environment variable, validated at startup. A missing or

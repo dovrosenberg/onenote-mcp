@@ -1,0 +1,210 @@
+# Build, test, and deploy to Cloud Run.
+#
+# Authentication is Workload Identity Federation. The job exchanges GitHub's OIDC token
+# for short-lived Google credentials, so no service-account key exists in this
+# repository or anywhere else; `id-token: write` below is what makes that exchange
+# possible. `scripts/gcp-bootstrap.sh` provisions the pool, the provider, and both
+# service accounts, and prints the `gh variable set` commands that fill in every `vars.*`
+# reference here.
+#
+# The image is built here rather than by `gcloud run deploy --source`, because
+# `ubuntu-latest` is already linux/amd64 — the platform Cloud Run runs and the one the
+# @resvg/resvg-js glibc prebuild is compiled for — and because building here needs no
+# Cloud Build API and no roles to go with it.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+# One deploy at a time, queued rather than cancelled: a superseded run still leaves the
+# image it pushed behind, and cancelling mid-deploy can leave traffic split across
+# revisions. The service runs at --max-instances=1 and holds its OAuth codes in memory,
+# so overlapping revision replacements are worth avoiding.
+concurrency:
+  group: deploy-cloud-run
+  cancel-in-progress: false
+
+env:
+  SERVICE: onenote-mcp
+  # The Artifact Registry repository, created under the same name by scripts/gcp-bootstrap.sh.
+  GAR_REPO: onenote-mcp
+  # Stands in for MCP_PUBLIC_URL on the very first deploy, when no Cloud Run service
+  # exists yet and so no URL exists to configure. It is well-formed enough to pass
+  # startup validation and resolves to nothing; the step after the deploy replaces it
+  # with the URL Cloud Run assigns.
+  PLACEHOLDER_PUBLIC_URL: https://placeholder.invalid
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fails on an unconfigured repository before anything is built, and names only the
+      # variables that are missing. It never prints a value: two of these are secrets,
+      # and GitHub's masking is a backstop rather than something to lean on.
+      - name: Check the repository is configured
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GAR_REGION: ${{ vars.GAR_REGION }}
+          WIF_PROVIDER: ${{ vars.WIF_PROVIDER }}
+          DEPLOY_SA: ${{ vars.DEPLOY_SA }}
+          RUNTIME_SA: ${{ vars.RUNTIME_SA }}
+          ONENOTE_CLIENT_ID: ${{ vars.ONENOTE_CLIENT_ID }}
+          ONENOTE_AUTHORITY: ${{ vars.ONENOTE_AUTHORITY }}
+          MCP_OAUTH_CLIENT_ID: ${{ vars.MCP_OAUTH_CLIENT_ID }}
+          MCP_OAUTH_CLIENT_SECRET: ${{ secrets.MCP_OAUTH_CLIENT_SECRET }}
+          MCP_TOKEN_SIGNING_KEY: ${{ secrets.MCP_TOKEN_SIGNING_KEY }}
+        run: |
+          missing=()
+          for name in GCP_PROJECT GCP_REGION GAR_REGION WIF_PROVIDER DEPLOY_SA RUNTIME_SA \
+                      ONENOTE_CLIENT_ID ONENOTE_AUTHORITY MCP_OAUTH_CLIENT_ID \
+                      MCP_OAUTH_CLIENT_SECRET MCP_TOKEN_SIGNING_KEY; do
+            [ -n "${!name}" ] || missing+=("$name")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "This repository is not configured to deploy. Set these first — see the"
+            echo "Deploy section of README.md and the output of scripts/gcp-bootstrap.sh:"
+            printf '  %s\n' "${missing[@]}"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci
+
+      # The gate. A type error or a failing test stops the run here, before an image is
+      # built and long before a revision is replaced. `npm run build` is part of the gate
+      # rather than a source of artifacts: the Dockerfile compiles its own dist/ inside
+      # the build stage, and nothing from the runner's dist/ reaches the image.
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      # project_id is passed so every gcloud call below resolves the same project the
+      # image is pushed to, rather than whichever one the credential happens to imply.
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SA }}
+          project_id: ${{ vars.GCP_PROJECT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${{ vars.GAR_REGION }}-docker.pkg.dev" --quiet
+
+      # Tagged with the commit sha and nothing else. A moving tag would make the deployed
+      # revision's image reference ambiguous after the next push.
+      - name: Build and push the image
+        id: image
+        env:
+          GAR_REGION: ${{ vars.GAR_REGION }}
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+        run: |
+          image="${GAR_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GAR_REPO}/server:${GITHUB_SHA}"
+          docker build -t "$image" .
+          docker push "$image"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+      # MCP_PUBLIC_URL is the OAuth issuer and the audience every access token is bound
+      # to, and nothing inside the container can discover it. Three sources, in order:
+      # the repository variable, which is the one to set and the only one that survives
+      # putting a custom domain in front; the URL Cloud Run already assigned to the
+      # service; and, on a first deploy where neither exists, a placeholder that the step
+      # after the deploy replaces.
+      - name: Resolve the public URL
+        id: public-url
+        env:
+          CONFIGURED_URL: ${{ vars.MCP_PUBLIC_URL }}
+          REGION: ${{ vars.GCP_REGION }}
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+        run: |
+          url="$CONFIGURED_URL"
+          if [ -z "$url" ]; then
+            url="$(gcloud run services describe "$SERVICE" --region="$REGION" \
+                     --project="$GCP_PROJECT" --format='value(status.url)' 2>/dev/null || true)"
+            if [ -n "$url" ]; then
+              echo "MCP_PUBLIC_URL is unset; using the URL Cloud Run assigned: $url"
+            fi
+          fi
+          if [ -z "$url" ]; then
+            url="$PLACEHOLDER_PUBLIC_URL"
+            echo "placeholder=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::No MCP_PUBLIC_URL and no existing service. Deploying with a placeholder issuer; the next step replaces it with the URL this deploy produces."
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      # env_vars_update_strategy is `overwrite`, not the action's `merge` default: this
+      # list is the whole environment of the service, so a variable dropped from it here
+      # must disappear from the revision rather than linger from an earlier deploy.
+      #
+      # PORT is absent because Cloud Run supplies it and rejects it as an input.
+      # GOOGLE_CLOUD_PROJECT is absent because the metadata server supplies it.
+      # MCP_KEEPALIVE_SECRET is listed unconditionally: an unset repository secret
+      # produces an empty value, loadConfig treats an empty value as unset, and
+      # POST /keepalive is then not mounted at all.
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE }}
+          project_id: ${{ vars.GCP_PROJECT }}
+          region: ${{ vars.GCP_REGION }}
+          image: ${{ steps.image.outputs.image }}
+          flags: --max-instances=1 --allow-unauthenticated --service-account=${{ vars.RUNTIME_SA }}
+          env_vars_update_strategy: overwrite
+          env_vars: |-
+            ONENOTE_CLIENT_ID=${{ vars.ONENOTE_CLIENT_ID }}
+            ONENOTE_AUTHORITY=${{ vars.ONENOTE_AUTHORITY }}
+            MCP_OAUTH_CLIENT_ID=${{ vars.MCP_OAUTH_CLIENT_ID }}
+            MCP_OAUTH_CLIENT_SECRET=${{ secrets.MCP_OAUTH_CLIENT_SECRET }}
+            MCP_TOKEN_SIGNING_KEY=${{ secrets.MCP_TOKEN_SIGNING_KEY }}
+            MCP_PUBLIC_URL=${{ steps.public-url.outputs.url }}
+            MCP_KEEPALIVE_SECRET=${{ secrets.MCP_KEEPALIVE_SECRET }}
+            FIRESTORE_CACHE_DOC=${{ vars.FIRESTORE_CACHE_DOC || 'tokencache/msal' }}
+
+      # Only on the first deploy. The service now exists, so it has a URL; --update-env-vars
+      # changes that one variable and leaves the rest of the environment the deploy above
+      # just set. Without this the service would run advertising an issuer that resolves
+      # to nothing, and the run would still be green.
+      - name: Replace the placeholder public URL
+        if: steps.public-url.outputs.placeholder == 'true'
+        env:
+          REGION: ${{ vars.GCP_REGION }}
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+        run: |
+          url="$(gcloud run services describe "$SERVICE" --region="$REGION" --project="$GCP_PROJECT" --format='value(status.url)')"
+          if [ -z "$url" ]; then
+            echo "Cloud Run reported no URL for $SERVICE; MCP_PUBLIC_URL is still the placeholder."
+            exit 1
+          fi
+          gcloud run services update "$SERVICE" --region="$REGION" --project="$GCP_PROJECT" \
+            --update-env-vars="MCP_PUBLIC_URL=$url" --quiet
+          echo "::warning::Set the MCP_PUBLIC_URL repository variable to $url — until it is set, every deploy rediscovers it, and a custom domain in front of the service would be ignored."
+
+      - name: Summary
+        env:
+          REGION: ${{ vars.GCP_REGION }}
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          url="$(gcloud run services describe "$SERVICE" --region="$REGION" --project="$GCP_PROJECT" --format='value(status.url)' || true)"
+          {
+            echo "### Deployed"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Service | \`$SERVICE\` in \`$REGION\` |"
+            echo "| Image | \`$IMAGE\` |"
+            echo "| URL | $url |"
+          } >> "$GITHUB_STEP_SUMMARY"
