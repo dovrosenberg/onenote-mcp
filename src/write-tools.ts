@@ -1,4 +1,5 @@
-// The writing tools: append_to_page, create_page, update_page_title.
+// The writing tools: append_to_page, append_to_page_by_name, create_page,
+// create_page_by_name, update_page_title.
 //
 // The Graph mechanics are in ./page-write.ts. What lives here is the argument checking
 // and the wording, and both exist for the same reason: the caller is a model that gets
@@ -24,11 +25,29 @@
 // Every result is one JSON text block, and each one says where the change landed. A
 // caller that appended to a client-authored page needs to know it wrote to the first
 // outline rather than the bottom of the page, and nothing in a 204 tells it that.
+//
+// The two `_by_name` tools take names where the others take ids. They resolve them
+// through src/name-lookup.ts, the same resolver the `_by_name` browsing tools use, so a
+// caller that knows where the content goes spends one call instead of a walk followed by
+// a write. Both check the title and the fragment before resolving anything, so a refusal
+// costs neither the lookup nor the write.
+//
+// `append_to_page_by_name` needs a page as well as a section, and the page title is not
+// matched by the container ladder: it is compared in full, ignoring case, by Graph. A
+// title matching no page or more than one is an error rather than a choice, because a
+// write to a guessed page is invisible until someone opens the notebook.
 
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 
+import type { PageSummary } from './graph-structure.ts';
 import { InkParseError, parseInkStrokes, strokeBounds } from './ink.ts';
-import { ToolInputError, requiredString, type ToolDefinition } from './mcp-tools.ts';
+import { ToolInputError, optionalString, requiredString, type ToolDefinition } from './mcp-tools.ts';
+import {
+  NameLookupError,
+  resolveSection,
+  resolvedPayload,
+  type LookupStructure,
+} from './name-lookup.ts';
 import { pageHtml, type RawPageContent } from './page-content.ts';
 import {
   clearanceHtml,
@@ -73,10 +92,41 @@ export interface PageWriteClient {
   createPage(sectionId: string, title: string, bodyHtml: string): Promise<CreatedPage>;
 }
 
-/** Build the three writing tools over a write client and the reader `append_to_page` uses. */
+/**
+ * The slice of `GraphStructure` the `_by_name` writing tools resolve through: the name
+ * resolver's own two calls, plus the title filter that turns a named section and a page
+ * title into one page.
+ */
+export interface WriteLookupStructure extends LookupStructure {
+  findPagesByTitle(sectionId: string, title: string): Promise<PageSummary[]>;
+}
+
+/** The name arguments both `_by_name` writing tools share. Same wording as the browsing ones. */
+const NAME_PATH_PROPERTIES = {
+  notebookName: {
+    type: 'string',
+    description: 'The notebook name, matched in full and case-insensitively.',
+  },
+  sectionGroupName: {
+    type: 'string',
+    description:
+      'The section group holding the section, if it is in one. Omit when the section ' +
+      'sits directly in the notebook; omitting it does not search inside groups.',
+  },
+  sectionName: {
+    type: 'string',
+    description: 'The section name, matched in full and case-insensitively.',
+  },
+} as const;
+
+/**
+ * Build the writing tools over a write client, the reader the appends use, and the
+ * structure client the two `_by_name` tools resolve names through.
+ */
 export function createWriteTools(
   write: PageWriteClient,
   layout: PageLayoutReader,
+  lookup: WriteLookupStructure,
 ): ToolDefinition[] {
   return [
     {
@@ -116,37 +166,64 @@ export function createWriteTools(
         const pageId = requiredString(args, 'pageId');
         const htmlFragment = fragmentArgument(args, 'htmlFragment');
 
-        const clearance = await inkClearance(layout, pageId);
-        const content =
-          clearance === null ? htmlFragment : clearanceHtml(clearance, htmlFragment);
+        return jsonResult(await append(write, layout, pageId, htmlFragment));
+      },
+    },
+    {
+      name: 'append_to_page_by_name',
+      title: 'Append to a page in a named section',
+      description:
+        'Add HTML to the end of a page you can name, in one call: the notebook name, ' +
+        'the section group name if the section is in one, the section name, and the ' +
+        'page title. This is append_to_page without the walk it would take to turn ' +
+        'those names into a page id. Container names are matched in full and ' +
+        "case-insensitively first, then against the name with any leading number " +
+        "stripped, so 'February' finds a section group named '062 - February'; a " +
+        'substring is tried last, and matchedBy in the result says which of those ' +
+        'matched. The page title is different: it is matched in full ignoring case and ' +
+        'nothing else, and a title matching no page or more than one is an error that ' +
+        'writes nothing — use list_pages_by_name to see the titles, or search_pages to ' +
+        'match part of one. Omit sectionGroupName when the section sits directly in the ' +
+        'notebook; it is not a wildcard. Everything append_to_page does to the content ' +
+        'applies here: it goes at the end of the page body, which on a page authored in ' +
+        'the OneNote client is the end of its first outline; existing content is never ' +
+        'replaced; and blank lines are added ahead of it if handwriting would otherwise ' +
+        'be written over. htmlFragment is page content, not a whole HTML document.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ...NAME_PATH_PROPERTIES,
+          pageTitle: {
+            type: 'string',
+            description:
+              'The page title, matched in full and case-insensitively. Not a substring ' +
+              'and not a prefix rule: the whole title, or it is an error.',
+          },
+          htmlFragment: {
+            type: 'string',
+            description:
+              'The HTML to append, as page content rather than a document. Unclosed ' +
+              'tags are tolerated; OneNote closes them.',
+          },
+        },
+        required: ['notebookName', 'sectionName', 'pageTitle', 'htmlFragment'],
+        additionalProperties: false,
+      },
+      annotations: { ...WRITE, destructiveHint: false, idempotentHint: false },
+      handle: async (args) => {
+        // The fragment is checked before anything is resolved, so a refusal costs
+        // neither of the two reads this tool would otherwise spend finding the page.
+        const path = namePath(args);
+        const pageTitle = requiredString(args, 'pageTitle');
+        const htmlFragment = fragmentArgument(args, 'htmlFragment');
 
-        await write.appendToPage(pageId, content);
+        const resolved = await resolveSection(lookup, path);
+        const page = await onePageByTitle(lookup, resolved.section.id, pageTitle);
 
         return jsonResult({
-          pageId,
-          appended: true,
-          inkClearance:
-            clearance === null
-              ? null
-              : {
-                  blankLines: clearance.breaks,
-                  inkBottomPx: Math.round(clearance.inkBottom),
-                  measuredFromPx: Math.round(clearance.clearedFrom),
-                  contentStartsAtPx: clearance.clearedTo,
-                  clearsTheInk: !clearance.truncated,
-                },
-          note:
-            'The content was appended to the end of the page body. On a page authored ' +
-            'in the OneNote client that is the end of the first outline. Nothing that ' +
-            'was on the page was replaced. A read of the page content will show the ' +
-            'change; the page metadata a listing returns can lag behind it by a few ' +
-            'seconds.' +
-            (clearance === null
-              ? ''
-              : ' This outline also holds handwriting, which OneNote keeps at a fixed ' +
-                'position that no write can move, so the content was preceded by blank ' +
-                'lines to bring it below the lowest stroke. The gap above it is ' +
-                'deliberate.'),
+          ...resolvedPayload(resolved),
+          page: { id: page.id, title: page.title },
+          ...(await append(write, layout, page.id, htmlFragment)),
         });
       },
     },
@@ -202,6 +279,73 @@ export function createWriteTools(
       },
     },
     {
+      name: 'create_page_by_name',
+      title: 'Create a page in a named section',
+      description:
+        'Create a new OneNote page in a section you can name, in one call: the notebook ' +
+        'name, the section group name if the section is in one, the section name, the ' +
+        'page title, and the body HTML. This is create_page without the list_notebooks ' +
+        '-> list_sections walk it would take to turn those names into a section id. ' +
+        'Container names are matched in full and case-insensitively first, then against ' +
+        "the name with any leading number stripped, so 'February' finds a section group " +
+        "named '062 - February'; a substring is tried last, and matchedBy in the result " +
+        'says which of those matched. Omit sectionGroupName when the section sits ' +
+        'directly in the notebook; it is not a wildcard. A name that matches nothing, or ' +
+        'matches more than one thing, is an error listing the candidates and no page is ' +
+        'created. The title becomes the page title OneNote shows and the one every ' +
+        'search and by-name lookup matches on. htmlFragment is the body content — <p>, ' +
+        '<ul>, <table>, <h1> and so on — not a whole HTML document, and it must not ' +
+        'carry its own <title>: this tool builds the document around it. Returns the new ' +
+        'page id and links to open the page.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ...NAME_PATH_PROPERTIES,
+          title: {
+            type: 'string',
+            description: 'The page title. Plain text; markup in it is not rendered.',
+          },
+          htmlFragment: {
+            type: 'string',
+            description: 'The body content, as page HTML rather than a whole document.',
+          },
+        },
+        required: ['notebookName', 'sectionName', 'title', 'htmlFragment'],
+        additionalProperties: false,
+      },
+      annotations: { ...WRITE, destructiveHint: false, idempotentHint: false },
+      handle: async (args) => {
+        // Every argument is checked before the lookup runs, so a fragment that was
+        // going to be refused costs no Graph request at all — not even the one that
+        // turns the names into a section id.
+        const path = namePath(args);
+        const title = titleArgument(args, 'title');
+        const htmlFragment = fragmentArgument(args, 'htmlFragment');
+
+        const resolved = await resolveSection(lookup, path);
+        const page = await write.createPage(resolved.section.id, title, htmlFragment);
+
+        return jsonResult({
+          ...resolvedPayload(resolved),
+          pageId: page.id,
+          title: page.title === '' ? title : page.title,
+          webUrl: page.webUrl,
+          clientUrl: page.clientUrl,
+          note:
+            'The page was created in the section named above. Check section and ' +
+            'matchedBy if the names you gave were approximate. Use pageId with ' +
+            'get_page_content to read it back or append_to_page to add to it. Do not ' +
+            'confirm the page by looking for its title in a listing straight away: page ' +
+            'metadata can take a few seconds to catch up, and the title above is the ' +
+            'one the service accepted.' +
+            (resolved.deepSearchUsed
+              ? ' The section sits below the section group named, and was found by an ' +
+                'account-wide search on its name.'
+              : ''),
+        });
+      },
+    },
+    {
       name: 'update_page_title',
       title: 'Rename a page',
       description:
@@ -244,6 +388,93 @@ export function createWriteTools(
       },
     },
   ];
+}
+
+/**
+ * Append to one page and describe what happened, for both tools that append.
+ *
+ * The ink clearance is the reason this is shared rather than repeated: a second copy
+ * that forgot to read the page first would write over someone's handwriting and report
+ * success, and the failure would only be visible in OneNote.
+ */
+async function append(
+  write: PageWriteClient,
+  layout: PageLayoutReader,
+  pageId: string,
+  htmlFragment: string,
+): Promise<Record<string, unknown>> {
+  const clearance = await inkClearance(layout, pageId);
+  const content = clearance === null ? htmlFragment : clearanceHtml(clearance, htmlFragment);
+
+  await write.appendToPage(pageId, content);
+
+  return {
+    pageId,
+    appended: true,
+    inkClearance:
+      clearance === null
+        ? null
+        : {
+            blankLines: clearance.breaks,
+            inkBottomPx: Math.round(clearance.inkBottom),
+            measuredFromPx: Math.round(clearance.clearedFrom),
+            contentStartsAtPx: clearance.clearedTo,
+            clearsTheInk: !clearance.truncated,
+          },
+    note:
+      'The content was appended to the end of the page body. On a page authored ' +
+      'in the OneNote client that is the end of the first outline. Nothing that ' +
+      'was on the page was replaced. A read of the page content will show the ' +
+      'change; the page metadata a listing returns can lag behind it by a few ' +
+      'seconds.' +
+      (clearance === null
+        ? ''
+        : ' This outline also holds handwriting, which OneNote keeps at a fixed ' +
+          'position that no write can move, so the content was preceded by blank ' +
+          'lines to bring it below the lowest stroke. The gap above it is ' +
+          'deliberate.'),
+  };
+}
+
+/**
+ * The one page in `sectionId` titled `pageTitle`.
+ *
+ * Graph does the comparison, case-insensitively and across the whole section, so no
+ * bound on how many pages the section holds can hide a match. Zero and more than one are
+ * both errors: this is a write, and appending to a guessed page puts someone's content
+ * on a page they did not name with nothing to say so.
+ *
+ * @throws {NameLookupError} when the title matches no page or more than one.
+ */
+async function onePageByTitle(
+  lookup: WriteLookupStructure,
+  sectionId: string,
+  pageTitle: string,
+): Promise<PageSummary> {
+  const matches = await lookup.findPagesByTitle(sectionId, pageTitle);
+  const first = matches[0];
+  if (matches.length === 1 && first !== undefined) return first;
+
+  throw new NameLookupError(
+    matches.length === 0 ? 'not-found' : 'ambiguous',
+    'pageTitle',
+    pageTitle,
+    matches.map((page) => ({ id: page.id, displayName: page.title })),
+    'page-title',
+  );
+}
+
+/** The three name arguments, read the same way by both `_by_name` writing tools. */
+function namePath(args: Readonly<Record<string, unknown>>): {
+  notebookName: string;
+  sectionGroupName: string | undefined;
+  sectionName: string;
+} {
+  return {
+    notebookName: requiredString(args, 'notebookName'),
+    sectionGroupName: optionalString(args, 'sectionGroupName'),
+    sectionName: requiredString(args, 'sectionName'),
+  };
 }
 
 /**

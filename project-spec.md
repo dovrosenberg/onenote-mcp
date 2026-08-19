@@ -161,7 +161,9 @@ the alignment is arithmetic, not guesswork.
 | Tool | Purpose |
 |---|---|
 | `append_to_page(pageId, htmlFragment)` | Appends content to the end of a page's body |
+| `append_to_page_by_name(notebookName, sectionGroupName?, sectionName, pageTitle, htmlFragment)` | Appends to a page named rather than identified |
 | `create_page(sectionId, title, htmlFragment)` | Creates a new page in a section |
+| `create_page_by_name(notebookName, sectionGroupName?, sectionName, title, htmlFragment)` | Creates a page in a section named rather than identified |
 | `update_page_title(pageId, newTitle)` | Changes a page's title |
 
 **Design notes for writing:**

@@ -56,9 +56,14 @@ export function createTools(auth: GraphAuth): ToolDefinition[] {
   // reads a page's layout before it writes so its content does not land on handwriting.
   const content = createGraphPageContent(auth);
 
+  // One structure client serves the browsing tools and `create_page_by_name`, which
+  // resolves a notebook/section-group/section path through the same resolver the
+  // `_by_name` browsing tools use.
+  const structure = createGraphStructure(auth);
+
   return [
-    ...createStructureTools(createGraphStructure(auth)),
+    ...createStructureTools(structure),
     ...createPageTools(content),
-    ...createWriteTools(createGraphPageWrite(auth), content),
+    ...createWriteTools(createGraphPageWrite(auth), content, structure),
   ];
 }

@@ -101,10 +101,18 @@ against the live account on 2026-08-18 in a scratch notebook — create, append,
 and a read-back of each. The fake fetch still cannot notice the service changing its
 mind.
 
-`test/write-tools.test.ts` drives the three writing tools through a fake write client, and
+`test/write-tools.test.ts` drives the five writing tools through a fake write client, and
 every refusal test also asserts the client was not called. That is the point of the file:
 a rejected argument must cost no Graph request, and on `create_page` a request that went
-through would leave a page behind.
+through would leave a page behind. The two `_by_name` tools also get a fake
+`WriteLookupStructure` that counts its calls, because two of their properties are things
+they do not do: the common path is one `getExpandedTree` and no fallback, and a refused
+fragment costs not even that. The container matching rules themselves are asserted in
+`test/name-lookup.test.ts` rather than again here; what this file adds for
+`append_to_page_by_name` is that a title matching no page or two pages reaches neither the
+write client nor the page reader, and that an append by name pads for ink identically to
+one by id — the padding assertions are the only thing saying the two tools share the
+`append` helper.
 
 `test/ink-preservation.integration.test.ts` is the only test that talks to the real
 account, and it is skipped unless the environment names a page: `ONENOTE_INK_TEST_PAGE_ID`,
@@ -527,6 +535,35 @@ means the section is a direct child of the notebook, not "search everywhere".
 a named section with its page id, so a model reads the titles, picks one, and passes that
 id straight to `get_page_content`. Nothing else is needed in between, and the tool
 description says so — a caller that re-resolved the name would pay for the lookup twice.
+
+**The two `_by_name` writing tools resolve names after they check the content.**
+`create_page_by_name` and `append_to_page_by_name` are `create_page` and `append_to_page`
+with the section named rather than identified, over the same `resolveSection` the
+browsing `_by_name` tools use, so writing to a known place costs one call instead of a
+`list_notebooks` → `list_sections` walk followed by a write. The title and the fragment
+are validated before the lookup runs: a refused argument costs neither the Graph request
+that resolves the names nor the one that would write. A container name that matches
+nothing or matches twice is a `NameLookupError` and nothing is written — a write tool
+that guessed a section would put content in the wrong notebook and nothing would say so.
+`resolvedPayload` lives in `src/name-lookup.ts` rather than in either tool module,
+because the browsing tools and these two answer with it and a second copy would drift.
+
+**A page title is not matched by the container ladder, and `append_to_page_by_name` says
+so in its error.** Graph compares it in full and case-insensitively across the section,
+which is the same comparison `find_page_by_name` uses. Zero matches and more than one are
+both `NameLookupError`, because this is a write: `find_page_by_name` can answer with an
+empty list and let the caller decide, and an append cannot. `NameLookupError` takes a
+`matching` argument for that — the container message tells the caller a leading number is
+stripped, which is true of a section group and false of a page title, so telling an
+`append_to_page_by_name` caller to drop one would send it to do something that changes
+nothing. The page-title message names `list_pages_by_name` and `search_pages` instead,
+and lists no candidates: getting them costs a second request, and the tool that lists them
+is one call away.
+
+**Both appends go through one `append` helper, and that is deliberate.** It reads the
+page, plans the ink clearance, writes, and builds the result. A second copy of that in
+`append_to_page_by_name` that skipped the read would write across someone's handwriting,
+return 204, and report success — the failure is only visible in OneNote.
 
 **The fallback below a named section group is one filtered request, not a walk.**
 `getExpandedTree` reaches a notebook's sections and one level of section group, because

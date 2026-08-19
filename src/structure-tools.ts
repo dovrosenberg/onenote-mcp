@@ -35,7 +35,12 @@ import type {
   PageSummary,
   SectionWithParents,
 } from './graph-structure.ts';
-import { namesMatch, resolveSection, type ResolvedPath } from './name-lookup.ts';
+import {
+  namesMatch,
+  resolveSection,
+  resolvedPayload,
+  type ResolvedPath,
+} from './name-lookup.ts';
 import {
   MAX_SECTIONS_SEARCHED,
   SEARCH_TIME_BUDGET_MS,
@@ -432,26 +437,6 @@ function namePath(args: Readonly<Record<string, unknown>>): {
     notebookName: requiredString(args, 'notebookName'),
     sectionGroupName: optionalString(args, 'sectionGroupName'),
     sectionName: requiredString(args, 'sectionName'),
-  };
-}
-
-/**
- * What the lookup resolved to, in every `_by_name` result.
- *
- * The ids are here so a caller can move on to get_page_content, list_pages, or the write
- * tools without repeating the lookup, and the display names are here so it can see which
- * container it actually got — the names it passed differ in case, and may differ in
- * whitespace.
- */
-function resolvedPayload(resolved: ResolvedPath): Record<string, unknown> {
-  return {
-    notebook: resolved.notebook,
-    sectionGroup: resolved.sectionGroup,
-    section: resolved.section,
-    // Which rung of the matching ladder answered each name. A caller that asked for
-    // 'February' and got '062 - February' can see that it was matched without its
-    // leading number rather than wonder whether it got the right group.
-    matchedBy: resolved.matchedBy,
   };
 }
 

@@ -268,8 +268,9 @@ curl -s -X POST localhost:8080/mcp \
 Both `Accept` types are required by the Streamable HTTP spec even though this server
 never streams. `createTools` in `src/tools.ts` is the registry — six browsing tools
 (`list_notebooks`, `list_sections`, `list_pages`, `search_pages`, `find_page_by_name`,
-`list_pages_by_name`), one reading tool (`get_page_content`), and three writing tools
-(`append_to_page`, `create_page`, `update_page_title`) — and `src/mcp-server.ts` is the
+`list_pages_by_name`), one reading tool (`get_page_content`), and five writing tools
+(`append_to_page`, `append_to_page_by_name`, `create_page`, `create_page_by_name`,
+`update_page_title`) — and `src/mcp-server.ts` is the
 JSON-RPC surface around them.
 
 A tool that throws comes back as a tool result with `isError: true` and a readable

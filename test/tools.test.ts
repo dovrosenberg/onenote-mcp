@@ -34,7 +34,9 @@ test('createTools exposes the browsing, reading and writing tools', () => {
       'list_pages_by_name',
       'get_page_content',
       'append_to_page',
+      'append_to_page_by_name',
       'create_page',
+      'create_page_by_name',
       'update_page_title',
     ],
   );

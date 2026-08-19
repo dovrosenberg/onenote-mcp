@@ -66,6 +66,17 @@ export interface ResolvedPath {
 export type LookupFailureKind = 'not-found' | 'ambiguous';
 
 /**
+ * Which rule the failed name was matched by, which decides what the message tells the
+ * caller to do next.
+ *
+ * `container` is the notebook / section group / section ladder in this module.
+ * `page-title` is the full-name, case-insensitive comparison Graph does on a section's
+ * pages, which is not the ladder — a caller told to drop a leading number from a page
+ * title would be told to do something that changes nothing.
+ */
+export type MatchedAs = 'container' | 'page-title';
+
+/**
  * A name that matched nothing, or matched more than once.
  *
  * This is an error rather than an empty result on purpose: a caller that named a section
@@ -84,8 +95,9 @@ export class NameLookupError extends Error {
     argument: string,
     wanted: string,
     candidates: readonly ResolvedNode[],
+    matching: MatchedAs = 'container',
   ) {
-    super(buildMessage(kind, argument, wanted, candidates));
+    super(buildMessage(kind, argument, wanted, candidates, matching));
     this.name = 'NameLookupError';
     this.kind = kind;
     this.argument = argument;
@@ -284,6 +296,29 @@ export async function resolveSection(
 }
 
 /**
+ * What the lookup resolved to, as every tool built on it reports it.
+ *
+ * The ids are here so a caller can move on to get_page_content, list_pages, or the write
+ * tools without repeating the lookup, and the display names are here so it can see which
+ * container it actually got — the names it passed differ in case, and may differ in
+ * whitespace. `matchedBy` says which rung of the ladder answered each name, so a caller
+ * that asked for 'February' and got '062 - February' can see that it was matched without
+ * its leading number rather than wonder whether it got the right group.
+ *
+ * It lives here rather than in one of the tool modules because both the browsing tools
+ * and `create_page_by_name` answer with it, and a second copy would drift.
+ */
+export function resolvedPayload(resolved: ResolvedPath): Record<string, unknown> {
+  return {
+    notebook: resolved.notebook,
+    sectionGroup: resolved.sectionGroup,
+    section: resolved.section,
+    matchedBy: resolved.matchedBy,
+    deepSearchUsed: resolved.deepSearchUsed,
+  };
+}
+
+/**
  * The message an `isError` tool result carries.
  *
  * It lists the names that were actually there. Those are the caller's own notebook and
@@ -296,7 +331,26 @@ function buildMessage(
   argument: string,
   wanted: string,
   candidates: readonly ResolvedNode[],
+  matching: MatchedAs,
 ): string {
+  if (matching === 'page-title') {
+    // The candidates are not listed here. Getting them means a second request listing
+    // the section's pages, and the tool that lists them is one call away.
+    if (kind === 'ambiguous') {
+      return (
+        `${argument} '${wanted}' matched ${String(candidates.length)} pages in that ` +
+        `section, so nothing was written. Use list_pages_by_name to see them with their ` +
+        `ids, and append_to_page with the id of the one you meant.`
+      );
+    }
+    return (
+      `${argument} '${wanted}' matched no page in that section. A page title is matched ` +
+      `in full, ignoring case, and never by a leading number or a substring — use ` +
+      `list_pages_by_name to see every title in the section, or search_pages to match ` +
+      `part of one.`
+    );
+  }
+
   const names = candidates.map((node) => node.displayName);
   const shown = names.slice(0, MAX_NAMES_LISTED).join(', ');
   const more = names.length > MAX_NAMES_LISTED ? ` (and ${names.length - MAX_NAMES_LISTED} more)` : '';

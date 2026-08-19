@@ -7,6 +7,11 @@
 // request: a write that is going to be wrong is cheaper to refuse than to send, and on a
 // create it would otherwise leave a page behind that the caller then has to find and
 // delete. Every refusal test asserts the client was not called.
+//
+// `create_page_by_name` is driven through a fake `LookupStructure` as well, and that fake
+// counts its calls: the resolver's own rules are asserted in test/name-lookup.test.ts, so
+// what this file checks is that the section id the tool creates in is the one the lookup
+// returned, and that a refused argument costs neither the lookup nor the write.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -14,12 +19,19 @@ import { readFileSync } from 'node:fs';
 
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
+import type { ExpandedNotebook, PageSummary } from '../src/graph-structure.ts';
 import { GraphRequestError } from '../src/graph-structure.ts';
+import { NameLookupError } from '../src/name-lookup.ts';
 import { ToolInputError, indexTools, type ToolDefinition } from '../src/mcp-tools.ts';
 import type { RawPageContent } from '../src/page-content.ts';
 import { CLEARANCE_ID_PREFIX } from '../src/page-layout.ts';
 import type { CreatedPage } from '../src/page-write.ts';
-import { createWriteTools, type PageLayoutReader, type PageWriteClient } from '../src/write-tools.ts';
+import {
+  createWriteTools,
+  type PageLayoutReader,
+  type PageWriteClient,
+  type WriteLookupStructure,
+} from '../src/write-tools.ts';
 
 const PAGE_ID = '1-abc!123';
 const SECTION_ID = '1-sec!456';
@@ -95,8 +107,72 @@ function fakeLayout(content: RawPageContent = pageContent(TYPED_PAGE)): FakeRead
   };
 }
 
-function tool(name: string, client: PageWriteClient, layout: PageLayoutReader = fakeLayout()): ToolDefinition {
-  const found = indexTools(createWriteTools(client, layout)).get(name);
+/**
+ * A notebook holding one section directly and one inside a section group whose name
+ * carries an ordering prefix. The prefix is what `create_page_by_name` has to see
+ * through when a caller names the month rather than the number.
+ */
+const EXPANDED: ExpandedNotebook[] = [
+  {
+    id: 'nb-2026',
+    displayName: 'Bullet Journal - 2026',
+    sections: [{ id: 'sec-inbox', displayName: 'Inbox' }],
+    sectionGroups: [
+      {
+        id: 'grp-feb',
+        displayName: '062 - February',
+        sections: [{ id: 'sec-log', displayName: 'Monthly Log' }],
+      },
+    ],
+  },
+];
+
+/** The pages `findPagesByTitle` answers with, keyed the way Graph filters them: by title. */
+const PAGES: Record<string, PageSummary[]> = {
+  'monthly log': [
+    { id: '1-page!log', title: 'Monthly Log', lastModifiedDateTime: '2026-08-19T10:00:00Z' },
+  ],
+  standup: [
+    { id: '1-page!a', title: 'Standup', lastModifiedDateTime: '2026-08-19T10:00:00Z' },
+    { id: '1-page!b', title: 'standup', lastModifiedDateTime: '2026-08-18T10:00:00Z' },
+  ],
+};
+
+interface FakeLookup extends WriteLookupStructure {
+  readonly lookups: { tree: number; byName: string[]; titles: { sectionId: string; title: string }[] };
+}
+
+function fakeLookup(tree: ExpandedNotebook[] = EXPANDED): FakeLookup {
+  const lookups = {
+    tree: 0,
+    byName: [] as string[],
+    titles: [] as { sectionId: string; title: string }[],
+  };
+  return {
+    lookups,
+    getExpandedTree: () => {
+      lookups.tree += 1;
+      return Promise.resolve(tree);
+    },
+    findSectionsByName: (displayName: string) => {
+      lookups.byName.push(displayName);
+      return Promise.resolve([]);
+    },
+    // Graph does this comparison in full and case-insensitively, so the fake does too.
+    findPagesByTitle: (sectionId: string, title: string) => {
+      lookups.titles.push({ sectionId, title });
+      return Promise.resolve(PAGES[title.trim().toLowerCase()] ?? []);
+    },
+  };
+}
+
+function tool(
+  name: string,
+  client: PageWriteClient,
+  layout: PageLayoutReader = fakeLayout(),
+  lookup: WriteLookupStructure = fakeLookup(),
+): ToolDefinition {
+  const found = indexTools(createWriteTools(client, layout, lookup)).get(name);
   assert.ok(found !== undefined, `${name} must be registered`);
   return found;
 }
@@ -116,12 +192,18 @@ async function caught(promise: Promise<unknown>): Promise<unknown> {
   assert.fail('expected the call to reject');
 }
 
-test('the three writing tools are registered and none claims to be read-only', () => {
-  const tools = createWriteTools(fakeWrite(), fakeLayout());
+test('the writing tools are registered and none claims to be read-only', () => {
+  const tools = createWriteTools(fakeWrite(), fakeLayout(), fakeLookup());
 
   assert.deepEqual(
     tools.map((t) => t.name),
-    ['append_to_page', 'create_page', 'update_page_title'],
+    [
+      'append_to_page',
+      'append_to_page_by_name',
+      'create_page',
+      'create_page_by_name',
+      'update_page_title',
+    ],
   );
   for (const t of tools) {
     assert.equal(t.annotations?.readOnlyHint, false, `${t.name} writes`);
@@ -285,6 +367,192 @@ test('create_page reports the requested title when Graph echoes an empty one', a
   });
 
   assert.equal(payload(result)['title'], 'Meeting notes');
+});
+
+test('append_to_page_by_name resolves the path and appends to the page it found', async () => {
+  const client = fakeWrite();
+  const lookup = fakeLookup();
+
+  const result = await tool('append_to_page_by_name', client, fakeLayout(), lookup).handle({
+    notebookName: 'Bullet Journal - 2026',
+    sectionGroupName: 'February',
+    sectionName: 'Monthly Log',
+    pageTitle: 'monthly log',
+    htmlFragment: '<p>appended</p>',
+  });
+
+  assert.deepEqual(client.calls, [['appendToPage', '1-page!log', '<p>appended</p>']]);
+  assert.equal(lookup.lookups.tree, 1);
+  assert.deepEqual(lookup.lookups.titles, [{ sectionId: 'sec-log', title: 'monthly log' }]);
+
+  const body = payload(result);
+  assert.equal(body['pageId'], '1-page!log');
+  // The title Graph holds, not the one the caller typed: the caller's differed in case.
+  assert.deepEqual(body['page'], { id: '1-page!log', title: 'Monthly Log' });
+  assert.deepEqual(body['section'], { id: 'sec-log', displayName: 'Monthly Log' });
+  assert.equal(body['appended'], true);
+  assert.match(String(body['note']), /first outline/);
+});
+
+test('an append by name to a page with ink is padded the same way as one by id', async () => {
+  // The clearance is shared code, and this is what says so. A second copy of the append
+  // that skipped the read would write over the handwriting and report success.
+  const client = fakeWrite();
+  const layout = fakeLayout(pageContent(TYPED_PAGE, INK_BELOW_TEXT));
+
+  const result = await tool('append_to_page_by_name', client, layout).handle({
+    notebookName: 'Bullet Journal - 2026',
+    sectionGroupName: 'February',
+    sectionName: 'Monthly Log',
+    pageTitle: 'Monthly Log',
+    htmlFragment: '<p>appended</p>',
+  });
+
+  assert.deepEqual(layout.reads, ['1-page!log']);
+  const sent = client.calls[0]?.[2] ?? '';
+  assert.equal((sent.match(/<br \/>/g) ?? []).length, 18);
+  assert.ok(sent.endsWith(`<div data-id="${CLEARANCE_ID_PREFIX}478"><p>appended</p></div>`));
+  assert.equal(
+    (payload(result)['inkClearance'] as Record<string, unknown>)['contentStartsAtPx'],
+    478,
+  );
+});
+
+test('a page title matching nothing, or more than one page, writes nothing', async () => {
+  // A page title is matched in full and nothing else, so both of these are the caller
+  // being wrong about which page it meant. Appending to a guess would put content on
+  // someone's page with nothing to say it happened.
+  for (const [pageTitle, kind] of [
+    ['No Such Page', 'not-found'],
+    ['Standup', 'ambiguous'],
+  ] as const) {
+    const client = fakeWrite();
+    const layout = fakeLayout();
+
+    const err = await caught(
+      tool('append_to_page_by_name', client, layout).handle({
+        notebookName: 'Bullet Journal - 2026',
+        sectionGroupName: 'February',
+        sectionName: 'Monthly Log',
+        pageTitle,
+        htmlFragment: '<p>appended</p>',
+      }),
+    );
+
+    assert.ok(err instanceof NameLookupError, `${pageTitle} must not be resolved to a page`);
+    assert.equal(err.kind, kind);
+    assert.equal(err.argument, 'pageTitle');
+    // The container ladder does not apply to a page title, and the message must not tell
+    // the caller to drop a leading number from one.
+    assert.doesNotMatch(err.message, /leading number removed/);
+    assert.match(err.message, /list_pages_by_name/);
+    assert.equal(client.calls.length, 0, 'nothing may be written');
+    assert.deepEqual(layout.reads, [], 'and no page may be read');
+  }
+});
+
+test('append_to_page_by_name refuses a bad fragment before it spends the lookup', async () => {
+  const client = fakeWrite();
+  const lookup = fakeLookup();
+
+  const err = await caught(
+    tool('append_to_page_by_name', client, fakeLayout(), lookup).handle({
+      notebookName: 'Bullet Journal - 2026',
+      sectionGroupName: 'February',
+      sectionName: 'Monthly Log',
+      pageTitle: 'Monthly Log',
+      htmlFragment: '<script>x</script>',
+    }),
+  );
+
+  assert.ok(err instanceof ToolInputError);
+  assert.equal(err.argument, 'htmlFragment');
+  assert.equal(lookup.lookups.tree, 0, 'a refused fragment must not cost a Graph request');
+  assert.deepEqual(lookup.lookups.titles, []);
+  assert.equal(client.calls.length, 0);
+});
+
+test('create_page_by_name resolves the names and creates the page in that section', async () => {
+  // The whole point of the tool: notebook, section group and section names in, one page
+  // created, no list_notebooks -> list_sections walk in between. 'February' has to reach
+  // '062 - February', because a caller knows the month and not the number.
+  const client = fakeWrite();
+  const lookup = fakeLookup();
+
+  const result = await tool('create_page_by_name', client, fakeLayout(), lookup).handle({
+    notebookName: 'bullet journal - 2026',
+    sectionGroupName: 'February',
+    sectionName: 'Monthly Log',
+    title: 'Meeting notes',
+    htmlFragment: '<p>body</p>',
+  });
+
+  assert.deepEqual(client.calls, [['createPage', 'sec-log', 'Meeting notes', '<p>body</p>']]);
+  assert.equal(lookup.lookups.tree, 1, 'the common path is one expanded-tree request');
+  assert.deepEqual(lookup.lookups.byName, [], 'and no account-wide fallback');
+
+  const body = payload(result);
+  assert.equal(body['pageId'], '1-new!789');
+  assert.deepEqual(body['section'], { id: 'sec-log', displayName: 'Monthly Log' });
+  assert.deepEqual(body['sectionGroup'], { id: 'grp-feb', displayName: '062 - February' });
+  // A caller that asked for 'February' can see what it actually got, and why.
+  assert.deepEqual(body['matchedBy'], {
+    notebook: 'exact',
+    sectionGroup: 'without-prefix',
+    section: 'exact',
+  });
+  assert.equal(body['deepSearchUsed'], false);
+});
+
+test('create_page_by_name reaches a section sitting directly in the notebook', async () => {
+  const client = fakeWrite();
+
+  await tool('create_page_by_name', client).handle({
+    notebookName: 'Bullet Journal - 2026',
+    sectionName: 'Inbox',
+    title: 'Meeting notes',
+    htmlFragment: '<p>body</p>',
+  });
+
+  assert.deepEqual(client.calls, [['createPage', 'sec-inbox', 'Meeting notes', '<p>body</p>']]);
+});
+
+test('a name that matches nothing creates no page', async () => {
+  // The failure has to happen before the write. A tool that guessed a section would put
+  // someone's meeting notes in the wrong notebook, and nothing would say so.
+  const client = fakeWrite();
+
+  const err = await caught(
+    tool('create_page_by_name', client).handle({
+      notebookName: 'Bullet Journal - 2026',
+      sectionName: 'No Such Section',
+      title: 'Meeting notes',
+      htmlFragment: '<p>body</p>',
+    }),
+  );
+
+  assert.ok(err instanceof NameLookupError);
+  assert.equal(err.argument, 'sectionName');
+  assert.equal(client.calls.length, 0, 'a page must not be created under a guessed name');
+});
+
+test('create_page_by_name refuses a bad fragment before it spends the lookup', async () => {
+  const client = fakeWrite();
+  const lookup = fakeLookup();
+
+  const err = await caught(
+    tool('create_page_by_name', client, fakeLayout(), lookup).handle({
+      notebookName: 'Bullet Journal - 2026',
+      sectionName: 'Inbox',
+      title: 'Meeting notes',
+      htmlFragment: '<html><body><p>x</p></body></html>',
+    }),
+  );
+
+  assert.ok(err instanceof ToolInputError);
+  assert.equal(err.argument, 'htmlFragment');
+  assert.equal(lookup.lookups.tree, 0, 'a refused fragment must not cost a Graph request');
+  assert.equal(client.calls.length, 0);
 });
 
 test('a title holding a tag is refused on both tools, and costs no request', async () => {
