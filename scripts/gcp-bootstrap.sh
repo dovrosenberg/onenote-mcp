@@ -110,6 +110,11 @@ ensure_resource() {
 # the operator waits once rather than six times.
 # ---------------------------------------------------------------------------
 log "enabling APIs"
+# cloudscheduler is enabled here although the keepalive job is optional and this
+# script does not create it: the job needs MCP_KEEPALIVE_SECRET, which is generated
+# by the operator and unknown here. Enabling an API costs nothing, and the README's
+# keepalive command fails with a PERMISSION_DENIED that reads like a missing role
+# when the API is off.
 gcloud services enable \
   run.googleapis.com \
   artifactregistry.googleapis.com \
@@ -117,6 +122,7 @@ gcloud services enable \
   iamcredentials.googleapis.com \
   sts.googleapis.com \
   cloudresourcemanager.googleapis.com \
+  cloudscheduler.googleapis.com \
   --project="$PROJECT"
 
 # ---------------------------------------------------------------------------

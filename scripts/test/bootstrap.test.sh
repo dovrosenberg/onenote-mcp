@@ -93,7 +93,7 @@ echo "--- Phase 2: APIs, Artifact Registry, Firestore ---"
 
 run_bootstrap PROJECT=test-project STUB_MISSING="$ALL_MISSING"
 assert_status 0 "fresh project run exits 0"
-for api in run artifactregistry firestore iamcredentials sts cloudresourcemanager; do
+for api in run artifactregistry firestore iamcredentials sts cloudresourcemanager cloudscheduler; do
   assert_logged "${api}.googleapis.com" "services enable includes ${api}.googleapis.com"
 done
 assert_logged "artifacts repositories create onenote-mcp" "fresh run creates the Artifact Registry repo"

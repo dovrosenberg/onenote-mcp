@@ -513,19 +513,84 @@ flow — it has no browser and nowhere to keep a refresh token — and it is its
 rather than the Layer-1 client secret so that a credential which can reach the whole MCP
 surface is not also sitting in a scheduler job.
 
+### Setting it up on your own account
+
+Four steps: generate a secret, get it onto the service, create the job, and check the
+job actually reaches the service. The whole thing is optional — skip it and the server
+works, up until the day nobody has called it in 90 days.
+
 ```bash
+# 1. Generate the secret. umask 077 so the file is not world-readable, and it is never
+#    printed: the two commands below read it from disk.
+umask 077
+openssl rand -hex 32 > keepalive.secret
+
+# 2. Get it onto the service. The GitHub secret alone changes nothing — the value
+#    reaches the container as an env var, which happens on a deploy and only then.
+gh secret set MCP_KEEPALIVE_SECRET < keepalive.secret
+gh workflow run deploy.yml --ref main
+
+# 3. Create the job. The API enable takes a minute or two to propagate; a create run
+#    immediately after it fails with SERVICE_DISABLED, which is a retry rather than a
+#    misconfiguration.
+gcloud services enable cloudscheduler.googleapis.com --project="$GCP_PROJECT"
+
 gcloud scheduler jobs create http onenote-mcp-keepalive \
+  --project="$GCP_PROJECT" \
+  --location="$GCP_REGION" \
   --schedule="0 4 * * 1" \
   --time-zone=UTC \
-  --uri="https://YOUR-SERVICE-URL/keepalive" \
+  --uri="$MCP_PUBLIC_URL/keepalive" \
   --http-method=POST \
-  --headers="X-Keepalive-Secret=YOUR-SECRET" \
+  --headers="X-Keepalive-Secret=$(cat keepalive.secret)" \
   --attempt-deadline=60s \
   --max-retry-attempts=3
+
+rm keepalive.secret
 ```
+
+`--location` is required and is the scheduler's own region, which has nothing to do with
+where the job's target is; using the Cloud Run region keeps one fewer value in your head.
+`scripts/gcp-bootstrap.sh` enables `cloudscheduler.googleapis.com` too, so step 3's
+enable is only needed on a project bootstrapped before that line existed.
+
+Then prove it, because every failure mode here is silent — a wrong secret, a job pointed
+at the old URL, and a service deployed without the variable all look like a scheduler job
+sitting there enabled:
+
+```bash
+gcloud scheduler jobs run onenote-mcp-keepalive --project="$GCP_PROJECT" --location="$GCP_REGION"
+
+# An empty status code is success. A code is a gRPC status; the request log below says why.
+gcloud scheduler jobs describe onenote-mcp-keepalive \
+  --project="$GCP_PROJECT" --location="$GCP_REGION" \
+  --format='value(status.code,lastAttemptTime,scheduleTime)'
+
+# The request as the service saw it. 200 is the answer; 401 is a secret mismatch and 404
+# means the deploy in step 2 did not happen.
+gcloud logging read \
+  'resource.type="cloud_run_revision" AND httpRequest.requestUrl:"keepalive"' \
+  --project="$GCP_PROJECT" --limit=3 --freshness=10m \
+  --format='value(timestamp,httpRequest.requestMethod,httpRequest.status,httpRequest.userAgent)'
+```
+
+A 200 means the token was exchanged. The thing that proves it was *stored* is the
+`updatedAt` field of the Firestore document moving to the time of the run, which is the
+only evidence the replacement refresh token survived the call. Measured on this
+deployment on 2026-08-19: the forced run answered 200 and `tokencache/msal` advanced from
+`14:15:53Z` to `14:30:54Z`.
 
 Weekly is ample against a 90-day window and leaves room for several missed runs. The job
 costs one token-endpoint round trip and one Firestore write.
+
+To rotate the secret: set the new GitHub secret, deploy, then
+`gcloud scheduler jobs update http onenote-mcp-keepalive --update-headers=…`. Any run
+between the deploy and the job update answers 401 and does no work, which on a weekly
+schedule is a window nothing lands in.
+
+The header sits in the job definition, readable by anyone with `roles/cloudscheduler.viewer`
+on the project, exactly as the env vars sit readable in the Cloud Run revision spec. That
+is the same tradeoff taken in **Deploy** for not running Secret Manager.
 
 | Status | Meaning | What the scheduler should do |
 |---|---|---|
