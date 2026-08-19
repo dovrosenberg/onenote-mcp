@@ -169,13 +169,26 @@ one `getExpandedTree` and no container walk. Its fixture nests a section group i
 section group, which the expanded response cannot reach — that is the only thing
 exercising the fallback walk, because the real account has no nesting at that level.
 
+`test/keepalive.test.ts` drives the route through its own router with a fake target,
+because the success path calls `refresh()` and the real one reaches Firestore and Entra.
+`createApp` is used for the two facts a fake router cannot show: that the route is absent
+when no secret is configured, and that a request carrying no Authorization header gets the
+route's own 401 rather than the bearer gate's challenge. What no test covers is whether a
+forced refresh actually slides Microsoft's window — that is a property of Entra, and
+nothing confirms it until an operator watches the scheduler job run for longer than the
+window.
+
 `test/tools.test.ts` covers the registry, and it constructs the real MSAL and Firestore
 clients while doing so. Neither opens a connection until a token is asked for, so it
 needs no credential and no backend; if that ever stops being true, this test is where it
 will show up first.
 
-`test/token-cache.test.ts` covers `readCache` and nothing else. `readCache` is a pure
-function over a document snapshot, so it runs without a backend. `beforeCacheAccess`,
+`test/token-cache.test.ts` covers `readCache`, `isEmptyCache` and
+`overwriteWouldEmptyCache`, all pure functions that run without a backend. The write
+guard's fixtures name `Account` and `RefreshToken` because that is what MSAL writes today,
+but every assertion in them holds with those keys renamed — that is the property keeping
+the guard from inverting when MSAL changes its format, so do not rewrite them to assert on
+the names. `beforeCacheAccess`,
 `afterCacheAccess`, the transaction inside `afterCacheAccess`, and
 `createFirestoreTokenCachePlugin` have no automated test at all. They need a Firestore
 backend, and the emulator is not installed here. Installing it takes `sudo apt-get
@@ -544,6 +557,21 @@ sent. Protected-resource metadata is served only at
 `/.well-known/oauth-protected-resource/mcp`; the bare path is a 404, measured against SDK
 1.30.0.
 
+**Both consent responses carry `securityHeaders`, and the CSP has no `form-action`.**
+`no-store` because one holds the signed authorization request and the other is a redirect
+carrying a code; `no-referrer` because the form posts from the `/authorize` URL, which has
+`state` and the PKCE challenge in its query string. `form-action` is the directive that
+looks obviously right and would break the flow: browsers have disagreed about whether it
+is checked against a redirect target, and the consent POST answers with a redirect to
+claude.ai.
+
+**`POST /consent` has a rate limit of its own, set above `MAX_PENDING_CODES`.** It is
+mounted ahead of the SDK's `/authorize` limiter on purpose, and a rendered form stays
+postable for `CONSENT_TTL_MS`, so one trip through `/authorize` yields a field that can be
+replayed for ten minutes. The limit is 200 rather than something near 100 so that the code
+store's own eviction — the bound whose behaviour is specified and tested — is what a burst
+runs into first, and the limiter is only a backstop.
+
 **The consent screen, the token format and the code store are `src/oauth-provider.ts`,
 and `src/server.ts` wires the two together.** `oauthRouter` takes the provider as an
 argument and does not construct it, so the dependency runs one way: the provider imports
@@ -701,6 +729,42 @@ caller can do: a status can be retried or mapped, and a malformed body cannot. N
 message prints a notebook, section, or page name — those are user content, and this
 repository's output can reach a public log.
 
+**`forceRefresh` exists for the keepalive route and nothing else.** `acquireTokenSilent`
+without it answers from MSAL's in-memory access token, so no request reaches Entra and
+Microsoft's refresh token does not slide. That is fine for a tool call and useless for a
+keepalive: the whole point of `GraphAuth.refresh()` is the side effect, a replacement
+refresh token with a fresh inactivity window written back to Firestore. Do not add it to
+the tool path — every forced refresh is a token-endpoint round trip and a Firestore write.
+
+**`POST /keepalive` is authenticated by a shared secret, not by a bearer token.** A
+scheduler cannot run the OAuth flow: no browser, nowhere to keep a refresh token. So
+`MCP_KEEPALIVE_SECRET` is compared with `timingSafeEqual` before any work happens, and the
+route sits outside the bearer gate in `createApp`. It is its own variable rather than the
+Layer-1 client secret because that one can reach the whole MCP surface. The route is not
+mounted at all when the variable is unset — a 404 tells an operator the service is
+unconfigured, where a 401 reads as a mistyped secret. Only POST is answered, so a link
+preview cannot spend a token exchange.
+
+**One `GraphAuth` per process, built by `createGraphAuthFor` and passed to both
+consumers.** `createTools` takes it as an argument rather than building it. Two MSAL
+clients would each hold their own in-memory access token and their own view of the
+Firestore cache, so a forced refresh through one would leave the other on a superseded
+blob until its next read, and both would be writing the same document.
+
+**Two events exist for alerting, and their field vocabulary is fixed.**
+`graph-auth-failure` and `token-cache-write-refused`, written through `logEvent` in
+`src/logging.ts` to stderr. They carry a reason from a fixed set and a document path from
+configuration — never an account identifier, never a cause message, never user content.
+They are separate from the request line because a log-based metric keyed on a status code
+cannot tell a dead refresh token from a missing page. `setEventSink` exists for tests only.
+
+**`@odata.nextLink` is checked against the Graph origin before it is followed.** It is the
+one URL in this repository that comes out of a response body rather than being built, and
+every request carries the Graph access token in a header. Graph is what writes these
+links, so the check is not expected to fire; it is there so the token cannot leave
+`https://graph.microsoft.com` whether or not that stays true. A link elsewhere is a
+`GraphResponseError` that does not quote the link.
+
 **The server never signs in interactively.** `acquireTokenByDeviceCode` belongs to
 `src/bootstrap.ts` alone. The deployed service acquires silently from the Firestore
 cache through `src/graph-auth.ts`. A device-code call in a request path would block on a
@@ -718,8 +782,33 @@ is the user's UPN and the second embeds the tenant id.
 
 **The token cache is one opaque string in one document.** `FirestoreTokenCachePlugin`
 stores the output of MSAL's `serialize()` verbatim in the document's `cache` field,
-alongside an `updatedAt` server timestamp. Do not parse that blob and do not split it
-across documents. MSAL owns its structure and changes it between library versions.
+alongside an `updatedAt` server timestamp and a `previousCache` field holding the blob
+that write replaced. Do not parse that blob and do not split it across documents. MSAL
+owns its structure and changes it between library versions.
+
+**`isEmptyCache` is the one exception to not parsing it, and it reads no key name.** A
+cache counts as empty when it parses to a JSON object whose every value is an empty
+container — which is true of `{"Account":{},"RefreshToken":{},…}` whatever those keys are
+called next version. Anything it does not recognise answers "not empty", so the guard
+fails open: the only thing it decides is whether to refuse a write, and refusing every
+write would strand the refresh token in memory. Do not make it look for `Account` or
+`RefreshToken` by name; that is the change that would silently invert it.
+
+**A write that would empty the document is refused, not attempted.**
+`overwriteWouldEmptyCache` in `afterCacheAccess` is the guard. MSAL removes credentials
+from its in-memory cache on some failures and `afterCacheAccess` runs inside MSAL's
+`finally`, so an emptied serialization can reach the write while the stored blob is still
+good — and that blob is the only copy of the refresh token, so replacing it costs a
+device-code sign-in. The refusal logs `token-cache-write-refused` and throws nothing:
+whatever emptied the cache is already on its way out, and a second error would bury it.
+
+**A Firestore failure is `TokenCacheUnavailableError`, never a bare rejection.** Firestore
+is read and written inside `acquireTokenSilent`, so without the distinct type a backend
+outage reaches the operator as `silent-failed`, whose message says to re-run the bootstrap
+CLI — sending a human to a browser to replace a credential that works. `acquireGraphToken`
+walks the cause chain for it and reports `cache-unavailable`, the one reason with
+`retryable: true` and the one message that does not name the CLI. Writes are retried
+three times before it is raised.
 
 **`afterCacheAccess` re-reads inside the transaction.** `--max-instances=1` does not
 prevent two instances existing during a revision transition. The transaction re-reads the

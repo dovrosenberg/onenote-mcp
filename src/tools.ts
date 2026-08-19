@@ -10,7 +10,7 @@
 // every time — see the note on `createGraphAuth` in ./graph-auth.ts.
 
 import type { Config } from './config.ts';
-import { createGraphAuth } from './graph-auth.ts';
+import { createGraphAuth, type GraphAuth } from './graph-auth.ts';
 import { createGraphStructure } from './graph-structure.ts';
 import type { ToolDefinition } from './mcp-tools.ts';
 import { createGraphPageContent } from './page-content.ts';
@@ -18,6 +18,24 @@ import { createPageTools } from './page-tools.ts';
 import { createGraphPageWrite } from './page-write.ts';
 import { createStructureTools } from './structure-tools.ts';
 import { createWriteTools } from './write-tools.ts';
+
+/**
+ * Build the process's one Graph auth object.
+ *
+ * Separate from `createTools` because the keepalive route in ./keepalive.ts needs the
+ * same object. Two of them would mean two MSAL clients, each with its own in-memory
+ * access token and its own view of the Firestore cache — a forced refresh through one
+ * would leave the other holding a superseded blob until its next read, and both would be
+ * writing the same document.
+ */
+export function createGraphAuthFor(config: Config): GraphAuth {
+  const { graph, firestore } = config;
+  if (graph === undefined || firestore === undefined) {
+    throw new Error("internal: createGraphAuthFor needs the 'graph' and 'firestore' config groups");
+  }
+
+  return createGraphAuth(graph, firestore);
+}
 
 /**
  * Every tool this server exposes.
@@ -33,14 +51,7 @@ import { createWriteTools } from './write-tools.ts';
  *
  * The writing tools come last so `tools/list` reads as browse, read, then write.
  */
-export function createTools(config: Config): ToolDefinition[] {
-  const { graph, firestore } = config;
-  if (graph === undefined || firestore === undefined) {
-    throw new Error("internal: createTools needs the 'graph' and 'firestore' config groups");
-  }
-
-  const auth = createGraphAuth(graph, firestore);
-
+export function createTools(auth: GraphAuth): ToolDefinition[] {
   // One page-content client serves both the reading tool and `append_to_page`, which
   // reads a page's layout before it writes so its content does not land on handwriting.
   const content = createGraphPageContent(auth);

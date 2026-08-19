@@ -49,6 +49,7 @@
 
 import express, { Router, type Request, type Response } from 'express';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import rateLimit from 'express-rate-limit';
 
 import { redirectUriMatches } from '@modelcontextprotocol/sdk/server/auth/handlers/authorize.js';
 import { InvalidGrantError, InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
@@ -61,7 +62,13 @@ import type {
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 
 import type { OAuthConfig } from './config.ts';
-import { createClientsStore, mcpResourceUrl, type Layer1Provider } from './oauth-router.ts';
+import {
+  createClientsStore,
+  mcpResourceUrl,
+  RATE_LIMIT,
+  RATE_LIMIT_WINDOW_MS,
+  type Layer1Provider,
+} from './oauth-router.ts';
 
 /**
  * Where the consent form posts back to.
@@ -103,6 +110,22 @@ const REFRESH_TOKEN_TTL_S = 30 * 24 * 60 * 60;
  * Approve once, and the flow that loses a code retries the click.
  */
 const MAX_PENDING_CODES = 100;
+
+/**
+ * How many consent POSTs are accepted in one rate-limit window.
+ *
+ * The route needs a limit of its own because it is deliberately outside the one the SDK
+ * puts on `/authorize`, and because a rendered form stays valid for CONSENT_TTL_MS: one
+ * trip through `/authorize` yields a field that can be posted again and again for ten
+ * minutes, and each post costs an HMAC verification and a Map entry.
+ *
+ * It is set above MAX_PENDING_CODES rather than near it, so the limiter is never what a
+ * burst hits first. The store's own eviction is the bound that matters and the one whose
+ * behaviour is specified; a limiter below the store's capacity would mean the store
+ * could not be filled, which is a different design that nothing here documents. A human
+ * clicking Approve uses one.
+ */
+const CONSENT_RATE_LIMIT = MAX_PENDING_CODES * 2;
 
 /** Payload discriminators. One byte each, because these ride in a URL and a form field. */
 const KIND_ACCESS = 'a';
@@ -203,58 +226,63 @@ export function createOAuthProvider(oauth: OAuthConfig): Layer1Provider {
   }
 
   const router = Router();
-  router.post(CONSENT_PATH, express.urlencoded({ extended: false }), async (req: Request, res: Response) => {
-    res.setHeader('Cache-Control', 'no-store');
+  router.post(
+    CONSENT_PATH,
+    rateLimit({ windowMs: RATE_LIMIT_WINDOW_MS, limit: CONSENT_RATE_LIMIT, ...RATE_LIMIT }),
+    express.urlencoded({ extended: false }),
+    async (req: Request, res: Response) => {
+      securityHeaders(res);
 
-    const body: unknown = req.body;
-    const submitted =
-      typeof body === 'object' && body !== null ? (body as Record<string, unknown>)['request'] : undefined;
-    const payload = typeof submitted === 'string' ? unsign(key, submitted) : null;
+      const body: unknown = req.body;
+      const submitted =
+        typeof body === 'object' && body !== null ? (body as Record<string, unknown>)['request'] : undefined;
+      const payload = typeof submitted === 'string' ? unsign(key, submitted) : null;
 
-    // A form field that was edited, signed with another key, or left in a tab for more
-    // than CONSENT_TTL_MS. Answered here rather than redirected: the redirect URI is
-    // part of what failed to verify, so there is nowhere trustworthy to send the caller,
-    // and no code is minted.
-    if (payload === null || readString(payload, 'k') !== KIND_CONSENT || isExpired(payload)) {
-      res.status(400).type('html').send(refusalPage());
-      return;
-    }
+      // A form field that was edited, signed with another key, or left in a tab for more
+      // than CONSENT_TTL_MS. Answered here rather than redirected: the redirect URI is
+      // part of what failed to verify, so there is nowhere trustworthy to send the caller,
+      // and no code is minted.
+      if (payload === null || readString(payload, 'k') !== KIND_CONSENT || isExpired(payload)) {
+        res.status(400).type('html').send(refusalPage());
+        return;
+      }
 
-    const clientId = readString(payload, 'c');
-    const redirectUri = readString(payload, 'r');
-    const codeChallenge = readString(payload, 'h');
-    if (clientId === null || redirectUri === null || codeChallenge === null) {
-      res.status(400).type('html').send(refusalPage());
-      return;
-    }
+      const clientId = readString(payload, 'c');
+      const redirectUri = readString(payload, 'r');
+      const codeChallenge = readString(payload, 'h');
+      if (clientId === null || redirectUri === null || codeChallenge === null) {
+        res.status(400).type('html').send(refusalPage());
+        return;
+      }
 
-    // Re-checked rather than trusted from the signature. The signature proves this
-    // server built the field; it does not prove the allowlist still holds the URI, and
-    // the key outlives a change to it.
-    const registered = await clientsStore.getClient(clientId);
-    if (
-      registered === undefined ||
-      !registered.redirect_uris.some((allowed) => redirectUriMatches(redirectUri, allowed))
-    ) {
-      res.status(400).type('html').send(refusalPage());
-      return;
-    }
+      // Re-checked rather than trusted from the signature. The signature proves this
+      // server built the field; it does not prove the allowlist still holds the URI, and
+      // the key outlives a change to it.
+      const registered = await clientsStore.getClient(clientId);
+      if (
+        registered === undefined ||
+        !registered.redirect_uris.some((allowed) => redirectUriMatches(redirectUri, allowed))
+      ) {
+        res.status(400).type('html').send(refusalPage());
+        return;
+      }
 
-    const state = readString(payload, 's') ?? '';
-    const scopeString = readString(payload, 'p') ?? '';
-    const code = mintCode({
-      clientId,
-      redirectUri,
-      codeChallenge,
-      scopes: splitScopes(scopeString),
-      expiresAt: Date.now() + AUTHORIZATION_CODE_TTL_MS,
-    });
+      const state = readString(payload, 's') ?? '';
+      const scopeString = readString(payload, 'p') ?? '';
+      const code = mintCode({
+        clientId,
+        redirectUri,
+        codeChallenge,
+        scopes: splitScopes(scopeString),
+        expiresAt: Date.now() + AUTHORIZATION_CODE_TTL_MS,
+      });
 
-    const target = new URL(redirectUri);
-    target.searchParams.set('code', code);
-    if (state !== '') target.searchParams.set('state', state);
-    res.redirect(302, target.href);
-  });
+      const target = new URL(redirectUri);
+      target.searchParams.set('code', code);
+      if (state !== '') target.searchParams.set('state', state);
+      res.redirect(302, target.href);
+    },
+  );
 
   return {
     get clientsStore() {
@@ -290,6 +318,7 @@ export function createOAuthProvider(oauth: OAuthConfig): Layer1Provider {
         x: expiryEpochSeconds(Math.floor(CONSENT_TTL_MS / 1000)),
       });
 
+      securityHeaders(res);
       res
         .status(200)
         .type('html')
@@ -486,6 +515,36 @@ function readNumber(payload: Record<string, unknown>, field: string): number | n
 
 function splitScopes(value: string): string[] {
   return value === '' ? [] : value.split(' ');
+}
+
+/**
+ * The headers both consent responses carry.
+ *
+ * `no-store` because the rendered page holds the signed authorization request and the
+ * POST's answer is a redirect carrying an authorization code; neither may sit in a
+ * shared cache. `no-referrer` because the form posts from the `/authorize` URL, which
+ * carries `state` and the PKCE challenge in its query string, and a `Referer` would
+ * carry them onward. `DENY` and `frame-ancestors 'none'` stop the page being framed —
+ * which buys little on its own, since the screen authenticates nobody and an attacker
+ * can click their own Approve button, but it costs nothing and stops the click being
+ * taken from someone else. The CSP allows the inline `<style>` in `page()` and nothing
+ * else: no script, no image, no font, no request off this origin.
+ *
+ * There is deliberately no `form-action`. It would be the natural directive to add, and
+ * it is the one that breaks this flow: the consent POST answers with a 302 to
+ * claude.ai, and browsers have disagreed about whether `form-action` is checked against
+ * the redirect target as well as the form's own action. A directive that might refuse
+ * the redirect is not worth having on the one page a human has to get through.
+ */
+function securityHeaders(res: Response): void {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+  );
 }
 
 /**

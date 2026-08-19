@@ -176,6 +176,43 @@ test('a nextLink that never stops is abandoned rather than followed forever', as
   assert.ok(calls.length < 100, `expected the walk to stop, made ${calls.length} requests`);
 });
 
+test('a nextLink pointing off the Graph origin is refused before the token is sent', async () => {
+  // Every request this module makes carries the Graph access token in an Authorization
+  // header, and a nextLink is the one URL that comes out of a response body rather than
+  // being built here. Graph is what writes these links, so this is not expected to fire;
+  // it is here so that the token cannot leave graph.microsoft.com whether or not that
+  // stays true.
+  const first = `${GRAPH_ROOT}/me/onenote/notebooks?${NODE_QUERY}`;
+
+  const elsewhere = [
+    'https://graph.microsoft.com.attacker.example/v1.0/me/onenote/notebooks',
+    'http://graph.microsoft.com/v1.0/me/onenote/notebooks',
+    'https://graph.microsoft.com:8443/v1.0/me/onenote/notebooks',
+    'https://attacker.example/collect',
+    '/me/onenote/notebooks?$skiptoken=relative',
+  ];
+
+  for (const next of elsewhere) {
+    const { fetchImpl, calls } = fakeFetch({
+      [first]: () => json({ value: [{ id: 'nb-1', displayName: '2025' }], '@odata.nextLink': next }),
+    });
+
+    const err = await caught(new GraphStructure(tokens, fetchImpl).listNotebooks());
+
+    assert.ok(err instanceof GraphResponseError, `${next}: got ${String(err)}`);
+    // Only the first request was made. The refusal happens before the second is issued,
+    // not after a response comes back from somewhere else.
+    assert.deepEqual(
+      calls.map((call) => call.url),
+      [first],
+      next,
+    );
+    // The link itself is not quoted: it came from a response body, and this output can
+    // reach a public log.
+    assert.ok(!err.message.includes(next), `the message quoted the link: ${err.message}`);
+  }
+});
+
 test('listSections and listSectionGroups address both container kinds and encode the id', async () => {
   // Real OneNote ids contain characters that must not reach the path raw.
   const groupId = '1-abc!def/ghi';

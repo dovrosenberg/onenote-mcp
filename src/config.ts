@@ -127,6 +127,14 @@ const SPECS: readonly VarSpec[] = [
     purpose: 'Bind port; Cloud Run sets this',
     check: checkPort,
   },
+  {
+    name: 'MCP_KEEPALIVE_SECRET',
+    group: 'server',
+    required: false,
+    purpose:
+      'Shared secret a scheduler presents to POST /keepalive, which refreshes the Microsoft token so it does not expire from disuse; the route is not mounted when this is unset',
+    check: checkSecretLength,
+  },
 ];
 
 export interface GraphConfig {
@@ -153,6 +161,14 @@ export interface OAuthConfig {
 
 export interface ServerConfig {
   readonly port: number;
+  /**
+   * The secret POST /keepalive requires, or undefined to not serve that route at all.
+   *
+   * Optional because the service runs correctly without it — it just needs a human at a
+   * browser again if the connector goes unused long enough for Microsoft's refresh token
+   * to lapse. See the keepalive section of README.md.
+   */
+  readonly keepaliveSecret?: string;
 }
 
 export interface Config {
@@ -241,7 +257,13 @@ export function loadConfig(
     };
   }
   if (wanted.has('server')) {
-    config.server = { port: Number(required(values, 'PORT')) };
+    const keepaliveSecret = values.get('MCP_KEEPALIVE_SECRET');
+    config.server = {
+      port: Number(required(values, 'PORT')),
+      // Spread rather than assigned as possibly-undefined: exactOptionalPropertyTypes
+      // treats an explicit undefined as a different type from an absent property.
+      ...(keepaliveSecret === undefined ? {} : { keepaliveSecret }),
+    };
   }
 
   return config;
@@ -353,6 +375,14 @@ function checkDocumentPath(value: string): string | null {
 }
 
 function checkSigningKey(value: string): string | null {
+  return checkSecretLength(value);
+}
+
+/**
+ * The one length rule both shared secrets are held to. It is a floor on how much work a
+ * guess costs, and nothing here can check that the characters were chosen randomly.
+ */
+function checkSecretLength(value: string): string | null {
   if (value.length < MIN_SIGNING_KEY_LENGTH) {
     return `expected at least ${MIN_SIGNING_KEY_LENGTH} characters, got ${value.length}`;
   }

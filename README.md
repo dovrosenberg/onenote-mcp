@@ -53,6 +53,33 @@ state before `npm run bootstrap` has been run. Both entrypoints use this same pl
 the bootstrap CLI writes the cache through it and the server reads through it, so there
 is one serializer and no second format to keep in step.
 
+That blob is the only copy of the refresh token, so two things protect it.
+
+**A write that would empty the document is refused.** MSAL removes credentials from its
+in-memory cache on some failures, and `afterCacheAccess` runs inside MSAL's `finally`
+block, so a serialization that has lost the account can reach this code while the stored
+one is still good. `overwriteWouldEmptyCache` stops it and logs
+`{"event":"token-cache-write-refused"}`. The emptiness check reads no MSAL key name — a
+cache is empty when it parses to an object whose every value is an empty container — so
+it cannot invert when MSAL changes its format, and anything it does not recognise is
+allowed through rather than blocked.
+
+**The blob each write replaces is kept in a `previousCache` field.** One generation, not
+a history: the cache is rewritten on every refresh, and the useful copy is always the
+most recent good one. Recovering from a bad write is copying that field over `cache` in
+the Firestore console, which is worth having because the alternative is a device-code
+sign-in. Turn on point-in-time recovery for a second layer:
+
+```bash
+gcloud firestore databases update --enable-pitr
+```
+
+**A backend failure is not a credential failure.** Firestore being unreachable, or a
+revoked `roles/datastore.user` binding, raises `TokenCacheUnavailableError` rather than
+surfacing as the error a dead refresh token produces. Writes are retried three times
+before that. See the `cache-unavailable` row in the table below for why the distinction
+is worth the code.
+
 `npm test` covers only `readCache`, the function that decodes a document snapshot. The
 two callbacks, the transaction, and `createFirestoreTokenCachePlugin` have no automated
 test — they need a Firestore backend. Exercising them means the emulator, which needs
@@ -84,8 +111,25 @@ caller as a bare 401 from Graph:
 | `reason` | What happened | What to do |
 |---|---|---|
 | `cache-unreadable` | The Firestore document is absent, or its `cache` field is not something MSAL can deserialize | `npm run bootstrap` |
+| `cache-unavailable` | Firestore did not answer, or the runtime service account lost `roles/datastore.user` | Retry. **Not** a sign-in. |
 | `no-account` | The cache was read but holds no signed-in account | `npm run bootstrap` |
 | `silent-failed` | The stored refresh token is expired or revoked, or the token endpoint returned nothing usable | `npm run bootstrap` |
+
+`cache-unavailable` is the row that earns its keep. Firestore is read and written inside
+`acquireTokenSilent`, through the cache plugin, so a backend outage used to arrive as the
+same rejection a dead refresh token produces — and that message tells the operator to go
+to a browser and replace a credential that is working. `GraphAuthError.retryable` carries
+the distinction and only that reason sets it.
+
+Every one of these also writes one line to stderr:
+
+```json
+{"event":"graph-auth-failure","reason":"silent-failed","documentPath":"tokencache/msal","retryable":"false"}
+```
+
+That line is the point. A tool failure otherwise appears only inside a Claude
+conversation, so without it nothing tells the operator the connector has stopped working.
+See **Alerting** below.
 
 The messages name the document path and the underlying MSAL error, and deliberately
 carry no account identifier: `username` is the user's UPN and `homeAccountId` embeds the
@@ -284,6 +328,19 @@ field signed with `MCP_TOKEN_SIGNING_KEY`, so a mid-consent instance replacement
 break the flow and the form cannot be edited; a field that fails to verify is a 400 with
 no redirect and no code minted.
 
+Both consent responses carry `Cache-Control: no-store`, `Referrer-Policy: no-referrer`
+— the form posts from the `/authorize` URL, which has `state` and the PKCE challenge in
+its query string — `X-Frame-Options: DENY`, and a CSP of `default-src 'none'; style-src
+'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'`. There is deliberately no
+`form-action`: browsers have disagreed about whether it is checked against a redirect
+target, and the consent POST answers with a redirect to claude.ai.
+
+`POST /consent` has a rate limit of its own — 200 in 15 minutes — because it is mounted
+ahead of the SDK's `/authorize` limiter on purpose and a rendered form stays postable for
+ten minutes, so one trip through `/authorize` yields a field that can be replayed. The
+limit sits above the 100-entry pending-code cap so that the store's own eviction, whose
+behaviour is specified, is what a burst runs into first.
+
 `POST /token` issues an access token good for one hour and a refresh token good for 30
 days. Both are an HMAC-SHA256 over a compact payload under `MCP_TOKEN_SIGNING_KEY` and
 nothing else — no store is consulted to verify one, which is what keeps a Cloud Run
@@ -432,6 +489,89 @@ window in which a leaked *access* token works. It costs a token request per expi
 human involvement at all, so it is cheap — but it does nothing about a leaked refresh
 token, which is the credential worth worrying about.
 
+## Keepalive
+
+Microsoft's delegated refresh tokens lapse after roughly 90 days without use. The token
+only slides forward when it is actually exchanged, and it is only exchanged when a tool
+call arrives after the held access token has expired — so a connector nobody uses for
+three months is a connector that needs a person at a browser running `npm run bootstrap`.
+Nothing in the server can prevent that on its own, because nothing in the server runs
+when nobody is calling it.
+
+`POST /keepalive` is the fix. It calls `acquireTokenSilent` with `forceRefresh: true`,
+which skips the held access token and exchanges the refresh token, so Entra issues a
+replacement with a fresh window and `src/token-cache.ts` writes it to Firestore.
+`forceRefresh` is the load-bearing part: without it MSAL answers from its own cache, no
+request reaches Entra, and the window does not move.
+
+Set `MCP_KEEPALIVE_SECRET` to at least 32 random characters and the route is mounted;
+leave it unset and the path 404s. A scheduler presents the secret in the
+`X-Keepalive-Secret` header, which is compared in constant time before any work is done.
+It is a shared secret rather than a bearer token because a scheduler cannot run the OAuth
+flow — it has no browser and nowhere to keep a refresh token — and it is its own variable
+rather than the Layer-1 client secret so that a credential which can reach the whole MCP
+surface is not also sitting in a scheduler job.
+
+```bash
+gcloud scheduler jobs create http onenote-mcp-keepalive \
+  --schedule="0 4 * * 1" \
+  --time-zone=UTC \
+  --uri="https://YOUR-SERVICE-URL/keepalive" \
+  --http-method=POST \
+  --headers="X-Keepalive-Secret=YOUR-SECRET" \
+  --attempt-deadline=60s \
+  --max-retry-attempts=3
+```
+
+Weekly is ample against a 90-day window and leaves room for several missed runs. The job
+costs one token-endpoint round trip and one Firestore write.
+
+| Status | Meaning | What the scheduler should do |
+|---|---|---|
+| 200 | The refresh token was exchanged and the new one stored | Nothing |
+| 401 | The secret is absent or wrong | Fix the job; the route did no work |
+| 404 | `MCP_KEEPALIVE_SECRET` is not set on the service | Set it and redeploy |
+| 503 with `"retryable": true` | Firestore was unreachable | Retry |
+| 503 with `"retryable": false` | The grant is dead | `npm run bootstrap` |
+
+What this does **not** protect against: a conditional-access sign-in-frequency policy, a
+password change, an MFA reset, or an admin revoking the grant. Any of those kills the
+refresh token whatever the schedule says, and no code change avoids it. If the Entra
+tenant is yours, exempt this app registration from sign-in-frequency policies; if it is
+not, treat 90 days as an upper bound somebody else can shorten without telling you.
+
+The keepalive route is also unrelated to the Layer-1 30-day window in **Token lifetime**
+below. That refresh token lives in Claude's connector store, and only Claude can present
+it or receive its replacement, so nothing running here can keep it alive. Losing it costs
+one click on the Approve button; losing the Microsoft one costs a device-code sign-in.
+
+## Alerting
+
+Two failures are invisible without a log-based metric, because both show up only as a
+message inside a Claude conversation or as a line nobody is reading:
+
+| Event | Means |
+|---|---|
+| `graph-auth-failure` with `retryable: "false"` | The Microsoft grant is dead. Someone has to run `npm run bootstrap`. |
+| `token-cache-write-refused` | MSAL handed over a cache with no credentials in it. The stored copy survived; something is wrong. |
+
+```bash
+gcloud logging metrics create onenote_mcp_auth_failure \
+  --description="Microsoft Graph credential failures needing an operator" \
+  --log-filter='resource.type="cloud_run_revision"
+    resource.labels.service_name="onenote-mcp"
+    jsonPayload.event=("graph-auth-failure" OR "token-cache-write-refused")
+    jsonPayload.retryable!="true"'
+```
+
+Then an alert policy on that metric being above zero. A consent approval is worth
+watching too: `POST /consent` answering 302 should happen only when you add the
+connector, and the request log already carries it.
+
+```
+jsonPayload.event="request" jsonPayload.path="/consent" jsonPayload.status=302
+```
+
 ## Bootstrap
 
 `npm run bootstrap` is the only interactive Microsoft sign-in in the project, and it runs
@@ -461,9 +601,10 @@ whichever project your `gcloud` login points at, and still print a success line.
 `MCP_OAUTH_*` values are not read, so running this never puts the Layer-1 client secret
 on your machine.
 
-Run it again whenever `GraphAuthError` appears in the server's logs. The refresh token is
-rotated on every use and dies if the service sits idle past roughly 90 days; there is no
-automatic recovery.
+Run it again whenever a `graph-auth-failure` event with `retryable: "false"` appears in
+the server's logs. The refresh token is rotated on every use and dies if the service sits
+idle past roughly 90 days; there is no automatic recovery. Configuring the keepalive job
+above is what stops idleness being one of the ways to get there.
 
 ## Container
 
@@ -520,6 +661,7 @@ and the process exits 1 without a stack trace.
 | `FIRESTORE_CACHE_DOC` | server: no · bootstrap: **yes** | `tokencache/msal` | Firestore document path holding the MSAL token cache |
 | `GOOGLE_CLOUD_PROJECT` | server: no · bootstrap: **yes** | — | GCP project; inferred automatically on Cloud Run |
 | `PORT` | no | `8080` | Bind port. Cloud Run sets this; the server never hardcodes one. |
+| `MCP_KEEPALIVE_SECRET` | no | — | At least 32 characters. Set it and `POST /keepalive` is mounted; leave it unset and the path 404s. See **Keepalive**. |
 
 `FIRESTORE_CACHE_DOC` names the document the MSAL cache plugin in `src/token-cache.ts`
 reads and writes. Its value must be a document path, meaning an even number of

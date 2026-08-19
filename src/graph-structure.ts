@@ -23,6 +23,18 @@ import {
 
 export const GRAPH_ROOT = 'https://graph.microsoft.com/v1.0';
 
+/**
+ * The only origin this module will send the access token to.
+ *
+ * `@odata.nextLink` is followed verbatim, because it carries Graph's own paging cursor
+ * and cannot be rebuilt from parts. That means a URL out of a response body decides
+ * where the next request goes, and every request carries the Graph bearer token in an
+ * Authorization header. A link naming another host would send that token to it. Graph is
+ * the one that writes these links, so this check is not expected to fire; it is here so
+ * that the token cannot leave this origin whether or not that stays true.
+ */
+const GRAPH_ORIGIN = new URL(GRAPH_ROOT).origin;
+
 /** `$select` for structure nodes; display names are needed to show a tree at all. */
 const NODE_SELECT = '$select=id,displayName&$orderby=displayName';
 
@@ -275,6 +287,15 @@ export async function graphGet(
  * early once enough items are in hand, which is what a caller asking for the most
  * recent N pages wants.
  */
+/** Is this an absolute URL on the Graph origin? A relative or malformed URL is not. */
+function isGraphUrl(value: string): boolean {
+  try {
+    return new URL(value).origin === GRAPH_ORIGIN;
+  } catch {
+    return false;
+  }
+}
+
 async function collectValues(
   firstUrl: string,
   accessToken: string,
@@ -312,6 +333,14 @@ async function collectValues(
     if (next === undefined || next === null) break;
     if (typeof next !== 'string' || next === '') {
       throw new GraphResponseError(`GET ${url} returned an unusable @odata.nextLink.`, url);
+    }
+    if (!isGraphUrl(next)) {
+      // The link itself is not quoted. It came from a response body, and this repository's
+      // output can reach a public log.
+      throw new GraphResponseError(
+        `GET ${url} returned an @odata.nextLink pointing somewhere other than ${GRAPH_ORIGIN}, so it was not followed.`,
+        url,
+      );
     }
     // The link is an absolute URL Graph built, including its own paging cursor. It is
     // followed verbatim; rebuilding it from parts loses the cursor.

@@ -122,6 +122,27 @@ test('PORT defaults to 8080 and parses as a number', () => {
   assert.equal(loadConfig(['server'], { PORT: '3000' }).server?.port, 3000);
 });
 
+test('MCP_KEEPALIVE_SECRET is optional, and absent means no keepalive route', () => {
+  // Absent rather than empty. src/server.ts mounts the route only when the property is
+  // there, so the path 404s and a scheduler job fails with "no such path" rather than
+  // with a 401 that reads as a mistyped secret.
+  assert.equal('keepaliveSecret' in (loadConfig(['server'], {}).server ?? {}), false);
+  assert.equal(loadConfig(['server'], { MCP_KEEPALIVE_SECRET: '  ' }).server?.keepaliveSecret, undefined);
+
+  const secret = 's'.repeat(32);
+  assert.equal(loadConfig(['server'], { MCP_KEEPALIVE_SECRET: secret }).server?.keepaliveSecret, secret);
+});
+
+test('a short MCP_KEEPALIVE_SECRET is invalid, held to the signing key length', () => {
+  // It is the only credential on a route that spends a token exchange, so it gets the
+  // same floor as MCP_TOKEN_SIGNING_KEY. Nothing here can check it was chosen randomly.
+  const err = expectConfigError({ MCP_KEEPALIVE_SECRET: 'short' }, ['server']);
+
+  assert.equal(err.missing.length, 0);
+  assert.equal(err.invalid.length, 1);
+  assert.match(err.invalid[0] ?? '', /^MCP_KEEPALIVE_SECRET: expected at least 32 characters, got 5$/);
+});
+
 test('a malformed PORT is invalid, not missing', () => {
   for (const value of ['abc', '70000', '0', '3000.5', '-1']) {
     const err = expectConfigError({ PORT: value }, ['server']);

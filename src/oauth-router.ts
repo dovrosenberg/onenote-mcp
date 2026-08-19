@@ -91,12 +91,15 @@ const REDIRECT_URIS = [
  * 50 requests and block the operator's own connect flow for 15 minutes. No per-IP keying
  * fixes that when every request arrives from one proxy.
  */
-const RATE_LIMIT = {
+export const RATE_LIMIT = {
   keyGenerator: () => 'global',
   // The keying above is what the trustProxy validator warns about, and it no longer
   // applies: the key does not come from the request at all.
   validate: { trustProxy: false, keyGeneratorIpFallback: false },
 };
+
+/** The window both the SDK's limiters and the consent limiter count within. */
+export const RATE_LIMIT_WINDOW_MS = 15 * 60_000;
 
 /** The canonical URL of the MCP endpoint — the `resource` a token is bound to. */
 export function mcpResourceUrl(oauth: OAuthConfig): URL {

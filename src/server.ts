@@ -2,11 +2,12 @@ import express, { type Application, type Request, type Response } from 'express'
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 
 import type { Config } from './config.ts';
+import { KEEPALIVE_PATH, keepaliveRouter } from './keepalive.ts';
 import { requestLogger } from './logging.ts';
 import { MCP_PATH, mcpRouter } from './mcp-server.ts';
 import { createOAuthProvider } from './oauth-provider.ts';
 import { oauthRouter, protectedResourceMetadataUrl } from './oauth-router.ts';
-import { createTools } from './tools.ts';
+import { createGraphAuthFor, createTools } from './tools.ts';
 import { SERVICE_NAME, VERSION } from './version.ts';
 
 /**
@@ -47,6 +48,19 @@ export function createApp(config: Config): Application {
   const provider = createOAuthProvider(config.oauth);
   app.use(oauthRouter(config.oauth, provider));
 
+  // One Graph auth object for the whole process, shared by the tools and by the
+  // keepalive route below. See `createGraphAuthFor` for why it is not built twice.
+  const auth = createGraphAuthFor(config);
+
+  // The keepalive route, when a secret is configured for it. It sits outside the bearer
+  // gate because the caller is a scheduler, which cannot run an OAuth flow: it presents
+  // a shared secret instead, and ./keepalive.ts compares it in constant time before
+  // doing any work. Absent configuration, the route is not mounted and the path 404s.
+  const keepaliveSecret = config.server?.keepaliveSecret;
+  if (keepaliveSecret !== undefined) {
+    app.use(KEEPALIVE_PATH, keepaliveRouter(keepaliveSecret, auth));
+  }
+
   // Everything below this line needs a bearer token. The middleware reads the
   // Authorization header and nothing else — a token in `?access_token=` is not seen, so
   // it answers 401 — and it refuses a token whose audience is not this server's MCP
@@ -71,7 +85,7 @@ export function createApp(config: Config): Application {
       verifier: provider,
       resourceMetadataUrl: protectedResourceMetadataUrl(config.oauth),
     }),
-    mcpRouter(createTools(config)),
+    mcpRouter(createTools(auth)),
   );
 
   return app;

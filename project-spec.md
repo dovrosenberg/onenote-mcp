@@ -335,6 +335,19 @@ ID keeps honoring the old one is undocumented. Do not build on it.
    service stays alive indefinitely. A service idle past that window needs the
    local bootstrap re-run. Conditional access policies can shorten the window.
    Emit a clear, specific error when refresh fails rather than a bare 401.
+
+   **Amended by the keepalive route.** Idleness is no longer one of the ways to
+   get there. `POST /keepalive` calls `acquireTokenSilent` with
+   `forceRefresh: true`, which is what makes the exchange happen whether or not
+   anyone has used the service; a Cloud Scheduler job calls it weekly. See
+   README.md under **Keepalive**. Without `forceRefresh` the call is worthless —
+   MSAL answers from its own access token and no request reaches Entra. What the
+   route cannot do anything about is a conditional-access sign-in-frequency
+   policy, a password change, an MFA reset, or a revoked grant.
+
+   The distinction between a dead credential and an unreachable Firestore is part
+   of the same goal: reporting the second as the first sends a human to a browser
+   to replace a credential that works. `GraphAuthError.retryable` carries it.
 4. **Do not deploy with unauthenticated `allUsers` access at the IAM layer
    without the Layer-1 OAuth described below.** A public Cloud Run URL
    proxying an entire OneNote account is a serious exposure. Claude custom

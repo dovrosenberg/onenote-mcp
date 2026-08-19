@@ -14,6 +14,14 @@
 // The JSON-RPC method and the tool name are protocol-level names from a fixed set. They
 // are the two fields that make a log line useful for telling a failing tool from a
 // failing transport, and neither can hold user content.
+//
+// `logEvent` is the second kind of line: not one per request, but one per operational
+// event worth alerting on — today, a Graph credential that stopped working and a token
+// cache write that was refused. It is separate from the request line because those are
+// the events an operator wants a log-based metric on, and a metric keyed on a status
+// code cannot tell a dead refresh token from a missing page. The same rule applies to
+// what may go in it: fixed field names, values from a fixed set, never user content and
+// never a token.
 
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 
@@ -23,6 +31,31 @@ export type LogSink = (line: string) => void;
 const defaultSink: LogSink = (line) => {
   console.log(line);
 };
+
+let eventSink: LogSink = (line) => {
+  // stderr rather than stdout: these are failures, and Cloud Logging maps the stream to
+  // a severity a log-based metric and an alert policy can filter on.
+  console.error(line);
+};
+
+/**
+ * Redirect event lines. Tests that provoke failures on purpose call this so the run is
+ * not buried in the lines they expect; nothing in `src/` calls it.
+ */
+export function setEventSink(sink: LogSink): void {
+  eventSink = sink;
+}
+
+/**
+ * Write one operational event.
+ *
+ * `event` names it and the fields describe it. Both are chosen at the call site from a
+ * fixed vocabulary — an enum member, a document path from configuration — because this
+ * line is read by an alert policy rather than by a person searching for a request.
+ */
+export function logEvent(event: string, fields: Record<string, string | number> = {}): void {
+  eventSink(JSON.stringify({ event, ...fields }));
+}
 
 /** The per-request fields the MCP route contributes, stashed on `res.locals`. */
 export interface McpLogFields {

@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 
 import type { Config } from '../src/config.ts';
 import { indexTools } from '../src/mcp-tools.ts';
-import { createTools } from '../src/tools.ts';
+import { createGraphAuthFor, createTools } from '../src/tools.ts';
 
 const STUB_CONFIG: Config = {
   graph: { clientId: 'client-id', authority: 'https://login.microsoftonline.com/common' },
@@ -22,7 +22,7 @@ const STUB_CONFIG: Config = {
 };
 
 test('createTools exposes the browsing, reading and writing tools', () => {
-  const tools = createTools(STUB_CONFIG);
+  const tools = createTools(createGraphAuthFor(STUB_CONFIG));
   assert.deepEqual(
     tools.map((tool) => tool.name),
     [
@@ -41,6 +41,14 @@ test('createTools exposes the browsing, reading and writing tools', () => {
   assert.doesNotThrow(() => indexTools(tools));
 });
 
-test('createTools refuses a config that was loaded without the Graph groups', () => {
-  assert.throws(() => createTools({ server: { port: 0 } }), /graph/);
+test('createGraphAuthFor refuses a config that was loaded without the Graph groups', () => {
+  assert.throws(() => createGraphAuthFor({ server: { port: 0 } }), /graph/);
+});
+
+test('one auth object serves the whole process', () => {
+  // The keepalive route and the tools share it. Two MSAL clients would mean two
+  // in-memory access tokens and two writers of the same Firestore document.
+  const auth = createGraphAuthFor(STUB_CONFIG);
+  assert.equal(typeof auth.getAccessToken, 'function');
+  assert.equal(typeof auth.refresh, 'function');
 });

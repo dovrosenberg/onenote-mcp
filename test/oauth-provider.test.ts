@@ -485,6 +485,80 @@ test('the pending-code store is bounded, and drops the oldest code first', async
   assert.equal(body['error'], 'invalid_grant');
 });
 
+test('both consent responses carry the headers that keep them out of caches and frames', async () => {
+  const { challenge } = pkce();
+
+  // The rendered form holds the signed authorization request; the POST's answer is a
+  // redirect carrying an authorization code. Neither may sit in a shared cache, and
+  // neither may leave the query string of /authorize — which carries `state` and the
+  // PKCE challenge — in a Referer on the way to claude.ai.
+  const rendered = await request(
+    `/authorize?${new URLSearchParams({
+      client_id: CLIENT_ID,
+      redirect_uri: REDIRECT_URI,
+      response_type: 'code',
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      scope: 'offline_access',
+    }).toString()}`,
+  );
+  const refused = await approve('not-a-signed-field');
+
+  for (const [label, res] of [
+    ['the rendered form', rendered],
+    ['the consent POST', refused],
+  ] as const) {
+    assert.equal(res.headers.get('cache-control'), 'no-store', label);
+    assert.equal(res.headers.get('referrer-policy'), 'no-referrer', label);
+    assert.equal(res.headers.get('x-frame-options'), 'DENY', label);
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff', label);
+
+    const csp = res.headers.get('content-security-policy') ?? '';
+    assert.match(csp, /default-src 'none'/, label);
+    assert.match(csp, /frame-ancestors 'none'/, label);
+    // No form-action: browsers have disagreed about whether it is checked against a
+    // redirect target, and the consent POST answers with a redirect to claude.ai. A
+    // directive that might refuse that redirect would break the one page a human has to
+    // get through.
+    assert.doesNotMatch(csp, /form-action/, label);
+  }
+});
+
+test('the consent route is rate limited, above the pending-code cap', async () => {
+  // The route needs a limiter of its own: it is mounted ahead of the SDK's /authorize
+  // limiter on purpose, and a rendered form stays postable for CONSENT_TTL_MS, so one
+  // trip through /authorize yields a field that can be posted again and again.
+  //
+  // Its own server, because exhausting the limit on the shared one would leave every
+  // later test in this file rate limited. The forms are invalid on purpose — a request
+  // that is refused for its signature still counts against the limit, which is the
+  // property worth having, since an attacker's requests are the invalid ones.
+  const own = createApp(STUB_CONFIG).listen(0);
+  await new Promise<void>((resolve) => own.once('listening', () => resolve()));
+  const { port } = own.address() as AddressInfo;
+
+  try {
+    const post = (): Promise<Response> =>
+      fetch(`http://127.0.0.1:${port}/consent`, { redirect: 'manual', ...form({ request: 'no' }) });
+
+    const first = await post();
+    assert.equal(first.status, 400);
+    // Above MAX_PENDING_CODES, so the store's own eviction — the bound whose behaviour
+    // is specified — is what a burst runs into first, and the limiter is the backstop.
+    assert.equal(first.headers.get('x-ratelimit-limit'), '200');
+
+    let refused: Response | undefined;
+    for (let i = 0; i < 205 && refused === undefined; i += 1) {
+      const res = await post();
+      if (res.status === 429) refused = res;
+    }
+
+    assert.ok(refused !== undefined, 'the consent route accepted more than its limit');
+  } finally {
+    own.close();
+  }
+});
+
 test('the metadata offers no revocation endpoint', async () => {
   const res = await request('/.well-known/oauth-authorization-server');
   const doc = (await res.json()) as Record<string, unknown>;

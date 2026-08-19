@@ -11,9 +11,16 @@ import {
   acquireGraphToken,
   type SilentTokenSource,
 } from '../src/graph-auth.ts';
-import { TokenCacheError } from '../src/token-cache.ts';
+import { setEventSink } from '../src/logging.ts';
+import { TokenCacheError, TokenCacheUnavailableError } from '../src/token-cache.ts';
 
 const DOC_PATH = 'tokencache/msal';
+
+// Every GraphAuthError below logs an operational event on purpose — that line is what an
+// alert policy keys on, so that a dead credential is not only visible inside a Claude
+// conversation. Silenced here so the run shows the assertions rather than the lines they
+// expect.
+setEventSink(() => {});
 
 /** Fabricated throughout: a fake tenant of all zeroes and a reserved-TLD username. */
 function fakeAccount(): AccountInfo {
@@ -171,6 +178,101 @@ test('a null or blank result throws rather than returning an unusable token', as
     assert.equal(err.reason, 'silent-failed');
     assert.match(err.message, /npm run bootstrap/);
   }
+});
+
+test('forceRefresh is off by default and passed through when asked for', async () => {
+  const requests: SilentFlowRequest[] = [];
+  const client = fakeSource({
+    silent: (request) => {
+      requests.push(request);
+      return Promise.resolve(fakeResult('fake-access-token'));
+    },
+  });
+
+  await acquireGraphToken(client, DOC_PATH);
+  await acquireGraphToken(client, DOC_PATH, { forceRefresh: true });
+  await acquireGraphToken(client, DOC_PATH, { forceRefresh: false });
+
+  // Absent rather than false on the default path. MSAL reads the property, and the
+  // property is what decides whether a request reaches Entra at all: without it a held
+  // access token is returned and the refresh token's inactivity window does not move.
+  assert.equal('forceRefresh' in (requests[0] ?? {}), false);
+  assert.equal(requests[1]?.forceRefresh, true);
+  assert.equal('forceRefresh' in (requests[2] ?? {}), false);
+});
+
+test('a Firestore failure is cache-unavailable, retryable, and does not name the CLI', async () => {
+  // The distinction this test exists for. Firestore is read and written inside the MSAL
+  // calls below, through the plugin, so a backend outage used to arrive as the same
+  // rejection a dead refresh token produces — and that message sends a human to a
+  // browser to replace a credential that is working.
+  const unavailable = new TokenCacheUnavailableError('write', DOC_PATH, {
+    cause: new Error('14 UNAVAILABLE'),
+  });
+
+  const sources: Array<[string, SilentTokenSource]> = [
+    ['on the read, through getAllAccounts', fakeSource({ accounts: () => Promise.reject(unavailable) })],
+    ['on the write, through acquireTokenSilent', fakeSource({ silent: () => Promise.reject(unavailable) })],
+    [
+      'wrapped in another error',
+      fakeSource({
+        silent: () => Promise.reject(new Error('token acquisition failed', { cause: unavailable })),
+      }),
+    ],
+  ];
+
+  for (const [label, client] of sources) {
+    const err = await caught(acquireGraphToken(client, DOC_PATH));
+
+    assert.ok(err instanceof GraphAuthError, `${label}: expected GraphAuthError, got ${String(err)}`);
+    assert.equal(err.reason, 'cache-unavailable', label);
+    assert.equal(err.retryable, true, label);
+    assert.match(err.message, /tokencache\/msal/, label);
+    // The whole point: this failure must not tell the operator to sign in again.
+    assert.doesNotMatch(err.message, /npm run bootstrap/, label);
+    assert.match(err.message, /retry/i, label);
+  }
+});
+
+test('every other reason is not retryable and does name the CLI', async () => {
+  const clients: Array<[string, SilentTokenSource]> = [
+    ['no-account', fakeSource({ accounts: () => Promise.resolve([]) })],
+    [
+      'cache-unreadable',
+      fakeSource({ accounts: () => Promise.reject(new TokenCacheError('bad field', DOC_PATH)) }),
+    ],
+    ['silent-failed', fakeSource({ silent: () => Promise.reject(new Error('invalid_grant')) })],
+  ];
+
+  for (const [reason, client] of clients) {
+    const err = await caught(acquireGraphToken(client, DOC_PATH));
+
+    assert.ok(err instanceof GraphAuthError, reason);
+    assert.equal(err.reason, reason, reason);
+    assert.equal(err.retryable, false, reason);
+    assert.match(err.message, /npm run bootstrap/, reason);
+  }
+});
+
+test('every failure writes one operational event naming the reason', async () => {
+  // The line an alert policy keys on. Without it, a dead grant is visible only inside a
+  // Claude conversation, and nothing tells the operator to run the bootstrap CLI.
+  const lines: string[] = [];
+  setEventSink((line) => lines.push(line));
+
+  await caught(acquireGraphToken(fakeSource({ accounts: () => Promise.resolve([]) }), DOC_PATH));
+
+  setEventSink(() => {});
+
+  assert.equal(lines.length, 1);
+  const event = JSON.parse(lines[0] ?? '{}') as Record<string, unknown>;
+  assert.equal(event['event'], 'graph-auth-failure');
+  assert.equal(event['reason'], 'no-account');
+  assert.equal(event['retryable'], 'false');
+  assert.equal(event['documentPath'], DOC_PATH);
+  // No account identifier: username is the user's UPN and homeAccountId embeds the
+  // tenant id, and this line reaches Cloud Logging.
+  assert.doesNotMatch(lines[0] ?? '', /example\.invalid|fake-object-id/);
 });
 
 test('no module under src/ calls acquireTokenByDeviceCode except bootstrap.ts', async () => {
