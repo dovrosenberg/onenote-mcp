@@ -13,11 +13,17 @@
 //   payload and nothing else; no store is consulted to verify one. That is what makes a
 //   Cloud Run revision replacement invisible to a connected client — an in-memory token
 //   store would force a reconnect on every deploy.
-// - **Refresh tokens are not rotated.** `exchangeRefreshToken` hands the same refresh
-//   token back. Rotation is required for *public* clients; supplying the secret in
-//   Claude's Advanced settings makes this a confidential one, and a stateless token
-//   cannot enforce rotation anyway — there is nothing to mark as spent. After 30 days
-//   the operator consents again.
+// - **Refresh tokens slide, and they are not rotated in the security sense.** Every
+//   refresh mints a new refresh token carrying a fresh 30-day expiry, so a connector in
+//   regular use never returns to the consent screen — the point of this service is to
+//   run unattended, and Claude refreshes on its own. What sliding does *not* do is
+//   invalidate the previous refresh token: it stays good until the expiry stamped in it,
+//   because a stateless token has no record to mark as spent. Real rotation needs a
+//   store, and a store is what makes a revision replacement force a reconnect. Rotation
+//   is required for *public* clients in any case, and the secret in Claude's Advanced
+//   settings makes this a confidential one. The 30 days therefore bound idleness rather
+//   than the connection: a connector unused for 30 days needs one more click, and one
+//   used weekly needs none.
 // - **There is no `revokeToken`, deliberately.** The SDK advertises
 //   `revocation_endpoint` only when the provider implements it, and with stateless
 //   tokens there is nothing to revoke: no record exists to delete and no later request
@@ -79,7 +85,11 @@ const CONSENT_TTL_MS = 10 * 60_000;
 /** Access-token lifetime, in seconds. Claude refreshes reactively on a 401. */
 const ACCESS_TOKEN_TTL_S = 60 * 60;
 
-/** Refresh-token lifetime, in seconds. Not rotated — see the note at the top. */
+/**
+ * Refresh-token lifetime, in seconds, counted from each refresh rather than from the
+ * consent click — see the note at the top. It bounds how long a connector may sit idle
+ * before a human has to approve again, not how long the connection may live.
+ */
 const REFRESH_TOKEN_TTL_S = 30 * 24 * 60 * 60;
 
 /**
@@ -159,6 +169,17 @@ export function createOAuthProvider(oauth: OAuthConfig): Layer1Provider {
       throw new InvalidGrantError('Authorization code was issued to another client');
     }
     return pending;
+  }
+
+  function mintRefreshToken(clientId: string, scopes: readonly string[]): string {
+    return sign(key, {
+      k: KIND_REFRESH,
+      c: clientId,
+      a: audience,
+      p: scopes.join(' '),
+      x: expiryEpochSeconds(REFRESH_TOKEN_TTL_S),
+      n: randomBytes(9).toString('base64url'),
+    });
   }
 
   function issueTokens(clientId: string, scopes: readonly string[], refreshToken: string): OAuthTokens {
@@ -298,21 +319,17 @@ export function createOAuthProvider(oauth: OAuthConfig): Layer1Provider {
         throw new InvalidGrantError('redirect_uri does not match the authorization request');
       }
 
-      const refreshToken = sign(key, {
-        k: KIND_REFRESH,
-        c: client.client_id,
-        a: audience,
-        p: pending.scopes.join(' '),
-        x: expiryEpochSeconds(REFRESH_TOKEN_TTL_S),
-        n: randomBytes(9).toString('base64url'),
-      });
-
-      return issueTokens(client.client_id, pending.scopes, refreshToken);
+      return issueTokens(
+        client.client_id,
+        pending.scopes,
+        mintRefreshToken(client.client_id, pending.scopes),
+      );
     },
 
     /**
-     * Exchanges a refresh token for a new access token, and hands the same refresh token
-     * back — see the note at the top of this file.
+     * Exchanges a refresh token for a new access token and a new refresh token, the
+     * second carrying a fresh 30-day expiry — see the note at the top of this file. The
+     * token handed in stays valid until its own expiry; nothing here can revoke it.
      *
      * Every failure is `invalid_grant`, never `invalid_request` and never a custom code.
      * That is the code Claude keys its re-authentication on: anything else reaches the
@@ -335,10 +352,13 @@ export function createOAuthProvider(oauth: OAuthConfig): Layer1Provider {
       }
 
       const granted = splitScopes(readString(payload, 'p') ?? '');
-      // A refresh may narrow the scopes but never widen them (RFC 6749 section 6).
+      // A refresh may narrow the scopes but never widen them (RFC 6749 section 6). The
+      // narrowing applies to the access token only: the new refresh token carries the
+      // originally granted scopes, so one narrow request does not permanently narrow the
+      // connection.
       const requested = scopes === undefined ? granted : scopes.filter((scope) => granted.includes(scope));
 
-      return issueTokens(client.client_id, requested, refreshToken);
+      return issueTokens(client.client_id, requested, mintRefreshToken(client.client_id, granted));
     },
 
     /**

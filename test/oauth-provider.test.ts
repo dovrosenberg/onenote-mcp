@@ -327,7 +327,7 @@ test('an unregistered redirect_uri is invalid_request, with no redirect', async 
   assert.equal(res.headers.get('location'), null);
 });
 
-test('a refresh token buys a new access token and is not rotated', async () => {
+test('a refresh token buys a new access token and a fresh 30-day window', async () => {
   const { verifier, challenge } = pkce();
   const code = await codeFor(challenge);
 
@@ -349,15 +349,31 @@ test('a refresh token buys a new access token and is not rotated', async () => {
   assert.equal(refreshed.status, 200, JSON.stringify(refreshed.body));
   assert.equal(typeof refreshed.body['access_token'], 'string');
 
-  // Handed back unchanged. Rotation is required for public clients; the secret in
-  // Claude's Advanced settings makes this a confidential one, and a stateless token
-  // cannot enforce rotation anyway — there is no record to mark as spent.
-  assert.equal(refreshed.body['refresh_token'], refreshToken);
+  // A new refresh token, not the one that was handed in. This is what makes the server
+  // run unattended: the 30 days are counted from each refresh, so a connector Claude
+  // refreshes every hour never returns to the consent screen, and only one left idle for
+  // 30 days does.
+  const renewed = refreshed.body['refresh_token'] as string;
+  assert.notEqual(renewed, refreshToken);
+  assert.ok(expiryOf(renewed) >= expiryOf(refreshToken), 'the new refresh token expires no later');
 
   const info = await createOAuthProvider(OAUTH_CONFIG).verifyAccessToken(
     refreshed.body['access_token'] as string,
   );
   assert.equal(info.resource?.href, `${PUBLIC_URL}/mcp`);
+
+  // The renewed token works, and so does the one it replaced. That second half is not an
+  // oversight: a stateless token carries its own expiry and there is no record to mark as
+  // spent, so sliding the window cannot invalidate the previous token. Asserted rather
+  // than left implicit, because it is the difference between this and real rotation.
+  for (const token of [renewed, refreshToken]) {
+    const again = await tokenRequest({
+      grant_type: 'refresh_token',
+      refresh_token: token,
+      client_secret: CLIENT_SECRET,
+    });
+    assert.equal(again.status, 200, JSON.stringify(again.body));
+  }
 });
 
 test('an unreadable or expired refresh token is invalid_grant', async () => {
@@ -478,6 +494,16 @@ test('the metadata offers no revocation endpoint', async () => {
   // rotating MCP_TOKEN_SIGNING_KEY, which invalidates every outstanding token at once.
   assert.equal('revocation_endpoint' in doc, false);
 });
+
+/** The `x` field of a signed payload: its expiry, in seconds since the epoch. */
+function expiryOf(token: string): number {
+  const payload = JSON.parse(Buffer.from(token.split('.')[0]!, 'base64url').toString('utf8')) as Record<
+    string,
+    unknown
+  >;
+  assert.equal(typeof payload['x'], 'number', 'the payload carries no numeric expiry');
+  return payload['x'] as number;
+}
 
 /** Matches the error the SDK's bearer middleware turns into a 401. */
 function isInvalidToken(err: unknown): true {

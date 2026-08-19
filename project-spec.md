@@ -500,7 +500,8 @@ minimal provider and drove it end to end. They are observations of SDK
 
    **Closed by #22**, as the decisions at the end of this section describe:
    HMAC-SHA256 over a compact payload, an hour for an access token and 30 days
-   for a refresh token, neither rotated and neither stored. Authorization
+   for a refresh token, neither stored, and the refresh token's window sliding
+   forward on every use rather than rotating. Authorization
    codes are a `Map`, single-use, 60 seconds, and capped at 100 pending
    entries — `/consent` is reachable by anyone holding the client id, and each
    request it accepts costs an entry for a minute. The oldest is evicted, and
@@ -616,6 +617,19 @@ Read 2026-08-18. These are the constraints the implementation has to meet.
   rotation for *public* clients; supplying the secret in Claude's Advanced
   settings makes this a confidential client, and rotation cannot be
   enforced by a stateless token anyway. Say so in the code.
+
+  **Amended during #22: the refresh token slides.** Each refresh mints a new
+  one carrying a fresh 30-day expiry. As first specified, the expiry was
+  stamped at the consent click and never moved, so a human had to approve
+  again every 30 days whether or not the connector had been used — and this
+  service exists to run unattended. Sliding makes the 30 days bound idleness
+  instead: Claude refreshes hourly on its own, so a connector in regular use
+  never returns to the consent screen, and one left alone for a month needs
+  one click. This is still not rotation. The previous refresh token stays
+  valid until the expiry stamped inside it, because a stateless token has no
+  record to mark as spent, and a store is what would make a revision
+  replacement force a reconnect. `test/oauth-provider.test.ts` asserts both
+  halves — the renewed token works, and so does the one it replaced.
 - **Authorization codes stay in memory**, single-use, 60-second lifetime.
   Losing one to a revision replacement costs a retry of the consent click,
   which is the one moment a human is already present.

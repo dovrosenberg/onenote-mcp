@@ -549,15 +549,28 @@ Run revision replacement invisible to a connected client: an in-memory token sto
 force a reconnect on every deploy. The audience is this server's own resource identifier
 taken from configuration, never the `resource` parameter the request asked for.
 
-**Refresh tokens are not rotated, and there is no `revokeToken`.** `exchangeRefreshToken`
-hands the same refresh token back. Rotation is required for *public* clients; the secret
-in Claude's Advanced settings makes this a confidential one, and a stateless token cannot
-enforce rotation — there is no record to mark as spent. For the same reason there is
-nothing to revoke, and the SDK advertises `revocation_endpoint` only when the provider
-implements it. The operator's lever is rotating `MCP_TOKEN_SIGNING_KEY`, which invalidates
-every outstanding access token, refresh token and consent form at once. Every refresh
-failure is `invalid_grant` — not `invalid_request`, not a custom code — because that is
-what Claude keys its re-authentication on.
+**The refresh token slides, so the server runs unattended.** Every refresh mints a new
+refresh token with a fresh 30-day expiry, which means the 30 days bound how long the
+connector may sit idle, not how long the connection may live: Claude refreshes hourly on
+its own, so a connector in regular use never returns to the consent screen. Issue #22
+specified a non-sliding token and this deviates from it deliberately — unattended
+operation is the point of the service, and a click every 30 days regardless of activity
+defeats it.
+
+**Sliding is not rotation, and the difference is asserted rather than implied.** The
+refresh token handed in stays valid until the expiry stamped inside it; nothing here can
+invalidate it, because a stateless token has no record to mark as spent. Real rotation
+needs a store, and a store is what would make a revision replacement force a reconnect.
+Rotation is required for *public* clients in any case, and the configured client secret
+makes this a confidential one. `test/oauth-provider.test.ts` checks that both the renewed
+token and the one it replaced still work, so the property cannot change unnoticed.
+
+**There is no `revokeToken`, for the same reason.** No record of a stateless token exists
+to delete, and the SDK advertises `revocation_endpoint` only when the provider implements
+it. The operator's lever is rotating `MCP_TOKEN_SIGNING_KEY`, which invalidates every
+outstanding access token, refresh token and consent form at once. Every refresh failure is
+`invalid_grant` — not `invalid_request`, not a custom code — because that is what Claude
+keys its re-authentication on.
 
 **The authorization parameters cross the consent screen signed, and the codes stay in
 memory.** The client id, redirect URI, PKCE challenge, state and scopes ride the form in

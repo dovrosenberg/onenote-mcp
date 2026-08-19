@@ -289,8 +289,13 @@ days. Both are an HMAC-SHA256 over a compact payload under `MCP_TOKEN_SIGNING_KE
 nothing else — no store is consulted to verify one, which is what keeps a Cloud Run
 revision replacement from forcing a reconnect. The payload carries the audience, which is
 `MCP_PUBLIC_URL` plus `/mcp`, so a token is good for this MCP endpoint and no other.
-Refresh tokens are not rotated: the configured client secret makes this a confidential
-client, and a stateless token has no record to mark as spent. There is no revocation
+Each refresh also returns a new refresh token with a fresh 30-day expiry, so the 30 days
+bound how long the connector may sit unused rather than how long it may stay connected —
+Claude refreshes on its own, and a connector in regular use never goes back to the consent
+screen. The refresh token it replaces keeps working until its own expiry: a stateless
+token has no record to mark as spent, so this is a sliding window and not rotation in the
+security sense. Rotation is required for public clients, and the configured client secret
+makes this a confidential one. There is no revocation
 endpoint for the same reason — **changing `MCP_TOKEN_SIGNING_KEY` and redeploying
 invalidates every outstanding access token, refresh token and open consent page at
 once**, which is the lever if a credential ever needs cutting off.
