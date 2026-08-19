@@ -240,6 +240,44 @@ string, the headers, the arguments, or the result — see `src/logging.ts`.
 Nothing on `/mcp` is authenticated yet. Issue #23's bearer-token middleware goes in front
 of the router; `/healthz` stays open.
 
+## OAuth discovery
+
+Claude has to find the authorization server before it can start a flow. `src/oauth-router.ts`
+mounts the SDK's `mcpAuthRouter` at the application root — it builds its paths from the
+issuer URL rather than from a mount point, so it cannot go behind a prefix — and serves
+four routes, all of them unauthenticated by necessity:
+
+| Path | What it is |
+|---|---|
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 authorization-server metadata |
+| `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 protected-resource metadata |
+| `GET,POST /authorize` | Authorization endpoint |
+| `POST /token` | Token endpoint |
+
+```bash
+curl -s localhost:8080/.well-known/oauth-authorization-server
+curl -s localhost:8080/.well-known/oauth-protected-resource/mcp
+```
+
+Everything in both documents is derived from `MCP_PUBLIC_URL`: it is the issuer, and the
+`resource` identifier is it plus `/mcp`. `MCP_PUBLIC_URL` is rejected at startup if it
+carries a trailing slash, so that every URL built by concatenating a path onto it is
+well-formed; the `issuer` field then reports the URL-normalised form, which for an
+origin-only value is the same string with a trailing slash added back. The protected-resource document is served only
+at the path-suffixed URL — the bare `/.well-known/oauth-protected-resource` is a 404, and
+so is `/.well-known/openid-configuration`. Claude probes the suffixed path first.
+
+`scopes_supported` lists `offline_access`, which is what makes Claude ask for a refresh
+token rather than re-consenting whenever an access token expires. There is no
+`registration_endpoint`: the client id and secret are configured, so Dynamic Client
+Registration has nothing to do. One client is registered, with three redirect URIs —
+`https://claude.ai/api/mcp/auth_callback` for the hosted Claude surfaces, and
+`http://localhost/callback` plus `http://127.0.0.1/callback` for Claude Code, whose port
+is ignored per RFC 8252.
+
+`/authorize` and `/token` answer `server_error` until issue #22 supplies the provider
+behind them — the consent screen, the token format, and the code store.
+
 ## Bootstrap
 
 `npm run bootstrap` is the only interactive Microsoft sign-in in the project, and it runs
@@ -289,6 +327,7 @@ docker run --rm -p 8080:8080 \
   -e MCP_OAUTH_CLIENT_ID=test-client \
   -e MCP_OAUTH_CLIENT_SECRET=test-secret \
   -e MCP_TOKEN_SIGNING_KEY=0123456789abcdef0123456789abcdef \
+  -e MCP_PUBLIC_URL=https://onenote-mcp.example.run.app \
   onenote-mcp
 
 curl -i localhost:8080/healthz    # 200, {"status":"ok",...}
@@ -323,6 +362,7 @@ and the process exits 1 without a stack trace.
 | `MCP_OAUTH_CLIENT_ID` | yes | — | Layer-1 OAuth client ID that Claude presents |
 | `MCP_OAUTH_CLIENT_SECRET` | yes | — | Layer-1 OAuth client secret |
 | `MCP_TOKEN_SIGNING_KEY` | yes | — | Key used to sign issued access tokens (min 32 chars) |
+| `MCP_PUBLIC_URL` | yes | — | The service's own public URL: `https`, no query, no fragment, no trailing slash |
 | `FIRESTORE_CACHE_DOC` | server: no · bootstrap: **yes** | `tokencache/msal` | Firestore document path holding the MSAL token cache |
 | `GOOGLE_CLOUD_PROJECT` | server: no · bootstrap: **yes** | — | GCP project; inferred automatically on Cloud Run |
 | `PORT` | no | `8080` | Bind port. Cloud Run sets this; the server never hardcodes one. |
@@ -335,6 +375,13 @@ slash-separated segments; `loadConfig` rejects a collection path at startup.
 `src/graph-auth.ts` presents to Entra ID. It is a public client, so there is deliberately
 no Layer-2 client secret; the `MCP_OAUTH_*` values below it belong to Layer 1, between
 Claude and this server, and are unrelated.
+
+`MCP_PUBLIC_URL` is the URL Claude reaches this service at. The OAuth issuer, the
+`resource` identifier a token is bound to, and the URL of the protected-resource metadata
+document are all built from it. Nothing on Cloud Run tells the process what URL it is
+reached at, and a value taken from the `Host` header would be whatever the caller sent,
+so it is configured. It can only be filled in after the first deploy has produced the
+URL.
 
 `npm run bootstrap` reads only `ONENOTE_CLIENT_ID`, `ONENOTE_AUTHORITY`,
 `FIRESTORE_CACHE_DOC`, and `GOOGLE_CLOUD_PROJECT` — not the `MCP_OAUTH_*` values — and it

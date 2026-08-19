@@ -14,6 +14,7 @@ function fullEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     MCP_OAUTH_CLIENT_ID: 'mcp-client',
     MCP_OAUTH_CLIENT_SECRET: 'mcp-secret',
     MCP_TOKEN_SIGNING_KEY: SIGNING_KEY,
+    MCP_PUBLIC_URL: 'https://onenote-mcp.example.run.app',
     ...overrides,
   };
 }
@@ -39,6 +40,7 @@ test('a complete environment loads every group', () => {
     clientId: 'mcp-client',
     clientSecret: 'mcp-secret',
     tokenSigningKey: SIGNING_KEY,
+    publicUrl: 'https://onenote-mcp.example.run.app',
   });
   assert.deepEqual(config.firestore, {
     cacheDocumentPath: 'tokencache/msal',
@@ -156,6 +158,30 @@ test('MCP_TOKEN_SIGNING_KEY shorter than 32 characters is rejected', () => {
   assert.equal(err.invalid.length, 1);
   assert.match(err.invalid[0] ?? '', /^MCP_TOKEN_SIGNING_KEY: expected at least 32 characters/);
   assert.equal(loadConfig(['oauth'], fullEnv()).oauth?.tokenSigningKey, SIGNING_KEY);
+});
+
+test('MCP_PUBLIC_URL must be an https origin with nothing after it', () => {
+  // Every OAuth URL this service publishes is this value with a path concatenated onto
+  // it, so a trailing slash, a query string or a fragment would appear in the middle of
+  // the result. RFC 8414 forbids the last two on an issuer identifier outright.
+  const bad = [
+    'not-a-url',
+    'http://onenote-mcp.example.run.app',
+    'https://onenote-mcp.example.run.app/',
+    'https://onenote-mcp.example.run.app?a=1',
+    'https://onenote-mcp.example.run.app#f',
+  ];
+
+  for (const value of bad) {
+    const err = expectConfigError(fullEnv({ MCP_PUBLIC_URL: value }), ['oauth']);
+    assert.equal(err.invalid.length, 1, `MCP_PUBLIC_URL=${value} should be invalid`);
+    assert.match(err.invalid[0] ?? '', /^MCP_PUBLIC_URL: /);
+  }
+
+  assert.equal(
+    loadConfig(['oauth'], fullEnv()).oauth?.publicUrl,
+    'https://onenote-mcp.example.run.app',
+  );
 });
 
 test('a whitespace-only value counts as missing, and values are trimmed', () => {

@@ -129,6 +129,15 @@ strokes is only visible in OneNote. `test/fixtures/ink-below-text.inkml` is hand
 so its strokes fall inside a 48px/624px column and end at 466px, which is the case that
 needs padding.
 
+`test/oauth-router.test.ts` drives both metadata documents over a real HTTP server
+through `createApp`, the way `test/mcp-server.test.ts` does. The paths are built from the
+issuer URL rather than from a mount point, so a wrong mount produces a document that
+reads correctly and a 404 at every URL it names — only a request can tell them apart. It
+asserts the endpoints the metadata advertises answer something other than 404 or 405, and
+that neither document contains the client secret or the signing key. What it cannot check
+is whether Claude accepts the documents; nothing confirms that until a real connect
+against the deployed URL.
+
 `test/name-lookup.test.ts` drives the resolver through a fake `LookupStructure` that
 counts calls, because what this module is for is what it does not do: the common path is
 one `getExpandedTree` and no container walk. Its fixture nests a section group inside a
@@ -493,6 +502,37 @@ that fails with 20266 — so there is nothing cheaper to fall back on. The time 
 checked before each section is fetched rather than during, so an overrun costs one round
 trip. A failure listing one section aborts the whole search: an expired refresh token
 fails every section identically, and returning "no matches" for it would be an answer.
+
+**Layer-1 OAuth is the SDK's router, mounted at the application root.**
+`src/oauth-router.ts` mounts `mcpAuthRouter`, which serves both metadata documents,
+`/authorize` and `/token`. It builds every path from the issuer URL rather than from a
+mount point, so it cannot go behind a prefix. `MCP_PUBLIC_URL` is the issuer, and the
+`resource` identifier is that plus `/mcp` — nothing on Cloud Run tells the process what
+URL it is reached at, and a value read from the `Host` header is whatever the caller
+sent. Protected-resource metadata is served only at
+`/.well-known/oauth-protected-resource/mcp`; the bare path is a 404, measured against SDK
+1.30.0.
+
+**Two things about the mount are load-bearing and look like details.**
+`scopesSupported` lists `offline_access`, which is the switch Claude reads to decide
+whether to ask for a refresh token; without it the operator re-consents whenever an
+access token expires. The clients store has no `registerClient`, which is what keeps
+`registration_endpoint` out of the metadata and Dynamic Client Registration out of the
+picture — the client id and secret are configured instead.
+
+**`/.well-known/oauth-authorization-server` is served ahead of the SDK's own copy.** The
+SDK advertises `none` in `token_endpoint_auth_methods_supported` unconditionally, which
+is untrue of a server whose one client record carries a secret. The override is the SDK's
+`createOAuthMetadata` output with that one key replaced, served by the SDK's
+`metadataHandler`, so the two documents cannot drift and the CORS and method handling
+stay identical.
+
+**The OAuth rate limiter keys on a constant.** `trust proxy` is true, so
+`express-rate-limit`'s default key is a forgeable `X-Forwarded-For` value and the library
+logs a stack trace on every `/authorize` and `/token` request. Behind Cloud Run every
+caller shares one bucket anyway. The constant key says so, and the lockout it allows —
+anyone who finds the URL can spend the token endpoint's 50 requests — is stated in
+`project-spec.md` and accepted.
 
 **A tool failure is an `isError` result; a protocol fault is a JSON-RPC error.** Every
 error a tool throws goes through `toolErrorResult`, because an expired refresh token, a

@@ -490,9 +490,17 @@ minimal provider and drove it end to end. They are observations of SDK
    the caller controls, so a confidential-client-only server still says it
    accepts public clients. The enforcement is correct regardless — a client
    record holding a secret makes the secret mandatory — so this is a
-   truthfulness problem in the document, not a hole. Removing it means
-   serving `/.well-known/oauth-authorization-server` from our own route
-   registered ahead of `mcpAuthRouter`.
+   truthfulness problem in the document, not a hole.
+
+   **Closed by #21.** `src/oauth-router.ts` registers
+   `/.well-known/oauth-authorization-server` ahead of `mcpAuthRouter` and
+   serves `client_secret_post` alone. The document is still the SDK's own
+   `createOAuthMetadata` output with that one key replaced, and it is still
+   served by the SDK's `metadataHandler`, so the CORS headers and the
+   GET/OPTIONS-only method handling are identical to the route it replaces
+   and the two documents cannot drift apart as the SDK changes. The reason
+   to bother: the document is what a client reads to decide whether to send
+   the secret at all.
 5. **Protected-resource metadata is served only at the path-suffixed URL.**
    With the resource at `…/mcp`, `/.well-known/oauth-protected-resource`
    itself is a 404. Claude probes the suffixed path first and only falls
@@ -513,7 +521,18 @@ minimal provider and drove it end to end. They are observations of SDK
    so all callers share one bucket. Anyone who finds the URL can exhaust the
    token endpoint's budget and block the operator's own connect flow for 15
    minutes. Neither raising `trust proxy` nor per-IP keying fixes that for a
-   single-user server; note it and move on.
+   single-user server.
+
+   **#21 made the shared bucket explicit and stopped the log noise.** With
+   `trust proxy` set to true — which this service needs behind Cloud Run —
+   `express-rate-limit` derives its key from `X-Forwarded-For`, which any
+   caller can set, and prints a `ValidationError` stack trace on every
+   `/authorize` and `/token` request rather than a log line. Observed while
+   wiring the mount, not predicted. `src/oauth-router.ts` therefore passes a
+   constant `keyGenerator` to both handlers: one global bucket, which is
+   what the measurement above already showed, with no forgeable key and no
+   stack trace. The lockout the paragraph above describes is unchanged and
+   still accepted.
 8. **`mcpAuthRouter` must be mounted at the application root.** It builds
    its paths from the issuer URL, not from a mount point.
 

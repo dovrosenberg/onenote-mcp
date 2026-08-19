@@ -36,6 +36,7 @@ FAKE_ENV=(
   -e MCP_OAUTH_CLIENT_ID=test-client
   -e MCP_OAUTH_CLIENT_SECRET=test-secret
   -e MCP_TOKEN_SIGNING_KEY=0123456789abcdef0123456789abcdef
+  -e MCP_PUBLIC_URL=https://onenote-mcp.example.run.app
 )
 
 pass() { printf '  ok   %s\n' "$1"; }

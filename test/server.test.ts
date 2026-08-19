@@ -12,6 +12,7 @@ const STUB_CONFIG: Config = {
     clientId: 'mcp-client',
     clientSecret: 'mcp-secret',
     tokenSigningKey: 'x'.repeat(32),
+    publicUrl: 'https://onenote-mcp.example.run.app',
   },
   server: { port: 0 },
 };

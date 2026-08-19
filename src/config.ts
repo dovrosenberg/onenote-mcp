@@ -112,6 +112,14 @@ const SPECS: readonly VarSpec[] = [
     check: checkSigningKey,
   },
   {
+    name: 'MCP_PUBLIC_URL',
+    group: 'oauth',
+    required: true,
+    purpose:
+      "The service's own public URL, with no trailing slash; the OAuth issuer, the resource identifier and the resource-metadata URL are all derived from it",
+    check: checkPublicUrl,
+  },
+  {
     name: 'PORT',
     group: 'server',
     required: false,
@@ -135,6 +143,12 @@ export interface OAuthConfig {
   readonly clientId: string;
   readonly clientSecret: string;
   readonly tokenSigningKey: string;
+  /**
+   * The service's own public origin, no trailing slash. Nothing on Cloud Run tells the
+   * process what URL it is reached at, so it is configured rather than derived from a
+   * request — a value taken from Host or X-Forwarded-Host is whatever the caller sent.
+   */
+  readonly publicUrl: string;
 }
 
 export interface ServerConfig {
@@ -223,6 +237,7 @@ export function loadConfig(
       clientId: required(values, 'MCP_OAUTH_CLIENT_ID'),
       clientSecret: required(values, 'MCP_OAUTH_CLIENT_SECRET'),
       tokenSigningKey: required(values, 'MCP_TOKEN_SIGNING_KEY'),
+      publicUrl: required(values, 'MCP_PUBLIC_URL'),
     };
   }
   if (wanted.has('server')) {
@@ -291,6 +306,35 @@ function checkHttpsUrl(value: string): string | null {
   }
   if (url.protocol !== 'https:') {
     return `expected an https URL, got protocol ${JSON.stringify(url.protocol)}`;
+  }
+  return null;
+}
+
+/**
+ * The issuer identifier of an OAuth authorization server: https, no query, no fragment
+ * (RFC 8414 section 2). The trailing slash is rejected on top of that, because every URL
+ * this service publishes is this value with a path concatenated onto it and a trailing
+ * slash would land in the middle of the result.
+ *
+ * A path is not rejected, but the service is expected to sit at the root of an origin:
+ * the SDK's OAuth router builds `/authorize` and `/token` as absolute paths from the
+ * issuer, so a value carrying a path would advertise them one level above where they are
+ * mounted. Cloud Run gives the service an origin of its own.
+ */
+function checkPublicUrl(value: string): string | null {
+  const notHttps = checkHttpsUrl(value);
+  if (notHttps !== null) return notHttps;
+
+  if (value.endsWith('/')) {
+    return `expected no trailing slash, got ${JSON.stringify(value)}`;
+  }
+
+  const url = new URL(value);
+  if (url.search !== '') {
+    return `expected no query string, got ${JSON.stringify(url.search)}`;
+  }
+  if (url.hash !== '') {
+    return `expected no fragment, got ${JSON.stringify(url.hash)}`;
   }
   return null;
 }

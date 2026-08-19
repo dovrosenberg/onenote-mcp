@@ -14,7 +14,12 @@ import { createApp } from '../src/server.ts';
 const STUB_CONFIG: Config = {
   graph: { clientId: 'client-id', authority: 'https://login.microsoftonline.com/common' },
   firestore: { cacheDocumentPath: 'tokencache/msal', projectId: 'proj' },
-  oauth: { clientId: 'mcp-client', clientSecret: 'mcp-secret', tokenSigningKey: 'x'.repeat(32) },
+  oauth: {
+    clientId: 'mcp-client',
+    clientSecret: 'mcp-secret',
+    tokenSigningKey: 'x'.repeat(32),
+    publicUrl: 'https://onenote-mcp.example.run.app',
+  },
   server: { port: 0 },
 };
 
