@@ -1,10 +1,11 @@
 import express, { type Application, type Request, type Response } from 'express';
+import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 
 import type { Config } from './config.ts';
 import { requestLogger } from './logging.ts';
 import { MCP_PATH, mcpRouter } from './mcp-server.ts';
 import { createOAuthProvider } from './oauth-provider.ts';
-import { oauthRouter } from './oauth-router.ts';
+import { oauthRouter, protectedResourceMetadataUrl } from './oauth-router.ts';
 import { createTools } from './tools.ts';
 import { SERVICE_NAME, VERSION } from './version.ts';
 
@@ -43,12 +44,35 @@ export function createApp(config: Config): Application {
   if (config.oauth === undefined) {
     throw new Error("internal: 'oauth' config group required by createApp");
   }
-  app.use(oauthRouter(config.oauth, createOAuthProvider(config.oauth)));
+  const provider = createOAuthProvider(config.oauth);
+  app.use(oauthRouter(config.oauth, provider));
 
+  // Everything below this line needs a bearer token. The middleware reads the
+  // Authorization header and nothing else — a token in `?access_token=` is not seen, so
+  // it answers 401 — and it refuses a token whose audience is not this server's MCP
+  // endpoint, which the spike in #20 measured the SDK as otherwise accepting.
+  //
+  // `resourceMetadataUrl` is what puts `resource_metadata="…"` in the WWW-Authenticate
+  // header of the 401. That URL is how Claude finds the authorization server and starts
+  // the flow, so a 401 without it is a dead end rather than a sign-in prompt.
+  //
+  // No `requiredScopes`. Passing any would make the middleware enforce them and answer a
+  // 403 for a token that has none; the one scope this server issues, `offline_access`,
+  // is about refresh tokens rather than about what a caller may do. If a scope check is
+  // ever added, the 403 has to carry `WWW-Authenticate: Bearer
+  // error="insufficient_scope"` — which this middleware does — because Claude treats any
+  // other 403 as terminal and prompts for nothing.
+  //
   // The tools are built once and shared by every request. The MCP server around them is
-  // per-request — see ./mcp-server.ts. Issue #23's bearer-token middleware goes between
-  // this path and the router; /healthz stays open.
-  app.use(MCP_PATH, mcpRouter(createTools(config)));
+  // per-request — see ./mcp-server.ts.
+  app.use(
+    MCP_PATH,
+    requireBearerAuth({
+      verifier: provider,
+      resourceMetadataUrl: protectedResourceMetadataUrl(config.oauth),
+    }),
+    mcpRouter(createTools(config)),
+  );
 
   return app;
 }

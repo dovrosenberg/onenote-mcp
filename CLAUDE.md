@@ -151,6 +151,18 @@ forms in the store-bound test are signed the same way rather than fetched, becau
 spend the file's whole budget. What it cannot check is whether Claude accepts any of it;
 that waits for a real connect against the deployed URL.
 
+`test/server.test.ts` covers what `createApp` mounts, and the bearer gate is most of it.
+Every assertion is a request over the wire, because what is being tested is the status and
+the `WWW-Authenticate` header an unauthenticated caller gets, neither of which a direct
+call to the middleware produces. The route-enumeration test reaches into Express's
+internals: a mounted router's prefix cannot be read back off the stack in Express 5 — the
+path string is compiled into a matcher and dropped — so it wraps `Router.prototype.use`
+for the duration of one `createApp` call to record the prefixes, and reads leaf paths off
+`layer.route`. That is the cost of the property it asserts, which is that a route added in
+a later issue shows up without anyone remembering to add it to a list. It signs its own
+tokens rather than importing the signer, for the reason `test/oauth-provider.test.ts`
+gives.
+
 `test/name-lookup.test.ts` drives the resolver through a fake `LookupStructure` that
 counts calls, because what this module is for is what it does not do: the common path is
 one `getExpandedTree` and no container walk. Its fixture nests a section group inside a
@@ -609,6 +621,25 @@ logs a stack trace on every `/authorize` and `/token` request. Behind Cloud Run 
 caller shares one bucket anyway. The constant key says so, and the lockout it allows —
 anyone who finds the URL can spend the token endpoint's 50 requests — is stated in
 `project-spec.md` and accepted.
+
+**`/mcp` is closed by the SDK's `requireBearerAuth`, and everything else is open by
+necessity.** The middleware is mounted in `createApp` between `MCP_PATH` and the router,
+with `resourceMetadataUrl` set to `protectedResourceMetadataUrl` — that option is what
+puts `resource_metadata=` in the 401's `WWW-Authenticate` header, and without it the 401
+is a dead end rather than a sign-in prompt. The exempt list is `/healthz`, both
+`.well-known` documents, `/authorize`, `/consent` and `/token`: everything `mcpAuthRouter`
+mounts is reached by a client that holds no token yet. No `requiredScopes` is passed,
+because passing any makes the middleware enforce them and `offline_access` is about
+refresh tokens rather than about what a caller may do.
+
+**The audience is compared with `checkResourceAllowed`, not with `===`.** The SDK's own
+comparison, by URL origin plus path prefix. The two strings come from different places —
+the audience stamped into the token when it was minted, and the configured
+`MCP_PUBLIC_URL` the running process holds — so a byte comparison would refuse a valid
+token over a trailing slash or a host's case. There is no separate issuer check: the
+audience *is* `MCP_PUBLIC_URL` plus the MCP path, so an `iss` field checked against the
+same configuration value would be the same comparison twice. Issue #23 asks for both; this
+is the deviation.
 
 **A tool failure is an `isError` result; a protocol fault is a JSON-RPC error.** Every
 error a tool throws goes through `toolErrorResult`, because an expired refresh token, a

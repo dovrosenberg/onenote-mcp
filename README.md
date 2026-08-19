@@ -237,8 +237,8 @@ Every request writes one JSON log line: the HTTP verb, the path, the status, the
 duration, the JSON-RPC method, and the tool name on a `tools/call`. Never the query
 string, the headers, the arguments, or the result — see `src/logging.ts`.
 
-Nothing on `/mcp` is authenticated yet. Issue #23's bearer-token middleware goes in front
-of the router; `/healthz` stays open.
+`/mcp` is closed behind a bearer token — see [Bearer tokens on the MCP
+endpoint](#bearer-tokens-on-the-mcp-endpoint). `/healthz` stays open.
 
 ## OAuth discovery
 
@@ -289,7 +289,48 @@ days. Both are an HMAC-SHA256 over a compact payload under `MCP_TOKEN_SIGNING_KE
 nothing else — no store is consulted to verify one, which is what keeps a Cloud Run
 revision replacement from forcing a reconnect. The payload carries the audience, which is
 `MCP_PUBLIC_URL` plus `/mcp`, so a token is good for this MCP endpoint and no other. How
-long those tokens live, and how to make a human approve more often, is the next section.
+long those tokens live, and how to make a human approve more often, is two sections down.
+
+## Bearer tokens on the MCP endpoint
+
+Every request to `/mcp` needs `Authorization: Bearer <access token>`. The SDK's
+`requireBearerAuth` sits in front of the MCP router in `createApp`, and
+`verifyAccessToken` in `src/oauth-provider.ts` is what it calls: the HMAC signature under
+`MCP_TOKEN_SIGNING_KEY`, the token kind, the expiry, and the audience. A token that is
+correctly signed and unexpired but carries another server's resource identifier is
+refused — the SDK checks no audience of its own, so without that check a token minted for
+a different MCP server by a server sharing this signing key would be accepted.
+
+A request with no token, an expired token, or a token that fails any of those checks is
+`401` with a challenge header:
+
+```
+WWW-Authenticate: Bearer error="invalid_token", error_description="…",
+                  resource_metadata="https://<MCP_PUBLIC_URL>/.well-known/oauth-protected-resource/mcp"
+```
+
+The `resource_metadata` parameter is the part that matters: it is how Claude finds the
+authorization server and starts the flow, so a 401 without it is a dead end rather than a
+sign-in prompt. Claude refreshes reactively on a 401 and proactively a few minutes before
+the stored expiry, so a 401 here is an ordinary event.
+
+The token is read from the `Authorization` header and from nowhere else. `?access_token=`
+in the query string is not honoured — the MCP authorization spec forbids it, and
+`src/logging.ts` leaves the query string out of the log line on the strength of that.
+
+Which routes are open is the exempt list, and it is longer than "everything except
+`/mcp`" because the whole authorization flow has to answer callers who hold no token yet:
+`/healthz`, both `.well-known` documents, `/authorize`, `/consent`, and `/token`. A test
+in `test/server.test.ts` enumerates the routes `createApp` actually registers and asserts
+that every one not on that list answers 401 without a token, so a route added later is
+closed unless someone opens it deliberately.
+
+No scopes are required. `offline_access`, the one scope this server issues, is about
+whether a refresh token is granted rather than about what a caller may do, and requiring
+it would answer 403 for tokens that are otherwise good. If a scope check is ever added,
+the 403 has to carry `WWW-Authenticate: Bearer error="insufficient_scope"` — which this
+middleware does — because Claude treats any other 403 as terminal and prompts for
+nothing.
 
 ## Token lifetime and forcing revalidation
 

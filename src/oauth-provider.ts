@@ -52,6 +52,7 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 import { redirectUriMatches } from '@modelcontextprotocol/sdk/server/auth/handlers/authorize.js';
 import { InvalidGrantError, InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import { checkResourceAllowed } from '@modelcontextprotocol/sdk/shared/auth-utils.js';
 import type { AuthorizationParams } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import type {
@@ -347,7 +348,7 @@ export function createOAuthProvider(oauth: OAuthConfig): Layer1Provider {
       if (readString(payload, 'c') !== client.client_id) {
         throw new InvalidGrantError('Refresh token was issued to another client');
       }
-      if (readString(payload, 'a') !== audience) {
+      if (!audienceMatches(readString(payload, 'a'), audience)) {
         throw new InvalidGrantError('Refresh token was issued for another resource');
       }
 
@@ -362,13 +363,16 @@ export function createOAuthProvider(oauth: OAuthConfig): Layer1Provider {
     },
 
     /**
-     * Verifies an access token. Issue #23 wires this to the MCP route through the SDK's
+     * Verifies an access token. ./server.ts wires this to the MCP route through the SDK's
      * `requireBearerAuth`, which turns `InvalidTokenError` into the 401 that carries
-     * `WWW-Authenticate`.
+     * `WWW-Authenticate`, and which rejects the token outright unless the `expiresAt`
+     * below is a number.
      *
-     * The audience is checked here because the payload carries it: a token signed by
-     * this key for another resource identifier is refused rather than accepted and
-     * compared later.
+     * Four things are checked: the HMAC signature, the kind, the expiry, and the
+     * audience. There is no separate issuer check, and that is not an omission — the
+     * audience *is* `MCP_PUBLIC_URL` plus the MCP path, so a token whose audience passes
+     * was minted by a server configured with this issuer, and an `iss` field compared
+     * against the same configuration value would be the same comparison a second time.
      */
     async verifyAccessToken(token: string): Promise<AuthInfo> {
       const payload = unsign(key, token);
@@ -376,7 +380,7 @@ export function createOAuthProvider(oauth: OAuthConfig): Layer1Provider {
         throw new InvalidTokenError('Access token is invalid or expired');
       }
       const clientId = readString(payload, 'c');
-      if (clientId === null || readString(payload, 'a') !== audience) {
+      if (clientId === null || !audienceMatches(readString(payload, 'a'), audience)) {
         throw new InvalidTokenError('Access token is invalid or expired');
       }
 
@@ -427,6 +431,32 @@ function unsign(key: string, token: string): Record<string, unknown> | null {
     return parsed as Record<string, unknown>;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Does a token's audience name this server's MCP endpoint?
+ *
+ * `checkResourceAllowed` is the SDK's own comparison, and it is used rather than `===`
+ * because the two strings arrive from different places: the audience in the token is
+ * this process's `MCP_PUBLIC_URL` plus the MCP path, and the configured value it is
+ * checked against may be typed by an operator with a trailing slash or a different case
+ * in the host. The comparison is by URL origin plus path prefix, so those cannot make a
+ * valid token look like one issued for another server.
+ *
+ * A malformed value cannot reach here through a signed token, but `new URL` throws on
+ * one, and a throw inside `verifyAccessToken` is a 500 rather than a 401. It is caught
+ * and read as a mismatch.
+ */
+function audienceMatches(tokenAudience: string | null, configuredAudience: string): boolean {
+  if (tokenAudience === null) return false;
+  try {
+    return checkResourceAllowed({
+      requestedResource: tokenAudience,
+      configuredResource: configuredAudience,
+    });
+  } catch {
+    return false;
   }
 }
 

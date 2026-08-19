@@ -1,5 +1,6 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import type { Server as HttpServer } from 'node:http';
 
@@ -22,6 +23,35 @@ const STUB_CONFIG: Config = {
   },
   server: { port: 0 },
 };
+
+/**
+ * An access token in the format src/oauth-provider.ts issues, minted here rather than
+ * obtained by driving the OAuth flow.
+ *
+ * Every request to the service under test carries one, because src/server.ts closes
+ * MCP_PATH behind the SDK's bearer middleware — what the 401 itself looks like is
+ * test/server.test.ts. Signed here rather than through the implementation for the reason
+ * test/oauth-provider.test.ts gives: a test that signs with the implementation's own
+ * function proves only that it agrees with itself.
+ */
+const ACCESS_TOKEN = (() => {
+  const body = Buffer.from(
+    JSON.stringify({
+      k: 'a',
+      c: STUB_CONFIG.oauth?.clientId,
+      a: `${STUB_CONFIG.oauth?.publicUrl}${MCP_PATH}`,
+      p: 'offline_access',
+      x: Math.floor(Date.now() / 1000) + 3600,
+      n: 'test',
+    }),
+  ).toString('base64url');
+  const signature = createHmac('sha256', STUB_CONFIG.oauth?.tokenSigningKey ?? '')
+    .update(body)
+    .digest('base64url');
+  return `${body}.${signature}`;
+})();
+
+const AUTHORIZED = { authorization: `Bearer ${ACCESS_TOKEN}` };
 
 /** Both media types, which the Streamable HTTP transport requires of every POST. */
 const MCP_HEADERS = {
@@ -56,7 +86,7 @@ async function mcp(body: unknown, init: RequestInit = {}): Promise<Response> {
   const { port } = serviceServer.address() as AddressInfo;
   return fetch(`http://127.0.0.1:${port}${MCP_PATH}`, {
     method: 'POST',
-    headers: MCP_HEADERS,
+    headers: { ...MCP_HEADERS, ...AUTHORIZED },
     body: typeof body === 'string' ? body : JSON.stringify(body),
     ...init,
   });
@@ -113,7 +143,7 @@ test('GET is refused with 405 rather than opening an SSE stream', async () => {
   const { port } = serviceServer.address() as AddressInfo;
   const res = await fetch(`http://127.0.0.1:${port}${MCP_PATH}`, {
     method: 'GET',
-    headers: { accept: 'text/event-stream' },
+    headers: { accept: 'text/event-stream', ...AUTHORIZED },
   });
 
   assert.equal(res.status, 405);
@@ -126,7 +156,10 @@ test('GET is refused with 405 rather than opening an SSE stream', async () => {
 test('DELETE is refused with 405', async () => {
   await serviceReady;
   const { port } = serviceServer.address() as AddressInfo;
-  const res = await fetch(`http://127.0.0.1:${port}${MCP_PATH}`, { method: 'DELETE' });
+  const res = await fetch(`http://127.0.0.1:${port}${MCP_PATH}`, {
+    method: 'DELETE',
+    headers: AUTHORIZED,
+  });
 
   assert.equal(res.status, 405);
   assert.equal(res.headers.get('allow'), 'POST');
