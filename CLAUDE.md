@@ -187,6 +187,22 @@ forced refresh actually slides Microsoft's window — that is a property of Entr
 nothing confirms it until an operator watches the scheduler job run for longer than the
 window.
 
+`test/mirror-schema.test.ts` covers `src/mirror-schema.ts`, which touches no backend.
+That split is forced rather than stylistic: `src/mirror-store.ts` and
+`src/mirror-blobs.ts` have **no automated test at all** and cannot get one on this
+machine. They need a Firestore backend and a GCS bucket; the emulator is not installed
+here, for the reason the `test/token-cache.test.ts` paragraph below gives; and an
+in-memory fake is ruled out there for reasons that apply doubly to the mirror — the 1 MiB
+document limit, the 1500-byte document-id limit, whether a query runs at all without its
+composite index, transaction behaviour under a contended lease, and
+`FieldValue.serverTimestamp()` are every one of them properties of Firestore, and a fake
+would assert the fake. So the rule is that those two files hold only calls, and anything
+a person could get wrong lives in `src/mirror-schema.ts` where a plain unit test reaches
+it. If you find yourself adding a branch to `mirror-store.ts`, that branch belongs in
+`mirror-schema.ts`. What no test covers even there is whether Firestore accepts what the
+schema produces: the id rules and both limits are read off Google's documentation rather
+than measured, and only a live write settles them.
+
 `test/graph-decode.test.ts` covers `src/graph-decode.ts`, which has no network in it —
 every function takes an already-parsed value and the URL it came from. Before the split
 these were reachable only through a fake `fetch` keyed by exact URL, so each decode
@@ -837,6 +853,25 @@ consumers.** `createTools` takes it as an argument rather than building it. Two 
 clients would each hold their own in-memory access token and their own view of the
 Firestore cache, so a forced refresh through one would leave the other on a superseded
 blob until its next read, and both would be writing the same document.
+
+**The mirror's blobs are in GCS, and the InkML is stored beside the PNG.** Firestore
+caps a document at 1 MiB and `MAX_INK_PNG_BYTES` is already 750 KB, so a rendered PNG
+would fill most of a document alone. The InkML going to the bucket too is not redundant:
+`MAX_INK_PNG_BYTES` is documented above as a chosen number rather than a measured one,
+and `fitInkToByteBudget` shrinks a render by re-rasterising and measuring — so with only
+the PNG kept, changing that budget would mean re-fetching every inked page from Graph,
+hours of the request budget to correct a guess. It is the same protection the raw HTML
+gets by being stored untrimmed. `src/mirror-blobs.ts` treats a 404 on read as a mirror
+miss and a 404 on delete as success, and lets everything else propagate: a permission
+failure that read as "not mirrored" would send every request to Graph and exhaust the
+hourly budget with nothing saying why.
+
+**`@google-cloud/storage` pins `uuid` through a `package.json` override.** The version
+it depends on transitively carries GHSA-w5hq-g745-h8pq, a missing bounds check in uuid's
+v3/v5/v6 generators when the caller supplies its own buffer. Nothing here or in `gaxios`
+does that, so it is not reachable — but `npm audit` reporting clean is worth more than
+the argument, because there is no audit gate in the deploy workflow to notice a future
+finding that *is* reachable. Drop the override when the upstream dependency moves.
 
 **One Firestore client per process too, and `src/firestore.ts` is the only place one is
 constructed.** `firestoreFor(config)` memoises by project id; `createFirestoreTokenCachePlugin`
