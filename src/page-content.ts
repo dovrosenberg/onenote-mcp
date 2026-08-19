@@ -49,9 +49,25 @@ export interface InkCandidate {
   readonly text: string;
 }
 
-/** The URL of one page's content, with the handwriting included. */
+/**
+ * The URL of one page's content, with the handwriting and the element ids included.
+ *
+ * `includeIDs=true` is what makes Graph emit the generated `id` attributes a PATCH can
+ * target. Without it a page authored in the OneNote client comes back with no id and no
+ * `data-id` anywhere, so nothing on it is addressable and the write tools in
+ * ./page-write.ts can only reach `body` and `title`. The two parameters compose:
+ * measured on 2026-08-18, `includeIDs=true&includeInkML=true` answers 200 with
+ * `multipart/mixed` and the ids present in the HTML part, so ./multipart.ts is
+ * unaffected.
+ *
+ * Generated ids change whenever the page is updated, so anything that targets one has to
+ * read it in the same operation that uses it. They are not cacheable between calls.
+ */
 export function pageContentUrl(pageId: string): string {
-  return `${GRAPH_ROOT}/me/onenote/pages/${encodeURIComponent(pageId)}/content?includeInkML=true`;
+  return (
+    `${GRAPH_ROOT}/me/onenote/pages/${encodeURIComponent(pageId)}/content` +
+    `?includeIDs=true&includeInkML=true`
+  );
 }
 
 /**

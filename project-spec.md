@@ -207,6 +207,12 @@ the alignment is arithmetic, not guesswork.
   handwriting intact. This is the single most important thing to test.
 - `create_page` must set a real page title (the `<title>` element in the
   submitted HTML), not just heading text in the body.
+- **A page created here omits `data-absolute-enabled` from its `<body>`.**
+  Graph then wraps the submission in one `<div data-id="_default">`, so
+  `body` addresses the whole page and `append_to_page` reaches the bottom of
+  it. Setting the attribute would give sibling outlines like a
+  client-authored page and put every append in the first one. The two page
+  shapes cannot both behave well; this picks the one this server creates.
 
 ---
 

@@ -15,18 +15,23 @@ import { createGraphStructure } from './graph-structure.ts';
 import type { ToolDefinition } from './mcp-tools.ts';
 import { createGraphPageContent } from './page-content.ts';
 import { createPageTools } from './page-tools.ts';
+import { createGraphPageWrite } from './page-write.ts';
 import { createStructureTools } from './structure-tools.ts';
+import { createWriteTools } from './write-tools.ts';
 
 /**
  * Every tool this server exposes.
  *
- * Issue #15 adds the four browsing tools and #16 the reading tool. Writing (#18)
- * appends to the list returned here.
+ * Issue #15 adds the browsing tools, #16 the reading tool, and #18 the three writing
+ * tools.
  *
- * The browsing tools and the reading tool are built over two different Graph clients
- * because the endpoints answer with different things — JSON for structure, a
- * `multipart/mixed` body for page content — but both take the same auth object, so one
- * MSAL client and one token cache serve the whole process.
+ * They are built over three Graph clients because the endpoints answer with different
+ * things — JSON for structure, a `multipart/mixed` body for page content, 204 with no
+ * body for a write — but all three take the same auth object, so one MSAL client and one
+ * token cache serve the whole process. All three also share the process-wide request
+ * gate, which is what keeps reads and writes together inside OneNote's per-user limits.
+ *
+ * The writing tools come last so `tools/list` reads as browse, read, then write.
  */
 export function createTools(config: Config): ToolDefinition[] {
   const { graph, firestore } = config;
@@ -39,5 +44,6 @@ export function createTools(config: Config): ToolDefinition[] {
   return [
     ...createStructureTools(createGraphStructure(auth)),
     ...createPageTools(createGraphPageContent(auth)),
+    ...createWriteTools(createGraphPageWrite(auth)),
   ];
 }

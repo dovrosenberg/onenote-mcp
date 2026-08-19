@@ -16,7 +16,7 @@ const STUB_CONFIG: Config = {
   server: { port: 0 },
 };
 
-test('createTools exposes the browsing tools and the reading tool', () => {
+test('createTools exposes the browsing, reading and writing tools', () => {
   const tools = createTools(STUB_CONFIG);
   assert.deepEqual(
     tools.map((tool) => tool.name),
@@ -28,6 +28,9 @@ test('createTools exposes the browsing tools and the reading tool', () => {
       'find_page_by_name',
       'list_pages_by_name',
       'get_page_content',
+      'append_to_page',
+      'create_page',
+      'update_page_title',
     ],
   );
   assert.doesNotThrow(() => indexTools(tools));

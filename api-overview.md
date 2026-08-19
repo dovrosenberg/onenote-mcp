@@ -242,6 +242,34 @@ scratch notebook. The three request bodies issue #18 needs:
   them, while the create response itself carried the right title. Do not confirm a write by
   re-reading metadata immediately.
 
+### Creating a page
+
+`POST /me/onenote/sections/{id}/pages` with the page as one HTML document. Source:
+<https://learn.microsoft.com/en-us/graph/api/section-post-pages>.
+
+| What | Value |
+|---|---|
+| `Content-Type` | `text/html` for an HTML-only page; `multipart/form-data` only when the request also carries binary parts. |
+| Body | A whole document: `<html><head><title>…</title></head><body>…</body></html>`. |
+| Success | `201` with the created page as JSON — `id`, `title`, `contentUrl`, and `links.oneNoteWebUrl` / `links.oneNoteClientUrl`. |
+
+**From the documentation, not measured.** The spike in issue #17 created its throwaway
+pages but did not record which content type it used, so the `text/html` form is what
+`src/page-write.ts` sends on the strength of the doc alone. Nothing confirms it until an
+operator runs the server against the real tenant. `multipart/form-data` is not used
+because this server submits no binary.
+
+Two things about the submitted document do come from the spike:
+
+- **The `<title>` element is the page title.** Everything that finds a page by name
+  matches the title Graph stores, and that comes from `<title>`; a heading in the body
+  sets nothing.
+- **`<body data-absolute-enabled="true">` decides the page's shape.** With it the page has
+  sibling top-level divs like a client-authored page. Without it Graph wraps the whole
+  submission in one `<div data-id="_default">`, and `body` then addresses the whole page.
+  `src/page-write.ts` omits it deliberately, so an append to a page this server created
+  lands at the bottom of the page.
+
 **Not tested.** Whether a PATCH preserves ink on a page that has handwriting. Testing it
 needs a page with real strokes, and no such page could be written to during this spike.
 Issue #19 is that test, and it needs handwriting added by hand from a tablet.

@@ -96,6 +96,9 @@ test('tools/list answers on a request that never initialised', async () => {
       'find_page_by_name',
       'list_pages_by_name',
       'get_page_content',
+      'append_to_page',
+      'create_page',
+      'update_page_title',
     ],
   );
 });

@@ -91,6 +91,19 @@ What no test covers is whether an MCP client actually shows the image block to i
 or whether `MAX_INK_PNG_BYTES` is the right number — 750 KB of PNG, about 1 MB once
 base64-encoded, is a budget chosen rather than measured against any client's cap.
 
+`test/page-write.test.ts` drives the write client through a fake `fetch` whose routes are
+keyed by method and exact URL, so an unexpected verb is an unrouted request and every
+assertion about a change array is also an assertion about where it was sent. What it
+cannot check is whether Graph accepts any of it: the change arrays come from the validated
+spike in `api-overview.md`, and the `text/html` create request comes from the
+documentation and was never measured — nothing confirms either until an operator runs the
+server against the real tenant.
+
+`test/write-tools.test.ts` drives the three writing tools through a fake write client, and
+every refusal test also asserts the client was not called. That is the point of the file:
+a rejected argument must cost no Graph request, and on `create_page` a request that went
+through would leave a page behind.
+
 `test/name-lookup.test.ts` drives the resolver through a fake `LookupStructure` that
 counts calls, because what this module is for is what it does not do: the common path is
 one `getExpandedTree` and no container walk. Its fixture nests a section group inside a
@@ -255,6 +268,15 @@ response into `{ html, ink }` — the trimmed HTML and the rendered PNG — and 
 when there are no parts; dropping it because there are no parts to search would lose the
 text of every typed page.
 
+**The content URL asks for `includeIDs=true` as well.** Graph emits the generated `id`
+attributes only when asked, so without it a page authored in the OneNote client comes
+back with no id and no `data-id` anywhere and nothing on it can be targeted by a PATCH.
+The two parameters compose — measured 2026-08-18: `includeIDs=true&includeInkML=true` is
+200, `multipart/mixed`, ids present in the HTML part — so `src/multipart.ts` is
+unaffected. Generated ids change whenever the page is updated, so anything that targets
+one has to read it in the same operation that uses it; they cannot be cached between
+calls.
+
 **The HTML trimmer rewrites tags and never touches text.** `trimPageHtml` in
 `src/page-html.ts` parses to a small tree, filters attributes, drops comments, and
 removes or unwraps elements. Text nodes are copied to the output verbatim, so no entity
@@ -307,7 +329,8 @@ which is what the `requiredString` / `optionalString` / `optionalInteger` helper
 `ToolDefinition` and the argument helpers from `src/mcp-tools.ts`, so listing the modules
 there as well would make the two files import each other. `src/mcp-tools.ts` holds the
 contract, the error mapping, and the helpers; `src/tools.ts` builds the shared Graph
-client and concatenates the lists each tool module returns. `#18` appends there.
+client and concatenates the lists each tool module returns. The order it concatenates in
+is the order `tools/list` shows: browse, read, then write.
 
 **A tool answers with one JSON text block, and every count it reports is real.**
 `list_pages` says `moreAvailable` when Graph returned exactly `top` items, and
@@ -335,6 +358,43 @@ predicted from the pixel count. It stops at `MIN_RENDER_WIDTH` even when that st
 not fit: an image too small to read is a better answer than a failed request, and the
 result says which width it got so the model can tell "illegible handwriting" from
 "rendered too small".
+
+**Writing is a PATCH of change objects, and the shapes are measured, not guessed.**
+`src/page-write.ts` sends `[{target, action, content}]` to
+`PATCH /me/onenote/pages/{id}/content` and reads a 204 with no body. The three shapes and
+every error code they can produce were measured against the live service on 2026-08-18 by
+the spike in issue #17 and are recorded in `api-overview.md` under **Writing page
+content**. The array is applied as a unit: one change naming a missing target fails the
+whole request with 400 code 20120 and applies none of the others.
+
+**`target: "body"` is the first outline, not the page, and `append_to_page` says so.** A
+page authored in the OneNote client has sibling top-level divs, and an append lands at the
+end of the first of them. Reaching another one means reading `?includeIDs=true` and
+targeting that div's generated id, which is issue #27. The tool description states where
+the content went, because a 204 does not.
+
+**A page created here has one outline, deliberately.** `createPageHtml` omits
+`data-absolute-enabled` from `<body>`, so Graph wraps the submission in a single
+`<div data-id="_default">` and `body` then covers the whole page. That is what makes
+`append_to_page` reach the bottom of a page this server created. Setting the attribute
+would produce sibling outlines like a client-authored page, and appends would land in the
+first one.
+
+**The title is escaped on create and verbatim on rename.** `createPage` puts it in a
+`<title>` element inside a document Graph parses, so it is escaped; `updatePageTitle`
+sends it as PATCH `content`, which is stored character for character — the spike produced
+a page actually titled `<p>x</p>`. Escaping the second would put `&amp;` in a title, and
+not escaping the first would let a `<` open a tag.
+
+**The write tools refuse before they spend a request.** `fragmentArgument` rejects a
+fragment carrying `<html>`, `<head>`, `<body>`, `<title>`, `<meta>`, `<base>`, `<link>`,
+`<script>` or `<style>`, and `titleArgument` rejects a title holding a complete tag. Both
+throw `ToolInputError` and neither reaches Graph — on `create_page` a wrong request that
+went through would leave a page behind for someone to find and delete. What is *not*
+checked is well-formedness: `<p>unclosed` returns 204 and the service closes the tag, so a
+strict parser here would refuse content that works. A bare `<` that opens no tag is left
+alone in a title, because `if x <y then` is a legal title and this tool is the only way to
+set one.
 
 **Container names are matched by a ladder, and the result says which rung answered.**
 `matchNodes` in `src/name-lookup.ts` tries exact and case-insensitive, then the same

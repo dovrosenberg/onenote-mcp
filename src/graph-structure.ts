@@ -103,6 +103,8 @@ export class GraphRequestError extends Error {
   readonly body: string;
   /** From `Retry-After`, in milliseconds. Only Graph knows how long a 429 lasts. */
   readonly retryAfterMs: number | undefined;
+  /** The verb, so a failed write does not report itself as a failed read. */
+  readonly method: string;
 
   constructor(
     url: string,
@@ -110,9 +112,10 @@ export class GraphRequestError extends Error {
     statusText: string,
     body: string,
     retryAfterMs?: number,
+    method = 'GET',
   ) {
     super(
-      `GET ${url} failed: ${status} ${statusText}${body === '' ? '' : ` ${truncate(body, MAX_BODY_CHARS)}`}`,
+      `${method} ${url} failed: ${status} ${statusText}${body === '' ? '' : ` ${truncate(body, MAX_BODY_CHARS)}`}`,
     );
     this.name = 'GraphRequestError';
     this.url = url;
@@ -120,6 +123,7 @@ export class GraphRequestError extends Error {
     this.statusText = statusText;
     this.body = body;
     this.retryAfterMs = retryAfterMs;
+    this.method = method;
   }
 }
 
@@ -146,10 +150,16 @@ export interface TokenSource {
   getAccessToken(): Promise<string>;
 }
 
-/** The slice of `fetch` this module uses, so a test can supply its own. */
+/**
+ * The slice of `fetch` this repository uses, so a test can supply its own.
+ *
+ * Every call in this module is a GET and passes only `headers`. `method` and `body` are
+ * here for ./page-write.ts, which PATCHes and POSTs through the same type so one fake
+ * fetch in a test can serve both halves of the client.
+ */
 export type FetchLike = (
   url: string,
-  init: { headers: Record<string, string> },
+  init: { headers: Record<string, string>; method?: string; body?: string },
 ) => Promise<Response>;
 
 /** `notebooks` and `sectionGroups` expose the same two child relationships. */

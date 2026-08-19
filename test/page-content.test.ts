@@ -73,12 +73,14 @@ async function caught(promise: Promise<unknown>): Promise<unknown> {
   assert.fail('expected the call to reject');
 }
 
-test('the content URL asks for ink and escapes the page id', () => {
-  // Without includeInkML the handwriting is gone from the response entirely, so this
-  // query parameter is the whole reason this module exists.
+test('the content URL asks for ink and ids, and escapes the page id', () => {
+  // Without includeInkML the handwriting is gone from the response entirely, so that
+  // query parameter is the whole reason this module exists. includeIDs is what makes
+  // Graph emit the generated ids a PATCH targets; without it a client-authored page
+  // carries no id anywhere and nothing on it is addressable.
   assert.equal(
     pageContentUrl(PAGE_ID),
-    'https://graph.microsoft.com/v1.0/me/onenote/pages/1-abc!123/content?includeInkML=true',
+    'https://graph.microsoft.com/v1.0/me/onenote/pages/1-abc!123/content?includeIDs=true&includeInkML=true',
   );
   assert.match(pageContentUrl('a/b'), /pages\/a%2Fb\/content/);
 });
