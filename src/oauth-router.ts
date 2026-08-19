@@ -9,9 +9,10 @@
 // carries both metadata documents, PKCE verification, redirect-URI matching, client
 // authentication and the OAuth error shapes; the spike in issue #20 measured all of it
 // against SDK 1.30.0 and the results are in project-spec.md under "Layer 1: what the SDK
-// provides". What is left is an `OAuthServerProvider` — the consent screen, the token
-// format and the code store — which is issue #22. Until that lands, `unimplemented` below
-// stands in so the routes the metadata advertises exist.
+// provides". What is left of the protocol — the consent screen, the token format and the
+// code store — is ./oauth-provider.ts, which this file mounts but does not construct:
+// ./server.ts builds the provider and passes it in, so the dependency runs one way and
+// the two modules do not import each other.
 //
 // Three things about the mount are not free choices:
 //
@@ -31,20 +32,15 @@
 // assumed. Claude probes the suffixed path first and issue #23's 401 names it explicitly,
 // so nothing here depends on the bare one.
 
-import { Router, type Response } from 'express';
+import { Router } from 'express';
 import { metadataHandler } from '@modelcontextprotocol/sdk/server/auth/handlers/metadata.js';
 import {
   createOAuthMetadata,
   mcpAuthRouter,
 } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/server/auth/clients.js';
-import { ServerError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
-import type {
-  AuthorizationParams,
-  OAuthServerProvider,
-} from '@modelcontextprotocol/sdk/server/auth/provider.js';
-import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
-import type { OAuthClientInformationFull, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
+import type { OAuthServerProvider } from '@modelcontextprotocol/sdk/server/auth/provider.js';
+import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 
 import type { OAuthConfig } from './config.ts';
 import { MCP_PATH } from './mcp-server.ts';
@@ -151,51 +147,24 @@ export function createClientsStore(oauth: OAuthConfig): OAuthRegisteredClientsSt
 }
 
 /**
- * The provider that stands in until issue #22 writes the real one.
+ * The provider this mount needs: an `OAuthServerProvider`, plus the route its consent
+ * form posts back to.
  *
- * Every method fails with `ServerError`, which the SDK turns into a 500 carrying
- * `error: "server_error"`. The routes therefore exist and answer in OAuth's own shape,
- * which is what this issue's acceptance asks for; no token can be issued and no request
- * can be authorised, which is the right failure while the provider is missing.
+ * The consent route belongs to the provider because it reaches the provider's own
+ * authorization-code store, and it is mounted here because the SDK's `/authorize` router
+ * does not own a resume path. ./oauth-provider.ts implements this.
  */
-export function unimplementedProvider(oauth: OAuthConfig): OAuthServerProvider {
-  const clientsStore = createClientsStore(oauth);
-  const refuse = (): never => {
-    throw new ServerError('The authorization server is not configured yet');
-  };
-
-  return {
-    get clientsStore() {
-      return clientsStore;
-    },
-    authorize(_client: OAuthClientInformationFull, _params: AuthorizationParams, _res: Response) {
-      return Promise.resolve(refuse());
-    },
-    challengeForAuthorizationCode(): Promise<string> {
-      return Promise.resolve(refuse());
-    },
-    exchangeAuthorizationCode(): Promise<OAuthTokens> {
-      return Promise.resolve(refuse());
-    },
-    exchangeRefreshToken(): Promise<OAuthTokens> {
-      return Promise.resolve(refuse());
-    },
-    verifyAccessToken(): Promise<AuthInfo> {
-      return Promise.resolve(refuse());
-    },
-  };
+export interface Layer1Provider extends OAuthServerProvider {
+  readonly consentRouter: Router;
 }
 
 /**
- * Build the Layer-1 OAuth mount: both metadata documents, `/authorize` and `/token`.
+ * Build the Layer-1 OAuth mount: both metadata documents, the consent route,
+ * `/authorize` and `/token`.
  *
- * Mount it at the application root — see the note at the top of this file. `provider` is
- * what issue #22 supplies; the default refuses everything.
+ * Mount it at the application root — see the note at the top of this file.
  */
-export function oauthRouter(
-  oauth: OAuthConfig,
-  provider: OAuthServerProvider = unimplementedProvider(oauth),
-): Router {
+export function oauthRouter(oauth: OAuthConfig, provider: Layer1Provider): Router {
   const router = Router();
   const issuerUrl = new URL(oauth.publicUrl);
 
@@ -219,6 +188,10 @@ export function oauthRouter(
     token_endpoint_auth_methods_supported: ['client_secret_post'],
   };
   router.use(AUTHORIZATION_SERVER_METADATA_PATH, metadataHandler(metadata));
+
+  // The consent form's POST target. Registered ahead of mcpAuthRouter for the same
+  // reason as the document above: whichever router matches a path first answers it.
+  router.use(provider.consentRouter);
 
   router.use(
     mcpAuthRouter({

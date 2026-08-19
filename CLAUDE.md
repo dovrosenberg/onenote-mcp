@@ -138,6 +138,19 @@ that neither document contains the client secret or the signing key. What it can
 is whether Claude accepts the documents; nothing confirms that until a real connect
 against the deployed URL.
 
+`test/oauth-provider.test.ts` drives the whole Layer-1 flow — `GET /authorize`, the
+consent POST, the token exchange, the refresh — over a real HTTP server through
+`createApp`. Nothing in it is a unit test of a handler: what it checks is the status, the
+OAuth error code in the body, and whether a `Location` header is present, and a direct
+call to the provider bypasses the SDK middleware that produces all three. It
+re-implements the token format at the bottom of the file rather than importing the
+signer, so a change to how a payload is signed breaks the test; a test that signs with
+the implementation's own function proves only that it agrees with itself. The filler
+forms in the store-bound test are signed the same way rather than fetched, because
+`/authorize` allows 100 requests per 15 minutes across every caller and one test would
+spend the file's whole budget. What it cannot check is whether Claude accepts any of it;
+that waits for a real connect against the deployed URL.
+
 `test/name-lookup.test.ts` drives the resolver through a fake `LookupStructure` that
 counts calls, because what this module is for is what it does not do: the common path is
 one `getExpandedTree` and no container walk. Its fixture nests a section group inside a
@@ -518,6 +531,50 @@ URL it is reached at, and a value read from the `Host` header is whatever the ca
 sent. Protected-resource metadata is served only at
 `/.well-known/oauth-protected-resource/mcp`; the bare path is a 404, measured against SDK
 1.30.0.
+
+**The consent screen, the token format and the code store are `src/oauth-provider.ts`,
+and `src/server.ts` wires the two together.** `oauthRouter` takes the provider as an
+argument and does not construct it, so the dependency runs one way: the provider imports
+the clients store and the resource URL from `src/oauth-router.ts`, and nothing imports
+back. The provider carries a `consentRouter`, which the mount registers ahead of
+`mcpAuthRouter` — the SDK's `/authorize` router renders nothing and owns no route that
+resumes the flow after the click.
+
+**A token is an HMAC over a compact payload, and no store is consulted to verify one.**
+`base64url(JSON)` plus `base64url(HMAC-SHA256)` under `MCP_TOKEN_SIGNING_KEY`, one-letter
+field names, `node:crypto` and no new dependency — nothing outside this server ever reads
+one. Access tokens last an hour, refresh tokens 30 days, and the payload carries the kind,
+the client id, the audience, the scopes and the expiry. Stateless is what makes a Cloud
+Run revision replacement invisible to a connected client: an in-memory token store would
+force a reconnect on every deploy. The audience is this server's own resource identifier
+taken from configuration, never the `resource` parameter the request asked for.
+
+**Refresh tokens are not rotated, and there is no `revokeToken`.** `exchangeRefreshToken`
+hands the same refresh token back. Rotation is required for *public* clients; the secret
+in Claude's Advanced settings makes this a confidential one, and a stateless token cannot
+enforce rotation — there is no record to mark as spent. For the same reason there is
+nothing to revoke, and the SDK advertises `revocation_endpoint` only when the provider
+implements it. The operator's lever is rotating `MCP_TOKEN_SIGNING_KEY`, which invalidates
+every outstanding access token, refresh token and consent form at once. Every refresh
+failure is `invalid_grant` — not `invalid_request`, not a custom code — because that is
+what Claude keys its re-authentication on.
+
+**The authorization parameters cross the consent screen signed, and the codes stay in
+memory.** The client id, redirect URI, PKCE challenge, state and scopes ride the form in
+one signed hidden field, so an instance replacement between rendering and clicking does
+not break the flow and the form cannot be edited. A field that fails to verify is a 400
+with no redirect and no code minted — the redirect URI is part of what failed to verify,
+so there is nowhere trustworthy to send the caller. Codes are a `Map`, single-use, 60
+seconds, capped at 100 pending; the cap bounds what a burst against `/consent` can cost,
+and losing a code costs a retry of the consent click, which is the one moment a human is
+already present. The `--max-instances=1` assumption is what makes an in-memory code store
+work at all.
+
+**The client secret is compared with `!==`, and that is accepted.** The comparison lives
+inside the SDK's `authenticateClient` middleware and cannot be replaced without replacing
+the whole token router. The channel is a string comparison behind TLS, reachable only
+from the public internet, under the token endpoint's 50-request rate limit. The signature
+comparisons in `src/oauth-provider.ts` are `timingSafeEqual`, because those it owns.
 
 **Two things about the mount are load-bearing and look like details.**
 `scopesSupported` lists `offline_access`, which is the switch Claude reads to decide

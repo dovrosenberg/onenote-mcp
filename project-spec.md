@@ -482,9 +482,32 @@ minimal provider and drove it end to end. They are observations of SDK
    and must eventually redirect with a code. Rendering a form and resuming
    after the POST is entirely ours, and the resume path needs a route the
    SDK's `/authorize` router does not own.
+
+   **Closed by #22.** `src/oauth-provider.ts` renders a one-button page and
+   posts it back to `/consent`, a route of this repository's own registered
+   ahead of `mcpAuthRouter`. The path is deliberately not under `/authorize`,
+   so the POST never passes through that router's rate limiter. The whole
+   authorization request — client id, redirect URI, PKCE challenge, state,
+   scopes, and a 10-minute expiry — crosses the page in one hidden field
+   signed with `MCP_TOKEN_SIGNING_KEY`. A field that fails to verify is a 400
+   with no redirect and no code minted, because the redirect URI is part of
+   what failed to verify. The URI is re-checked against the clients store at
+   mint time as well: the signature proves this server built the field, not
+   that the allowlist still holds the URI.
 3. **No token format, no stores, no refresh.** The SDK issues nothing. The
    demo provider it ships (`examples/server/demoInMemoryOAuthProvider.js`)
    keeps codes and tokens in a `Map` and throws on refresh.
+
+   **Closed by #22**, as the decisions at the end of this section describe:
+   HMAC-SHA256 over a compact payload, an hour for an access token and 30 days
+   for a refresh token, neither rotated and neither stored. Authorization
+   codes are a `Map`, single-use, 60 seconds, and capped at 100 pending
+   entries — `/consent` is reachable by anyone holding the client id, and each
+   request it accepts costs an entry for a minute. The oldest is evicted, and
+   losing a code costs a retry of the consent click. `revokeToken` is not
+   implemented, so the SDK advertises no `revocation_endpoint`; there is no
+   record of a stateless token to delete, and rotating the signing key
+   invalidates every outstanding token at once.
 4. **Metadata advertises `none` in `token_endpoint_auth_methods_supported`
    unconditionally.** `createOAuthMetadata` builds that array from nothing
    the caller controls, so a confidential-client-only server still says it
@@ -514,6 +537,10 @@ minimal provider and drove it end to end. They are observations of SDK
    string comparison behind TLS, reachable only from the public internet,
    under a 50-request rate limit — measuring it is not practical, and
    replacing the SDK's token endpoint to close it costs more than it buys.
+
+   **#22 took the amendment.** The task is dropped and the code says why. The
+   signature comparisons `src/oauth-provider.ts` does own use
+   `timingSafeEqual`.
 7. **Rate limiting keys on the socket address.** The SDK applies
    `express-rate-limit` at 100 requests per 15 minutes on `/authorize` and
    50 on `/token`. Behind Cloud Run every request arrives from the front

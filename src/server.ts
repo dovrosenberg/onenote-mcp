@@ -3,6 +3,7 @@ import express, { type Application, type Request, type Response } from 'express'
 import type { Config } from './config.ts';
 import { requestLogger } from './logging.ts';
 import { MCP_PATH, mcpRouter } from './mcp-server.ts';
+import { createOAuthProvider } from './oauth-provider.ts';
 import { oauthRouter } from './oauth-router.ts';
 import { createTools } from './tools.ts';
 import { SERVICE_NAME, VERSION } from './version.ts';
@@ -17,8 +18,10 @@ export function createApp(config: Config): Application {
   const app = express();
 
   // Cloud Run terminates TLS and forwards the original scheme and client IP in
-  // X-Forwarded-*. Issue #22's authorization-code redirect has to build absolute https
-  // URLs, which req.protocol only reports correctly with this set.
+  // X-Forwarded-*. Nothing here reads req.protocol — every absolute URL this service
+  // publishes is built from MCP_PUBLIC_URL — but express-rate-limit and Express's own
+  // req.ip both behave differently without it, and the OAuth mount's rate-limit keying
+  // is written against this being true.
   app.set('trust proxy', true);
   app.disable('x-powered-by');
 
@@ -40,7 +43,7 @@ export function createApp(config: Config): Application {
   if (config.oauth === undefined) {
     throw new Error("internal: 'oauth' config group required by createApp");
   }
-  app.use(oauthRouter(config.oauth));
+  app.use(oauthRouter(config.oauth, createOAuthProvider(config.oauth)));
 
   // The tools are built once and shared by every request. The MCP server around them is
   // per-request — see ./mcp-server.ts. Issue #23's bearer-token middleware goes between

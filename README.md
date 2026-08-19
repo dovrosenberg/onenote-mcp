@@ -245,13 +245,14 @@ of the router; `/healthz` stays open.
 Claude has to find the authorization server before it can start a flow. `src/oauth-router.ts`
 mounts the SDK's `mcpAuthRouter` at the application root — it builds its paths from the
 issuer URL rather than from a mount point, so it cannot go behind a prefix — and serves
-four routes, all of them unauthenticated by necessity:
+five routes, all of them unauthenticated by necessity:
 
 | Path | What it is |
 |---|---|
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 authorization-server metadata |
 | `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 protected-resource metadata |
 | `GET,POST /authorize` | Authorization endpoint |
+| `POST /consent` | Where the consent form posts back; the SDK's `/authorize` router owns no resume path |
 | `POST /token` | Token endpoint |
 
 ```bash
@@ -275,8 +276,24 @@ Registration has nothing to do. One client is registered, with three redirect UR
 `http://localhost/callback` plus `http://127.0.0.1/callback` for Claude Code, whose port
 is ignored per RFC 8252.
 
-`/authorize` and `/token` answer `server_error` until issue #22 supplies the provider
-behind them — the consent screen, the token format, and the code store.
+`GET /authorize` renders a consent page rather than redirecting: one Approve button
+naming what is granted and the host the authorization code will be sent to. Approving
+posts back to `POST /consent`, which mints a 60-second single-use code and redirects to
+the client's callback. The whole authorization request crosses that page in one hidden
+field signed with `MCP_TOKEN_SIGNING_KEY`, so a mid-consent instance replacement does not
+break the flow and the form cannot be edited; a field that fails to verify is a 400 with
+no redirect and no code minted.
+
+`POST /token` issues an access token good for one hour and a refresh token good for 30
+days. Both are an HMAC-SHA256 over a compact payload under `MCP_TOKEN_SIGNING_KEY` and
+nothing else — no store is consulted to verify one, which is what keeps a Cloud Run
+revision replacement from forcing a reconnect. The payload carries the audience, which is
+`MCP_PUBLIC_URL` plus `/mcp`, so a token is good for this MCP endpoint and no other.
+Refresh tokens are not rotated: the configured client secret makes this a confidential
+client, and a stateless token has no record to mark as spent. There is no revocation
+endpoint for the same reason — **changing `MCP_TOKEN_SIGNING_KEY` and redeploying
+invalidates every outstanding access token, refresh token and open consent page at
+once**, which is the lever if a credential ever needs cutting off.
 
 ## Bootstrap
 
