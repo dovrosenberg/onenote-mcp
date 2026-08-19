@@ -284,7 +284,12 @@ Two things about the submitted document come from the #17 spike:
 
 **Not tested.** Whether a PATCH preserves ink on a page that has handwriting. Testing it
 needs a page with real strokes, and no such page could be written to during this spike.
-Issue #19 is that test, and it needs handwriting added by hand from a tablet.
+The test now exists — `test/ink-preservation.integration.test.ts`, issue #19 — and is
+skipped unless the environment names a live page carrying handwriting. It renders the ink
+before and after `append_to_page` and `update_page_title` and compares the stroke count and
+the PNG bytes. It has not been run against the account, because the page it needs has to be
+written on by hand from a tablet. Until it has, whether a write preserves ink is unknown
+rather than confirmed.
 
 ## Errors
 

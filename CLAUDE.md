@@ -105,6 +105,20 @@ every refusal test also asserts the client was not called. That is the point of 
 a rejected argument must cost no Graph request, and on `create_page` a request that went
 through would leave a page behind.
 
+`test/ink-preservation.integration.test.ts` is the only test that talks to the real
+account, and it is skipped unless the environment names a page: `ONENOTE_INK_TEST_PAGE_ID`,
+or `ONENOTE_INK_TEST_NOTEBOOK` + `ONENOTE_INK_TEST_SECTION` + `ONENOTE_INK_TEST_PAGE_TITLE`
+(plus `ONENOTE_INK_TEST_SECTION_GROUP` when the section sits in one). It renders the page's
+ink before and after `append_to_page` and `update_page_title` and asserts the stroke count
+and the PNG bytes are identical, because a PATCH that strips handwriting reports no error
+and the page cannot be recovered. Two things make it worth the credential: the page must
+carry real strokes, which only a person with a tablet can put there, and the write is
+confirmed independently — the appended marker has to appear in the page HTML and the new
+title has to become visible — so a write that silently did nothing cannot pass as ink
+preserved. It leaves the page changed: the marker paragraph stays, and the title is put
+back only when the original could be read. `npm test` runs it as a skip; nothing has run it
+against the account yet.
+
 `test/name-lookup.test.ts` drives the resolver through a fake `LookupStructure` that
 counts calls, because what this module is for is what it does not do: the common path is
 one `getExpandedTree` and no container walk. Its fixture nests a section group inside a

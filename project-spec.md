@@ -455,7 +455,10 @@ Settled by the spike in issue #17, on 2026-08-18:
 - **`update_page_title` mechanics** — settled; see the writing notes above.
 - **Ink and writes** — still open. Whether a PATCH preserves handwriting was
   not tested, because it needs a page carrying real strokes and the spike
-  wrote only to throwaway pages. Issue #19 is that test.
+  wrote only to throwaway pages. Issue #19 is that test, and it is now written:
+  `test/ink-preservation.integration.test.ts`, skipped unless the environment
+  names a live page with handwriting on it. Running it needs a person with a
+  tablet to make that page; until someone does, the question stays open.
 
 ---
 
