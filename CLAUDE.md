@@ -187,6 +187,22 @@ forced refresh actually slides Microsoft's window — that is a property of Entr
 nothing confirms it until an operator watches the scheduler job run for longer than the
 window.
 
+`test/graph-decode.test.ts` covers `src/graph-decode.ts`, which has no network in it —
+every function takes an already-parsed value and the URL it came from. Before the split
+these were reachable only through a fake `fetch` keyed by exact URL, so each decode
+assertion paid for a routing table. The last test in the file is the one that is easiest
+to lose and worth the most: eight decoders are handed a body carrying a plausible page
+name in the position they reject, and every thrown message is checked for not containing
+it. What no test covers is whether Graph's bodies still have the shape these decoders
+assume; that is asserted in `test/graph-structure.test.ts` against hand-written fixtures
+and confirmed only by a live run.
+
+`test/firestore.test.ts` covers the memoisation in `src/firestore.ts` and nothing else.
+It constructs the real `@google-cloud/firestore` client, which needs no credential and no
+backend because the client connects lazily — the same property `test/tools.test.ts` leans
+on, so if it stops being true both files fail together. Everything the client then does
+is untested, for the reason the `test/token-cache.test.ts` paragraph gives.
+
 `test/tools.test.ts` covers the registry, and it constructs the real MSAL and Firestore
 clients while doing so. Neither opens a connection until a token is asked for, so it
 needs no credential and no backend; if that ever stops being true, this test is where it
@@ -798,6 +814,18 @@ clients would each hold their own in-memory access token and their own view of t
 Firestore cache, so a forced refresh through one would leave the other on a superseded
 blob until its next read, and both would be writing the same document.
 
+**One Firestore client per process too, and `src/firestore.ts` is the only place one is
+constructed.** `firestoreFor(config)` memoises by project id; `createFirestoreTokenCachePlugin`
+calls it rather than building its own, and anything else needing Firestore does the same.
+Two clients against one database would open two gRPC channels and run two credential
+refreshers for no benefit. It is memoised at module level rather than threaded through
+constructors for the reason `PRODUCTION_GATE` is — a process-wide shared resource whose
+wiring should not appear in every signature between the entrypoint and the leaf. The key
+is the project id rather than a single instance so that the inferred client, the one
+built when `GOOGLE_CLOUD_PROJECT` is absent and Cloud Run's metadata server supplies it,
+can never be handed to a caller that named a project explicitly. Construction opens no
+connection.
+
 **Two events exist for alerting, and their field vocabulary is fixed.**
 `graph-auth-failure` and `token-cache-write-refused`, written through `logEvent` in
 `src/logging.ts` to stderr. They carry a reason from a fixed set and a document path from
@@ -931,17 +959,34 @@ violate this today; that is an open gap, not a decision.
 **Retry only what is retryable, and inspect the OData code first.** The article's second
 best practice: a 4xx other than 429 means the request itself is wrong and retrying it
 burns quota to fail again. 429 and 503 are worth retrying after a wait; 400 with code
-`20266`, 400 with code `20112` "invalid entity id", and 404 are not. Nothing in
-`src/graph-structure.ts` retries anything at all yet, so the first 429 rejects the
-enclosing `Promise.all` while its siblings are still consuming quota.
+`20266`, 400 with code `20112` "invalid entity id", and 404 are not. `retryWait` in
+`src/graph-throttle.ts` is the one place that decides, and every client runs through
+`PRODUCTION_GATE`, so nothing here retries on its own.
+
+**One 500 is retried, and the rule is deliberately narrow.** Measured 2026-08-19 and
+recorded in `api-overview.md`: every `$expand` on `/me/onenote/notebooks` answered 500
+with OData code `19999` for seven minutes across 18 attempts and then recovered with no
+change to the request, while un-expanded calls on the same collection answered 200
+throughout. Without a retry that takes down `search_pages`, `find_page_by_name`,
+`list_pages_by_name`, `create_page_by_name` and `append_to_page_by_name`, all of which go
+through `getExpandedTree()`. So a 500 is retried only when the body carries code `19999`
+**and** only on a GET. Both halves matter: `19999` is also what an account-wide
+`/sections` request with no `$filter` answers every time, permanently, which is why the
+retry rides the existing three-attempt cap rather than becoming an open-ended wait; and
+`PATCH /pages/{id}/content` is not safe to repeat blindly, which is why `src/page-write.ts`
+passing an explicit `method` excludes its writes by construction while
+`src/graph-structure.ts` and `src/page-content.ts` default to GET and are covered. A body
+that is not JSON, or is JSON of another shape, is left alone rather than guessed at.
 
 **Treat the hourly 400 as the binding constraint on tool design, not the per-minute
 120.** A tool that walks the account can run at most twice an hour before every later
-call in that hour fails. That is what makes an unscoped `search_pages` unsafe as
-written: it walks the tree and then lists pages per section, and the account holds 560
-sections. The bounds in `src/page-search.ts` do not express this — 200 sections cannot
-be reached inside a 25-second budget at a legal request rate, and the tree walk alone
-would exhaust the budget before the first section is listed.
+call in that hour fails. That is what makes an unscoped `search_pages` expensive: it walks
+the tree and then lists pages per section, and the account held 568 sections when last
+counted on 2026-08-19. `MAX_SECTIONS_SEARCHED` is 60 and `SEARCH_TIME_BUDGET_MS` is 25
+seconds, so one unscoped search costs up to 61 requests — a seventh of the hourly budget
+for a sample of roughly a tenth of the account, and the result says so through
+`stoppedEarly` and the counts. Removing that cost is most of the point of the Firestore
+mirror in issue #30.
 
 **Prefer a cached structure over re-reading it.** Notebooks, section groups and sections
 change rarely; pages change often. Anything that needs the tree more than once in an
