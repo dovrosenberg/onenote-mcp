@@ -27,8 +27,17 @@
 
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 
-import type { CreatedPage } from './page-write.ts';
+import { InkParseError, parseInkStrokes, strokeBounds } from './ink.ts';
 import { ToolInputError, requiredString, type ToolDefinition } from './mcp-tools.ts';
+import { pageHtml, type RawPageContent } from './page-content.ts';
+import {
+  clearanceHtml,
+  clearedTo,
+  parseOutlines,
+  planInkClearance,
+  type ClearancePlan,
+} from './page-layout.ts';
+import type { CreatedPage } from './page-write.ts';
 
 /** These tools write. `openWorldHint` because the world is someone's notebook. */
 const WRITE: Tool['annotations'] = { readOnlyHint: false, openWorldHint: true };
@@ -52,6 +61,11 @@ const FORBIDDEN_ELEMENT =
  */
 const LOOKS_LIKE_MARKUP = /<\/?[a-zA-Z][^<>]*>/;
 
+/** The slice of `GraphPageContent` `append_to_page` reads the page's layout through. */
+export interface PageLayoutReader {
+  fetchRaw(pageId: string): Promise<RawPageContent>;
+}
+
 /** The slice of `GraphPageWrite` these tools call, so a test can pass a plain object. */
 export interface PageWriteClient {
   appendToPage(pageId: string, html: string): Promise<void>;
@@ -59,8 +73,11 @@ export interface PageWriteClient {
   createPage(sectionId: string, title: string, bodyHtml: string): Promise<CreatedPage>;
 }
 
-/** Build the three writing tools over one write client. */
-export function createWriteTools(write: PageWriteClient): ToolDefinition[] {
+/** Build the three writing tools over a write client and the reader `append_to_page` uses. */
+export function createWriteTools(
+  write: PageWriteClient,
+  layout: PageLayoutReader,
+): ToolDefinition[] {
   return [
     {
       name: 'append_to_page',
@@ -72,8 +89,11 @@ export function createWriteTools(write: PageWriteClient): ToolDefinition[] {
         'page, which may hold other outlines beside it. For a page created by ' +
         'create_page it is the bottom of the page. htmlFragment is page content such ' +
         '<p>, <ul>, <table> or <h1>, not a whole HTML document: a fragment carrying ' +
-        '<html>, <body> or <title> is rejected. Existing content is never replaced. ' +
-        'pageId comes from list_pages, search_pages or list_pages_by_name.',
+        '<html>, <body> or <title> is rejected. Existing content is never replaced. If ' +
+        'that outline also holds handwriting, blank lines are added ahead of the ' +
+        'content so it lands below the lowest stroke instead of on top of it — OneNote ' +
+        'fixes ink in place and no write can move it. pageId comes from list_pages, ' +
+        'search_pages or list_pages_by_name.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -96,17 +116,37 @@ export function createWriteTools(write: PageWriteClient): ToolDefinition[] {
         const pageId = requiredString(args, 'pageId');
         const htmlFragment = fragmentArgument(args, 'htmlFragment');
 
-        await write.appendToPage(pageId, htmlFragment);
+        const clearance = await inkClearance(layout, pageId);
+        const content =
+          clearance === null ? htmlFragment : clearanceHtml(clearance, htmlFragment);
+
+        await write.appendToPage(pageId, content);
 
         return jsonResult({
           pageId,
           appended: true,
+          inkClearance:
+            clearance === null
+              ? null
+              : {
+                  blankLines: clearance.breaks,
+                  inkBottomPx: Math.round(clearance.inkBottom),
+                  measuredFromPx: Math.round(clearance.clearedFrom),
+                  contentStartsAtPx: clearance.clearedTo,
+                  clearsTheInk: !clearance.truncated,
+                },
           note:
             'The content was appended to the end of the page body. On a page authored ' +
             'in the OneNote client that is the end of the first outline. Nothing that ' +
             'was on the page was replaced. A read of the page content will show the ' +
             'change; the page metadata a listing returns can lag behind it by a few ' +
-            'seconds.',
+            'seconds.' +
+            (clearance === null
+              ? ''
+              : ' This outline also holds handwriting, which OneNote keeps at a fixed ' +
+                'position that no write can move, so the content was preceded by blank ' +
+                'lines to bring it below the lowest stroke. The gap above it is ' +
+                'deliberate.'),
         });
       },
     },
@@ -204,6 +244,41 @@ export function createWriteTools(write: PageWriteClient): ToolDefinition[] {
       },
     },
   ];
+}
+
+/**
+ * What this append has to do about the handwriting already on the page, or null.
+ *
+ * This costs one extra Graph request per append, which is the price of not writing text
+ * across someone's handwriting: no endpoint reports an outline's rendered height or the
+ * ink's position, so both have to be read.
+ *
+ * An unreadable ink document is not a reason to refuse the write. `parseInkStrokes`
+ * throws only when trace groups nest past its bound, and the caller's content is good
+ * either way — it goes on the page unpadded.
+ */
+async function inkClearance(
+  layout: PageLayoutReader,
+  pageId: string,
+): Promise<ClearancePlan | null> {
+  const raw = await layout.fetchRaw(pageId);
+  const html = pageHtml(raw);
+  if (html === null) return null;
+
+  // `target: "body"` is the first top-level div, so that outline is the one being
+  // appended to and the only one whose column matters.
+  const outline = parseOutlines(html)[0];
+  if (outline === undefined) return null;
+
+  let ink;
+  try {
+    ink = strokeBounds(parseInkStrokes(raw.raw));
+  } catch (err) {
+    if (!(err instanceof InkParseError)) throw err;
+    return null;
+  }
+
+  return planInkClearance(outline, ink, clearedTo(html));
 }
 
 /**

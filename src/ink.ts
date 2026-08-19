@@ -70,6 +70,14 @@ export interface InkPoint {
 /** One pen-down-to-pen-up stroke. Strokes with fewer than two points are dropped. */
 export type InkStroke = readonly InkPoint[];
 
+/** The rectangle a set of strokes covers, in px at 96 dpi. */
+export interface InkBox {
+  readonly left: number;
+  readonly top: number;
+  readonly right: number;
+  readonly bottom: number;
+}
+
 /** An SVG document plus the size its own attributes declare, in px. */
 export interface InkSvg {
   readonly svg: string;
@@ -176,29 +184,44 @@ export function parseInkStrokes(text: string): InkStroke[] {
 }
 
 /**
+ * The rectangle the strokes cover, or null when there are none.
+ *
+ * The coordinates are the page's own: px at 96 dpi, measured from the top left of the
+ * page above the title area, which is the same space the outline divs in the page HTML
+ * are positioned in. That is what lets ./page-layout.ts decide whether appended text
+ * would land on the handwriting.
+ */
+export function strokeBounds(strokes: readonly InkStroke[]): InkBox | null {
+  let left = Infinity;
+  let top = Infinity;
+  let right = -Infinity;
+  let bottom = -Infinity;
+
+  for (const stroke of strokes) {
+    for (const point of stroke) {
+      if (point.x < left) left = point.x;
+      if (point.y < top) top = point.y;
+      if (point.x > right) right = point.x;
+      if (point.y > bottom) bottom = point.y;
+    }
+  }
+
+  return left === Infinity ? null : { left, top, right, bottom };
+}
+
+/**
  * Draw strokes as SVG paths on a white ground, sized to their bounding box.
  *
  * The box is padded so a stroke drawn at the very edge is not clipped by the stroke
  * width itself, and the padding has a floor so a single dot still produces a canvas.
  */
 export function strokesToSvg(strokes: readonly InkStroke[]): InkSvg {
-  if (strokes.length === 0) {
+  const box = strokeBounds(strokes);
+  if (box === null) {
     throw new RangeError('strokesToSvg needs at least one stroke');
   }
 
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-
-  for (const stroke of strokes) {
-    for (const point of stroke) {
-      if (point.x < minX) minX = point.x;
-      if (point.y < minY) minY = point.y;
-      if (point.x > maxX) maxX = point.x;
-      if (point.y > maxY) maxY = point.y;
-    }
-  }
+  const { left: minX, top: minY, right: maxX, bottom: maxY } = box;
 
   const margin = Math.max(
     (maxX - minX) * MARGIN_FRACTION,

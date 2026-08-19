@@ -41,9 +41,13 @@ export function createTools(config: Config): ToolDefinition[] {
 
   const auth = createGraphAuth(graph, firestore);
 
+  // One page-content client serves both the reading tool and `append_to_page`, which
+  // reads a page's layout before it writes so its content does not land on handwriting.
+  const content = createGraphPageContent(auth);
+
   return [
     ...createStructureTools(createGraphStructure(auth)),
-    ...createPageTools(createGraphPageContent(auth)),
-    ...createWriteTools(createGraphPageWrite(auth)),
+    ...createPageTools(content),
+    ...createWriteTools(createGraphPageWrite(auth), content),
   ];
 }

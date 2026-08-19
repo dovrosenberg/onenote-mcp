@@ -236,6 +236,26 @@ scratch notebook. The three request bodies issue #18 needs:
   the tag.
 - **An empty array is `400` code `20125`**, "The PATCH request contains no actions", and an
   unknown action is `400` code `20122`.
+- **A new outline cannot be created, and no outline can be moved.** Measured 2026-08-19,
+  across a page created with `data-absolute-enabled="true"` and two positioned outlines, a
+  page created without it, and a client-authored page carrying ink. An absolutely
+  positioned `<div>` sent as `content` to `target: "body"` returns `204`, but the div is
+  flattened into the first outline and its `position`, `top` and `left` are dropped — the
+  documented rule is that absolute positioning applies only to direct children of `<body>`,
+  and `body` as a PATCH target is the first div, not the body element. `insert` beside an
+  outline is `400` code `20135`, "The entity type is not supported for this operation", and
+  so is `insert` against `body`. `replace` on an outline by generated id is `20134`, and by
+  `#{data-id}` it is `20141`. `replace` on a *nested* div fails the same way. So absolute
+  positioning is a create-time property: on an existing page, content can only be added
+  inside an outline that is already there.
+- **Vertical space can only be made with `<br>`.** `margin-top:278pt` on an appended
+  paragraph came back as the default `5.5pt`, and an appended `<p>&nbsp;</p>` was dropped
+  from the page entirely. Eight `<br>` elements in one paragraph came back as eight. That
+  is what `src/page-layout.ts` uses to push appended text below existing ink.
+- **A `data-id` survives only on an element that carries content.** In one PATCH,
+  `<p data-id="m1-text">text</p>` and `<div data-id="m3-div"><p>text</p></div>` came back
+  with their ids; `<p data-id="m2-breaks"><br /><br /></p>` and the same wrapped in a div
+  came back with the attribute gone. A marker attribute has to ride on real content.
 - **A PATCH is visible to the next content read** — measured 3.7 seconds after the request,
   including both round trips. Page *metadata* is weaker: `GET /pages/{id}?$select=title`
   returned `""` for two of the pages created during this spike within seconds of creating

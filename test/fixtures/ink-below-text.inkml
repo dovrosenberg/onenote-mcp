@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Hand-authored InkML, not a page dump. Real stroke data is legible handwriting and this
+  repository is public, so no captured ink may be committed.
+
+  This one exists for the layout decision rather than for the renderer: its strokes sit
+  inside the column of an outline positioned at left:48px;top:120px;width:624px, and hang
+  below that outline's top, which is the case where an append has to be pushed down the
+  page to stay off the handwriting.
+
+  Coordinates are himetric (1/100 mm) and the channel order is X, Y, F, as this account's
+  pages emit. 2540 himetric = 1 inch = 96 px, so:
+
+    1323  ->  50.0 px      5292  ->  200.0 px
+    13229 -> 500.0 px      12329 -> 466.0 px
+
+  giving a box of left 50, top 200, right 500, bottom 466 in page pixels.
+-->
+<inkml:ink xmlns:inkml="http://www.w3.org/2003/InkML">
+  <inkml:definitions>
+    <inkml:context xml:id="ctx0">
+      <inkml:inkSource xml:id="src0">
+        <inkml:traceFormat>
+          <inkml:channel name="X" type="integer" units="himetric" />
+          <inkml:channel name="Y" type="integer" units="himetric" />
+          <inkml:channel name="F" type="integer" units="dev" />
+        </inkml:traceFormat>
+      </inkml:inkSource>
+    </inkml:context>
+  </inkml:definitions>
+  <inkml:trace contextRef="#ctx0">1323 5292 9000, 13229 5292 9100, 13229 12329 9200</inkml:trace>
+  <inkml:trace contextRef="#ctx0">13229 12329 8000, 1323 12329 8100, 1323 5292 8200</inkml:trace>
+</inkml:ink>

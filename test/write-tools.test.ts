@@ -10,16 +10,31 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { GraphRequestError } from '../src/graph-structure.ts';
 import { ToolInputError, indexTools, type ToolDefinition } from '../src/mcp-tools.ts';
+import type { RawPageContent } from '../src/page-content.ts';
+import { CLEARANCE_ID_PREFIX } from '../src/page-layout.ts';
 import type { CreatedPage } from '../src/page-write.ts';
-import { createWriteTools, type PageWriteClient } from '../src/write-tools.ts';
+import { createWriteTools, type PageLayoutReader, type PageWriteClient } from '../src/write-tools.ts';
 
 const PAGE_ID = '1-abc!123';
 const SECTION_ID = '1-sec!456';
+
+/** An outline in the shape Graph emits one, with no handwriting anywhere near it. */
+const TYPED_PAGE =
+  '<html><head><title>t</title></head><body data-absolute-enabled="true">' +
+  '<div id="div:{aaa}{32}" data-id="_default" style="position:absolute;left:48px;top:120px;width:624px">' +
+  '<p>Typed text.</p></div></body></html>';
+
+/** The committed InkML whose strokes sit inside that outline's column, ending at 466px. */
+const INK_BELOW_TEXT = readFileSync(
+  new URL('./fixtures/ink-below-text.inkml', import.meta.url),
+  'utf8',
+);
 
 const CREATED: CreatedPage = {
   id: '1-new!789',
@@ -54,8 +69,34 @@ function fakeWrite(created: CreatedPage = CREATED, fail?: () => never): Fake {
   };
 }
 
-function tool(name: string, client: PageWriteClient): ToolDefinition {
-  const found = indexTools(createWriteTools(client)).get(name);
+/** A page in the shape Graph returns one, with the ink part optional. */
+function pageContent(html: string, inkml = ''): RawPageContent {
+  const parts = [
+    { headers: 'Content-Type: text/html', contentType: 'text/html', body: html },
+    ...(inkml === ''
+      ? []
+      : [{ headers: 'Content-Type: application/inkml+xml', contentType: 'application/inkml+xml', body: inkml }]),
+  ];
+  return { raw: [html, inkml].join('\n'), contentType: 'multipart/mixed; boundary=b', parts };
+}
+
+interface FakeReader extends PageLayoutReader {
+  readonly reads: string[];
+}
+
+function fakeLayout(content: RawPageContent = pageContent(TYPED_PAGE)): FakeReader {
+  const reads: string[] = [];
+  return {
+    reads,
+    fetchRaw: (pageId) => {
+      reads.push(pageId);
+      return Promise.resolve(content);
+    },
+  };
+}
+
+function tool(name: string, client: PageWriteClient, layout: PageLayoutReader = fakeLayout()): ToolDefinition {
+  const found = indexTools(createWriteTools(client, layout)).get(name);
   assert.ok(found !== undefined, `${name} must be registered`);
   return found;
 }
@@ -76,7 +117,7 @@ async function caught(promise: Promise<unknown>): Promise<unknown> {
 }
 
 test('the three writing tools are registered and none claims to be read-only', () => {
-  const tools = createWriteTools(fakeWrite());
+  const tools = createWriteTools(fakeWrite(), fakeLayout());
 
   assert.deepEqual(
     tools.map((t) => t.name),
@@ -103,6 +144,82 @@ test('append_to_page passes the fragment through and says where it landed', asyn
   assert.equal(body['pageId'], PAGE_ID);
   assert.equal(body['appended'], true);
   assert.match(String(body['note']), /first outline/);
+});
+
+test('an append to a page with ink below the text is pushed below the strokes', async () => {
+  // The whole point of reading before writing. OneNote fixes ink in place and no write
+  // can move it, so text appended into an outline the strokes overlap renders on top of
+  // the handwriting. The fixture's ink ends at 466px, the outline starts at 120px.
+  const client = fakeWrite();
+  const layout = fakeLayout(pageContent(TYPED_PAGE, INK_BELOW_TEXT));
+
+  const result = await tool('append_to_page', client, layout).handle({
+    pageId: PAGE_ID,
+    htmlFragment: '<p>appended</p>',
+  });
+
+  assert.deepEqual(layout.reads, [PAGE_ID]);
+  const sent = client.calls[0]?.[2] ?? '';
+  assert.equal((sent.match(/<br \/>/g) ?? []).length, 20);
+  assert.ok(
+    sent.endsWith(`<div data-id="${CLEARANCE_ID_PREFIX}490"><p>appended</p></div>`),
+    "the caller's fragment goes last, unchanged, inside the marker",
+  );
+
+  const clearance = payload(result)['inkClearance'] as Record<string, unknown>;
+  assert.deepEqual(clearance, {
+    blankLines: 20,
+    inkBottomPx: 466,
+    measuredFromPx: 120,
+    contentStartsAtPx: 490,
+    clearsTheInk: true,
+  });
+});
+
+test('a page with no ink is appended to exactly as asked', async () => {
+  const client = fakeWrite();
+  const layout = fakeLayout();
+
+  const result = await tool('append_to_page', client, layout).handle({
+    pageId: PAGE_ID,
+    htmlFragment: '<p>appended</p>',
+  });
+
+  assert.deepEqual(client.calls, [['appendToPage', PAGE_ID, '<p>appended</p>']]);
+  assert.equal(payload(result)['inkClearance'], null);
+});
+
+test('a second append does not stack another block of blank lines', async () => {
+  // The marker left by the first append records the ink it cleared. Without reading it
+  // back, a page written to three times would carry three stacks of padding.
+  const cleared =
+    TYPED_PAGE.replace(
+      '<p>Typed text.</p>',
+      `<p>Typed text.</p><p><br /></p><div data-id="${CLEARANCE_ID_PREFIX}490"><p>already below the ink</p></div>`,
+    );
+  const client = fakeWrite();
+
+  await tool('append_to_page', client, fakeLayout(pageContent(cleared, INK_BELOW_TEXT))).handle({
+    pageId: PAGE_ID,
+    htmlFragment: '<p>second</p>',
+  });
+
+  assert.deepEqual(client.calls, [['appendToPage', PAGE_ID, '<p>second</p>']]);
+});
+
+test('a refused fragment costs no read and no write', async () => {
+  const client = fakeWrite();
+  const layout = fakeLayout();
+
+  await caught(
+    tool('append_to_page', client, layout).handle({
+      pageId: PAGE_ID,
+      htmlFragment: '<body><p>x</p></body>',
+    }),
+  );
+
+  assert.deepEqual(layout.reads, [], 'the argument check comes before the read');
+  assert.deepEqual(client.calls, []);
 });
 
 test('an unclosed tag is appended rather than refused', async () => {

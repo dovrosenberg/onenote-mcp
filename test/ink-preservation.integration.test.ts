@@ -172,7 +172,7 @@ describe('writes preserve existing ink (live account)', { skip: skipReason() }, 
     auth = createGraphAuth(config.graph, config.firestore);
     structure = createGraphStructure(auth);
     write = createGraphPageWrite(auth);
-    tools = indexTools(createWriteTools(write));
+    tools = indexTools(createWriteTools(write, createGraphPageContent(auth)));
     pageId = await resolvePageId(structure);
 
     baseline = await readPage();

@@ -120,6 +120,15 @@ back only when the original could be read. It was run against the account on 202
 against a page carrying 5 strokes: both writes left the stroke count and the PNG bytes
 identical. `npm test` runs it as a skip.
 
+`test/page-layout.test.ts` covers the ink-clearance arithmetic, which is pure: it takes
+page HTML and an ink bounding box and returns a plan, so the whole decision runs without a
+Graph call. Its HTML is written in the shape Graph emits — absolutely positioned top-level
+divs with `left`, `top` and `width` in px. What it cannot cover is `LINE_HEIGHT_PX`; no
+endpoint reports a line height, so whether 19px per break lands the text just below the
+strokes is only visible in OneNote. `test/fixtures/ink-below-text.inkml` is hand-authored
+so its strokes fall inside a 48px/624px column and end at 466px, which is the case that
+needs padding.
+
 `test/name-lookup.test.ts` drives the resolver through a fake `LookupStructure` that
 counts calls, because what this module is for is what it does not do: the common path is
 one `getExpandedTree` and no container walk. Its fixture nests a section group inside a
@@ -388,6 +397,28 @@ page authored in the OneNote client has sibling top-level divs, and an append la
 end of the first of them. Reaching another one means reading `?includeIDs=true` and
 targeting that div's generated id, which is issue #27. The tool description states where
 the content went, because a 204 does not.
+
+**An append is padded off the handwriting, because nothing else can move it.** OneNote
+fixes ink in a page-level layer and an outline grows downwards, so appending to a page
+whose strokes hang below its text renders the text over the handwriting. Putting the new
+content in its own outline below the ink is not possible: measured 2026-08-19, an
+absolutely positioned div sent to `target: "body"` is flattened into the first outline
+with its position dropped, `insert` beside an outline is 400 code 20135, and `replace` on
+one is 20134 or 20141. Margins are normalised away and an empty paragraph is deleted, so
+the only lever left is `<br>`, which survives verbatim. `src/page-layout.ts` reads the
+outline's `top` and the ink's bounding box and decides how many breaks go in front of the
+caller's fragment; `append_to_page` pays one extra Graph read per call for it, and the
+result JSON reports the padding rather than hiding it.
+
+**The padding is measured from the outline's top, and marked so it happens once.** No
+endpoint reports an outline's rendered height, so where its text currently ends is
+unknown; measuring from the top clears the ink whatever the height is, at the cost of a
+gap. The fragment is wrapped in `<div data-id="ink-clearance-{px}">`, recording the page
+position the content was brought down to — not the ink bottom, which reads as new ink on
+the next call over rounding, and not on the padding itself, because the service discards a
+`data-id` from an element holding only line breaks. `LINE_HEIGHT_PX = 19` is a chosen
+number: nothing in the API reports a line height, and only looking at the page in OneNote
+can confirm it.
 
 **A page created here has one outline, deliberately.** `createPageHtml` omits
 `data-absolute-enabled` from `<body>`, so Graph wraps the submission in a single
