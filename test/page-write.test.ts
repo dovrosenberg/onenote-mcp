@@ -2,12 +2,12 @@
 // exact URL. An unrouted request fails the test, so every behavioural assertion here is
 // also an assertion about the verb and the URL that were built.
 //
-// What this cannot check is whether Graph accepts what is sent. The change arrays, the
-// `text/html` create, and the 204-with-no-body success are copied from the spike recorded
-// in `api-overview.md` under **Writing page content**, which ran against the live service
-// on 2026-08-18 — except for the create request, which is the documented `text/html`
-// shape rather than the `multipart/form-data` one and was not part of that spike. Nothing
-// confirms any of it until an operator runs the server against the real tenant.
+// What this cannot check is whether Graph accepts what is sent. The change arrays and the
+// 204-with-no-body success come from the spike recorded in `api-overview.md` under
+// **Writing page content**; the `text/html` create was measured separately, by the
+// acceptance run for issue #18 on 2026-08-18 — 201 with the page's id and links, in a
+// scratch notebook. A fake fetch cannot notice the service changing its mind about any of
+// it.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';

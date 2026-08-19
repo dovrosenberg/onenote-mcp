@@ -253,13 +253,25 @@ scratch notebook. The three request bodies issue #18 needs:
 | Body | A whole document: `<html><head><title>…</title></head><body>…</body></html>`. |
 | Success | `201` with the created page as JSON — `id`, `title`, `contentUrl`, and `links.oneNoteWebUrl` / `links.oneNoteClientUrl`. |
 
-**From the documentation, not measured.** The spike in issue #17 created its throwaway
-pages but did not record which content type it used, so the `text/html` form is what
-`src/page-write.ts` sends on the strength of the doc alone. Nothing confirms it until an
-operator runs the server against the real tenant. `multipart/form-data` is not used
-because this server submits no binary.
+**Measured**, 2026-08-18, on a page created in a scratch notebook by the acceptance run
+for issue #18. `Content-Type: text/html` with the document below answered `201` and the
+body carried `id`, `title`, `contentUrl`, and both `links` hrefs.
+`multipart/form-data` is not used, because this server submits no binary.
 
-Two things about the submitted document do come from the spike:
+Two more things that run measured:
+
+- **The whole round trip works.** `create_page`, then `append_to_page`, then
+  `update_page_title` on the same page: the created heading, paragraph and list all came
+  back on the next content read, the appended paragraph landed *after* the created
+  content rather than replacing it, and the renamed title appeared in
+  `/sections/{id}/pages` within 5 seconds. That is faster than the #17 spike saw, where a
+  metadata read answered `""` — 5 seconds is one measurement, not a guarantee.
+- **`includeIDs=true` produces targetable ids on a page created this way.** Seven of them
+  on a page with six elements, in the documented form with the guid brace-wrapped:
+  `div:{guid}{32}`, `h1:{guid}{39}`, `p:{guid}{42}`, `li:{guid}{45}`. All seven survive
+  `trimPageHtml`, so what a caller reads is what a PATCH can target.
+
+Two things about the submitted document come from the #17 spike:
 
 - **The `<title>` element is the page title.** Everything that finds a page by name
   matches the title Graph stores, and that comes from `<title>`; a heading in the body

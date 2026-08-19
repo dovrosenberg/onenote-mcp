@@ -94,10 +94,11 @@ base64-encoded, is a budget chosen rather than measured against any client's cap
 `test/page-write.test.ts` drives the write client through a fake `fetch` whose routes are
 keyed by method and exact URL, so an unexpected verb is an unrouted request and every
 assertion about a change array is also an assertion about where it was sent. What it
-cannot check is whether Graph accepts any of it: the change arrays come from the validated
-spike in `api-overview.md`, and the `text/html` create request comes from the
-documentation and was never measured — nothing confirms either until an operator runs the
-server against the real tenant.
+cannot check is whether Graph accepts any of it. That was settled separately: the change
+arrays come from the validated spike in `api-overview.md`, and all three tools were run
+against the live account on 2026-08-18 in a scratch notebook — create, append, rename,
+and a read-back of each. The fake fetch still cannot notice the service changing its
+mind.
 
 `test/write-tools.test.ts` drives the three writing tools through a fake write client, and
 every refusal test also asserts the client was not called. That is the point of the file:
