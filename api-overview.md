@@ -282,14 +282,14 @@ Two things about the submitted document come from the #17 spike:
   `src/page-write.ts` omits it deliberately, so an append to a page this server created
   lands at the bottom of the page.
 
-**Not tested.** Whether a PATCH preserves ink on a page that has handwriting. Testing it
-needs a page with real strokes, and no such page could be written to during this spike.
-The test now exists — `test/ink-preservation.integration.test.ts`, issue #19 — and is
-skipped unless the environment names a live page carrying handwriting. It renders the ink
-before and after `append_to_page` and `update_page_title` and compares the stroke count and
-the PNG bytes. It has not been run against the account, because the page it needs has to be
-written on by hand from a tablet. Until it has, whether a write preserves ink is unknown
-rather than confirmed.
+**Writes preserve ink.** Measured 2026-08-18 by
+`test/ink-preservation.integration.test.ts` (issue #19) against a scratch page carrying 5
+hand-written strokes. `append_to_page` and `update_page_title` each left the stroke count at
+5 and the rendered PNG byte-identical — same 26,586 bytes, same SHA-256 — while the appended
+paragraph appeared in the page HTML and the new title became visible, so both writes did
+happen. A PATCH that names `body` or `title` does not disturb an `<ink>` node it says
+nothing about. The test is skipped unless the environment names a live page; re-run it
+against a page with handwriting before trusting a new change array shape.
 
 ## Errors
 

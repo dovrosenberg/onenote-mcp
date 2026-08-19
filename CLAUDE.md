@@ -116,8 +116,9 @@ carry real strokes, which only a person with a tablet can put there, and the wri
 confirmed independently — the appended marker has to appear in the page HTML and the new
 title has to become visible — so a write that silently did nothing cannot pass as ink
 preserved. It leaves the page changed: the marker paragraph stays, and the title is put
-back only when the original could be read. `npm test` runs it as a skip; nothing has run it
-against the account yet.
+back only when the original could be read. It was run against the account on 2026-08-18
+against a page carrying 5 strokes: both writes left the stroke count and the PNG bytes
+identical. `npm test` runs it as a skip.
 
 `test/name-lookup.test.ts` drives the resolver through a fake `LookupStructure` that
 counts calls, because what this module is for is what it does not do: the common path is

@@ -265,6 +265,7 @@ granting the roles it needs.
 | Layer-1 OAuth client ID (Claude → this server) | No | GitHub repo variable | Env var `MCP_OAUTH_CLIENT_ID` |
 | Layer-1 OAuth client secret | **Yes** | GitHub repo secret | Env var `MCP_OAUTH_CLIENT_SECRET` |
 | Access-token signing key | **Yes** | GitHub repo secret | Env var `MCP_TOKEN_SIGNING_KEY` |
+| The service's own public URL (#21) | No | GitHub repo variable | Env var `MCP_PUBLIC_URL` |
 | WIF provider resource name | No | GitHub repo variable | Used by the Action only |
 | Deploy service account email | No | GitHub repo variable | Used by the Action only |
 | MSAL token cache | **Yes** | Firestore document | Read and written at runtime by the service |
@@ -408,8 +409,8 @@ Layer 2 is already validated (Appendix A). Layer 1 is new work.
   authorization-code flow against this server.
 - **OAuth metadata discovery endpoints** so Claude can find the authorization
   server (`/.well-known/oauth-authorization-server`, and protected-resource
-  metadata per the MCP auth spec). Claude supports both the 2025-03-26 and
-  2025-06-18 MCP auth specs.
+  metadata per the MCP auth spec). Claude supports the 2025-03-26,
+  2025-06-18 and 2025-11-25 MCP auth specs.
 - **An authorize endpoint with a real consent step.** Anthropic's docs are
   explicit that a pure machine-to-machine `client_credentials` grant is
   **not** supported — every connection requires user consent, which means a
@@ -426,14 +427,171 @@ Layer 2 is already validated (Appendix A). Layer 1 is new work.
   ID/secret is supplied. Supplying them explicitly (the Advanced settings
   path) sidesteps DCR, which is the simpler route here — implementing DCR
   for a single-user server is wasted effort.
-- Going authless is not really an option even setting security aside: the
-  connector UI assumes OAuth and there's no "no auth" declaration, so
-  servers exposing no OAuth metadata can fail the connect flow outright.
+- Anthropic's connector documentation now lists `none` (an authless server)
+  as a supported authentication type, so the connector UI is no longer the
+  reason to build Layer 1. The reason is that the Cloud Run URL is public
+  and deployed `--allow-unauthenticated`, and OneNote content sits behind
+  it.
 - Since this is single-user, the "user database" is one user. Don't build
   user management — a single configured credential pair, a trivial consent
   screen, and signed/opaque access tokens with an expiry is enough.
-- Existing MCP SDK auth middleware may cover most of this; check what the
-  TypeScript MCP SDK provides before hand-rolling an authorization server.
+- The TypeScript MCP SDK covers most of the OAuth machinery. What it covers
+  and what it leaves is measured in the next section.
+
+### Layer 1: what the SDK provides — settled by the spike in issue #20
+
+**Decision: use the SDK's authorization-server router and its bearer
+middleware. Do not hand-roll an OAuth server.** `mcpAuthRouter` and
+`requireBearerAuth` from `@modelcontextprotocol/sdk` 1.30.0 carry the
+protocol: metadata documents, PKCE verification, redirect-URI matching,
+client authentication, error shapes, and the `WWW-Authenticate` header.
+What is left is an `OAuthServerProvider` implementation — the consent
+screen, the token format, and the stores. The named gaps are below; each
+one is work for #21, #22 or #23, not a reason to write the router.
+
+#### Measured, 2026-08-18
+
+The lines below come from a probe that mounted `mcpAuthRouter` over a
+minimal provider and drove it end to end. They are observations of SDK
+1.30.0, not readings of its documentation.
+
+| Probe | Result |
+|---|---|
+| `GET /.well-known/oauth-authorization-server` | 200. `code_challenge_methods_supported: ["S256"]`, `grant_types_supported: ["authorization_code","refresh_token"]`, no `registration_endpoint` |
+| `GET /.well-known/oauth-protected-resource/mcp` | 200, `resource` and `authorization_servers` as configured |
+| `GET /.well-known/oauth-protected-resource` | 404 |
+| `GET /.well-known/openid-configuration` | 404 |
+| `GET /authorize` → `https://claude.ai/api/mcp/auth_callback` | 302 carrying `code` and `state` |
+| `GET /authorize` → `http://localhost:3118/callback`, registered as `http://localhost/callback` | 302 — RFC 8252 port relaxation already implemented |
+| `GET /authorize` → an unregistered redirect URI | 400 `invalid_request`, no redirect |
+| `POST /token`, credentials in the form body | 200 with the provider's token response |
+| `POST /token`, credentials in an `Authorization: Basic` header | 400 `invalid_request` — HTTP Basic client authentication is not implemented |
+| `POST /token` with a JSON body | 400 — form-urlencoded only, which is what Claude sends |
+| `POST /mcp` with no token | 401, `WWW-Authenticate: Bearer error="invalid_token", error_description="…", resource_metadata="…"` |
+| `POST /mcp?access_token=…` | 401 — the query string is never read |
+| `POST /mcp` with a token whose `resource` names another server | **200** |
+
+#### The gaps, and where each one lands
+
+1. **No audience check.** The last probe line is the important one: a token
+   minted for a different resource server was accepted. `AuthInfo.resource`
+   is carried but nothing compares it. `checkResourceAllowed` exists in
+   `shared/auth-utils.js` and is called only by the SDK's client. Binding
+   the audience is `verifyAccessToken`'s job, and it is #23's work.
+2. **No consent screen.** `provider.authorize` is handed the response object
+   and must eventually redirect with a code. Rendering a form and resuming
+   after the POST is entirely ours, and the resume path needs a route the
+   SDK's `/authorize` router does not own.
+3. **No token format, no stores, no refresh.** The SDK issues nothing. The
+   demo provider it ships (`examples/server/demoInMemoryOAuthProvider.js`)
+   keeps codes and tokens in a `Map` and throws on refresh.
+4. **Metadata advertises `none` in `token_endpoint_auth_methods_supported`
+   unconditionally.** `createOAuthMetadata` builds that array from nothing
+   the caller controls, so a confidential-client-only server still says it
+   accepts public clients. The enforcement is correct regardless — a client
+   record holding a secret makes the secret mandatory — so this is a
+   truthfulness problem in the document, not a hole. Removing it means
+   serving `/.well-known/oauth-authorization-server` from our own route
+   registered ahead of `mcpAuthRouter`.
+5. **Protected-resource metadata is served only at the path-suffixed URL.**
+   With the resource at `…/mcp`, `/.well-known/oauth-protected-resource`
+   itself is a 404. Claude probes the suffixed path first and only falls
+   back to the bare one, and the `401` will point at the suffixed URL
+   explicitly, so nothing here breaks. A client that probes only the bare
+   path fails to discover anything.
+6. **The client secret is compared with `!==`.** Issue #22 asks for a
+   constant-time comparison; the comparison lives inside the SDK's
+   `authenticateClient` middleware and cannot be replaced without replacing
+   the whole token router. Recommendation: amend #22. The channel is a
+   string comparison behind TLS, reachable only from the public internet,
+   under a 50-request rate limit — measuring it is not practical, and
+   replacing the SDK's token endpoint to close it costs more than it buys.
+7. **Rate limiting keys on the socket address.** The SDK applies
+   `express-rate-limit` at 100 requests per 15 minutes on `/authorize` and
+   50 on `/token`. Behind Cloud Run every request arrives from the front
+   end, and a probe with `X-Forwarded-For` set did not change the counter,
+   so all callers share one bucket. Anyone who finds the URL can exhaust the
+   token endpoint's budget and block the operator's own connect flow for 15
+   minutes. Neither raising `trust proxy` nor per-IP keying fixes that for a
+   single-user server; note it and move on.
+8. **`mcpAuthRouter` must be mounted at the application root.** It builds
+   its paths from the issuer URL, not from a mount point.
+
+#### What Claude does, from Anthropic's connector documentation
+
+Read 2026-08-18. These are the constraints the implementation has to meet.
+
+- **Spec revisions**: 2025-03-26, 2025-06-18 and 2025-11-25 are all
+  supported.
+- **Dynamic Client Registration is skippable**, which settles the third task
+  on #20. A custom connector added by URL takes an OAuth Client ID, and the
+  Client Secret field beside it is optional — supply it only if the server
+  requires confidential-client authentication. Ours does. Pre-registered
+  credentials are one of the three client-identity mechanisms Claude
+  accepts, alongside DCR and Client ID Metadata Documents.
+- **Callback URLs**: `https://claude.ai/api/mcp/auth_callback` for
+  Claude.ai, Desktop, mobile and Cowork. Claude Code is a native client on
+  an RFC 8252 loopback redirect with an ephemeral port, declaring
+  `http://localhost/callback` and `http://127.0.0.1/callback`; both must be
+  accepted with the port ignored. The SDK's matcher already does this, so
+  registering all three redirect URIs makes both surfaces work.
+- **PKCE `S256` on every authorization request**, and the metadata must
+  advertise it.
+- **The `resource` parameter is sent** on authorization and token requests,
+  set to the canonical form of the MCP server URL including its path. The
+  token has to be bound to it, and the check should accept the canonical
+  value rather than a byte comparison against what the user typed.
+- **`offline_access` is appended to the requested scopes** when the
+  authorization server metadata lists it in `scopes_supported`. That is the
+  switch that decides whether Claude asks for a refresh token.
+- **Refresh happens reactively on a 401**, plus proactively up to five
+  minutes before the stored expiry. A dead refresh token must come back as
+  `invalid_grant`.
+- **The `401` must carry `WWW-Authenticate` with a `resource_metadata`
+  parameter.** Claude does not honour that header on a 200, and a tool
+  result carrying an "isError" sign-in message produces no auth prompt at
+  all — it reaches the model as an ordinary tool failure.
+- **Endpoint latency**: 10 seconds for discovery and token requests, 30 for
+  refresh. A Cloud Run cold start plus an HMAC is well inside that.
+- **Anthropic's egress range is `160.79.104.0/21`**, if anything in front of
+  the service ever needs an allowlist.
+
+#### The decisions this settles for #21–#23
+
+- **Token format: HMAC-SHA256 over a compact payload, using
+  `MCP_TOKEN_SIGNING_KEY` and `node:crypto`.** No new dependency, and
+  nothing outside this server ever reads one. The payload carries the
+  audience, the expiry, and the client id.
+- **Access tokens are stateless and last an hour. Refresh tokens are
+  stateless and last 30 days.** Stateless is what makes a revision
+  replacement invisible: an in-memory token store would force a reconnect
+  every deploy.
+- **Refresh tokens are not rotated.** OAuth 2.1 and the MCP spec require
+  rotation for *public* clients; supplying the secret in Claude's Advanced
+  settings makes this a confidential client, and rotation cannot be
+  enforced by a stateless token anyway. Say so in the code.
+- **Authorization codes stay in memory**, single-use, 60-second lifetime.
+  Losing one to a revision replacement costs a retry of the consent click,
+  which is the one moment a human is already present.
+- **The authorization parameters cross the consent screen signed**, in a
+  hidden form field, with the same key. That keeps the flow working across
+  an instance replacement mid-consent and stops the form being edited.
+- **The consent screen authenticates nobody.** It has one Approve button.
+  What protects the endpoint is that `/token` requires the client secret,
+  that the redirect URI allowlist sends every code to `claude.ai` or to
+  loopback, and that PKCE binds the code to the client that started the
+  flow. An attacker holding the client id can reach the consent screen and
+  cause a code to be minted; without the secret they cannot exchange it.
+- **A new configuration variable is needed: `MCP_PUBLIC_URL`**, in the
+  `oauth` group. The issuer, the `resource` value, and the
+  `resource_metadata` URL all have to be the service's public URL, and
+  nothing on Cloud Run tells the process what that is. The deploy workflow
+  gains `MCP_PUBLIC_URL=${{ vars.MCP_PUBLIC_URL }}`, which can only be
+  filled in after the first deploy has produced the URL.
+- **#23's exempt list is longer than the issue assumes.** Everything
+  `mcpAuthRouter` mounts is unauthenticated by necessity: `/authorize`,
+  `/token`, both `.well-known` documents, and the consent POST, alongside
+  `/healthz`. The fail-closed route test has to enumerate them.
 
 ---
 
@@ -453,12 +611,11 @@ Settled by the spike in issue #17, on 2026-08-18:
   `#{data-id}`. Nothing has to rewrite full page content. A `position`
   parameter on `append_to_page` is the straightforward shape.
 - **`update_page_title` mechanics** — settled; see the writing notes above.
-- **Ink and writes** — still open. Whether a PATCH preserves handwriting was
-  not tested, because it needs a page carrying real strokes and the spike
-  wrote only to throwaway pages. Issue #19 is that test, and it is now written:
-  `test/ink-preservation.integration.test.ts`, skipped unless the environment
-  names a live page with handwriting on it. Running it needs a person with a
-  tablet to make that page; until someone does, the question stays open.
+- **Ink and writes** — settled 2026-08-18 by issue #19's test,
+  `test/ink-preservation.integration.test.ts`, run against a scratch page with 5
+  hand-written strokes on it. `append_to_page` and `update_page_title` both left
+  the stroke count and the rendered PNG bytes identical. Writes do not clobber
+  handwriting.
 
 ---
 
