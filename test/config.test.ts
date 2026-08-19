@@ -242,3 +242,161 @@ test('loadConfig does not read the real process.env when an env is injected', ()
     delete process.env['ONENOTE_CLIENT_ID'];
   }
 });
+
+// ---------------------------------------------------------------------------
+// The mirror group (issue #30).
+//
+// Every variable is optional, so an unset environment leaves the feature entirely off
+// and the deployed service behaves exactly as it did before the group existed. That is
+// the property the first test asserts, and it is what lets the mirror ship inert.
+// ---------------------------------------------------------------------------
+
+const MIRROR_GROUPS: ConfigGroup[] = [...ALL_GROUPS, 'mirror'];
+
+test('the mirror group is entirely optional and defaults to off', () => {
+  const config = loadConfig(MIRROR_GROUPS, fullEnv());
+
+  assert.deepEqual(config.mirror, {
+    rootDocumentPath: 'onenoteMirror/default',
+    readEnabled: false,
+    syncRequestBudget: 120,
+  });
+});
+
+test('the mirror group reads every variable when they are all set', () => {
+  const config = loadConfig(
+    MIRROR_GROUPS,
+    fullEnv({
+      MIRROR_ROOT_DOC: 'mirrors/prod',
+      MIRROR_SYNC_SECRET: 'y'.repeat(32),
+      MIRROR_BUCKET: 'onenote-mcp-mirror-505918',
+      MIRROR_READ_ENABLED: 'true',
+      MIRROR_SYNC_REQUEST_BUDGET: '60',
+    }),
+  );
+
+  assert.deepEqual(config.mirror, {
+    rootDocumentPath: 'mirrors/prod',
+    syncSecret: 'y'.repeat(32),
+    bucket: 'onenote-mcp-mirror-505918',
+    readEnabled: true,
+    syncRequestBudget: 60,
+  });
+});
+
+test('MIRROR_SYNC_SECRET without MIRROR_BUCKET is a ConfigError naming the bucket', () => {
+  // A sync has nowhere to put a rendered ink PNG without a bucket. SPECS cannot express
+  // "required when another variable is present", so loadConfig checks the pair itself —
+  // the first cross-field rule in the file.
+  const err = expectConfigError(
+    fullEnv({ MIRROR_SYNC_SECRET: 'y'.repeat(32) }),
+    MIRROR_GROUPS,
+  );
+
+  assert.deepEqual(err.missing, ['MIRROR_BUCKET']);
+  assert.match(err.message, /MIRROR_BUCKET/);
+});
+
+test('MIRROR_READ_ENABLED without MIRROR_BUCKET is a ConfigError too', () => {
+  // Reads serve the stored ink PNG out of the bucket, so enabling them without one is
+  // the same mistake from the other direction.
+  const err = expectConfigError(
+    fullEnv({ MIRROR_READ_ENABLED: 'true' }),
+    MIRROR_GROUPS,
+  );
+
+  assert.deepEqual(err.missing, ['MIRROR_BUCKET']);
+});
+
+test('a bucket with neither the secret nor reads set is allowed', () => {
+  // Provisioning the bucket before turning anything on is the ordinary deploy sequence.
+  const config = loadConfig(
+    MIRROR_GROUPS,
+    fullEnv({ MIRROR_BUCKET: 'onenote-mcp-mirror-505918' }),
+  );
+
+  assert.equal(config.mirror?.bucket, 'onenote-mcp-mirror-505918');
+  assert.equal(config.mirror?.readEnabled, false);
+  assert.equal(config.mirror?.syncSecret, undefined);
+});
+
+test('MIRROR_READ_ENABLED accepts only true and false', () => {
+  for (const value of ['true', 'TRUE', 'True']) {
+    const config = loadConfig(MIRROR_GROUPS, fullEnv({
+      MIRROR_READ_ENABLED: value,
+      MIRROR_BUCKET: 'b-ucket',
+    }));
+    assert.equal(config.mirror?.readEnabled, true, value);
+  }
+
+  for (const value of ['false', 'FALSE']) {
+    const config = loadConfig(MIRROR_GROUPS, fullEnv({ MIRROR_READ_ENABLED: value }));
+    assert.equal(config.mirror?.readEnabled, false, value);
+  }
+
+  // Nothing else is guessed at. "1", "yes" and "on" all read as true to a human and
+  // would silently enable the mirror if this were lenient.
+  for (const value of ['1', 'yes', 'on', '0', 'no']) {
+    const err = expectConfigError(fullEnv({ MIRROR_READ_ENABLED: value }), MIRROR_GROUPS);
+    assert.deepEqual(err.missing, []);
+    assert.match(err.message, /MIRROR_READ_ENABLED/);
+  }
+});
+
+test('MIRROR_SYNC_REQUEST_BUDGET is bounded on both sides', () => {
+  const budget = (value: string): number | undefined =>
+    loadConfig(MIRROR_GROUPS, fullEnv({ MIRROR_SYNC_REQUEST_BUDGET: value })).mirror
+      ?.syncRequestBudget;
+
+  assert.equal(budget('10'), 10);
+  assert.equal(budget('350'), 350);
+
+  // Below 10 a run cannot get past the structure read and the first section, so it would
+  // never make progress. Above 350 one run could spend the whole hourly budget of 400
+  // and leave nothing for the interactive tools.
+  for (const value of ['9', '351', '0', '-5', 'lots', '12.5']) {
+    const err = expectConfigError(
+      fullEnv({ MIRROR_SYNC_REQUEST_BUDGET: value }),
+      MIRROR_GROUPS,
+    );
+    assert.match(err.message, /MIRROR_SYNC_REQUEST_BUDGET/);
+  }
+});
+
+test('MIRROR_ROOT_DOC is held to the same document-path rule as the token cache', () => {
+  const err = expectConfigError(fullEnv({ MIRROR_ROOT_DOC: 'onenoteMirror' }), MIRROR_GROUPS);
+  assert.match(err.message, /MIRROR_ROOT_DOC/);
+
+  assert.equal(
+    loadConfig(MIRROR_GROUPS, fullEnv({ MIRROR_ROOT_DOC: 'a/b/c/d' })).mirror?.rootDocumentPath,
+    'a/b/c/d',
+  );
+});
+
+test('MIRROR_BUCKET is checked against the GCS naming rules, not just non-empty', () => {
+  const ok = (value: string): string | undefined =>
+    loadConfig(MIRROR_GROUPS, fullEnv({ MIRROR_BUCKET: value })).mirror?.bucket;
+
+  assert.equal(ok('onenote-mcp-mirror-505918'), 'onenote-mcp-mirror-505918');
+  assert.equal(ok('a.b_c-1'), 'a.b_c-1');
+
+  // A typo fails here, at startup, alongside every other configuration problem, rather
+  // than at the first PUT hours into a backfill.
+  for (const value of [
+    'gs://onenote-mcp-mirror',
+    'OneNoteMirror',
+    'has spaces',
+    'ab',
+    'x'.repeat(64),
+    '-leading-dash',
+    'trailing-dash-',
+  ]) {
+    const err = expectConfigError(fullEnv({ MIRROR_BUCKET: value }), MIRROR_GROUPS);
+    assert.match(err.message, /MIRROR_BUCKET/);
+  }
+});
+
+test('a caller that does not ask for the mirror group gets no mirror config', () => {
+  const config = loadConfig(ALL_GROUPS, fullEnv({ MIRROR_READ_ENABLED: 'true' }));
+  assert.equal(config.mirror, undefined);
+});

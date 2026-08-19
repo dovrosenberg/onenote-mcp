@@ -269,10 +269,34 @@ image built by issue #6.
 
 **Configuration is grouped, and read in exactly one place.** `loadConfig(groups, env)`
 in `src/config.ts` validates only the groups the caller asks for: `graph`, `firestore`,
-`firestore-explicit`, `oauth`, `server`. The server asks for `graph`, `firestore`,
-`oauth`, and `server`; `bootstrap.ts` asks for `graph` and `firestore-explicit` only, so
+`firestore-explicit`, `oauth`, `server`, `mirror`. The server asks for everything except
+`firestore-explicit`; `bootstrap.ts` asks for `graph` and `firestore-explicit` only, so
 the operator running it locally is never made to hold `MCP_OAUTH_CLIENT_SECRET`. Add a
 new variable to the `SPECS` table, not to a new `process.env` read somewhere else.
+
+**The `mirror` group is entirely optional, and that is what makes it a rollback switch.**
+Every `MIRROR_*` variable defaults or may be absent, so a service deployed with none of
+them set behaves exactly as one built before the group existed. `MIRROR_READ_ENABLED` is
+set back to `false` and redeployed to turn the whole page mirror off — no code change, no
+data migration, and the tool modules are identical under both settings. The server asks
+for the group unconditionally even while nothing reads it, so a malformed `MIRROR_*` value
+fails at startup beside every other configuration problem rather than at first use.
+
+**`MIRROR_BUCKET` is the one cross-field rule in `loadConfig`, and it is deliberate.** A
+`VarSpec` says required-or-not per variable and cannot say "required when another is
+present". A sync has nowhere to put a rendered ink PNG without a bucket and a mirror read
+has nowhere to fetch one from, so the `mirror` block checks the pair itself and throws
+`ConfigError(['MIRROR_BUCKET'], [], purposes)`. Without it the failure surfaces hours into
+a backfill at the first object write. If a second rule of this kind is ever needed, the
+right move is probably a `requires` field on `VarSpec` rather than a second hand-written
+block.
+
+**`checkBoolean` accepts only `true` and `false`.** Not `1`, not `yes`, not `on`. A
+lenient parser would also have to decide what `0` and `off` mean, and at that point a typo
+like `ture` reads as `false` and switches the mirror off with nothing to say so. The
+comparison in the `mirror` block lowercases to match, because a case-sensitive read of a
+case-insensitive validator would let `True` pass validation and then evaluate false —
+which is the same silent inversion from the other direction.
 
 **The bootstrap CLI requires the two Firestore variables the server defaults.** That is
 the whole difference between the `firestore` and `firestore-explicit` groups:

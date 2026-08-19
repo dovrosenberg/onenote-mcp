@@ -41,6 +41,13 @@ GAR_REPO="${SERVICE}"
 POOL_ID="github-pool"
 PROVIDER_ID="github-provider"
 
+# The bucket holding rendered ink PNGs and any page HTML too large for a
+# Firestore document (issue #30). Bucket names are globally unique across all
+# of GCS, so the project number is appended to make a collision with someone
+# else's bucket impossible. Override MIRROR_BUCKET to use a name you already
+# own.
+MIRROR_BUCKET="${MIRROR_BUCKET:-${SERVICE}-mirror-${PROJECT##*-}}"
+
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -119,6 +126,7 @@ gcloud services enable \
   run.googleapis.com \
   artifactregistry.googleapis.com \
   firestore.googleapis.com \
+  storage.googleapis.com \
   iamcredentials.googleapis.com \
   sts.googleapis.com \
   cloudresourcemanager.googleapis.com \
@@ -154,6 +162,30 @@ ensure_resource "Firestore Native database ($REGION)" \
     --project="$PROJECT"
 
 # ---------------------------------------------------------------------------
+# Cloud Storage bucket for the page mirror (issue #30).
+#
+# --uniform-bucket-level-access turns off per-object ACLs, so access is decided
+# by IAM alone and an object cannot be made public one at a time.
+# --public-access-prevention refuses any binding that would make it public at
+# all. Both matter here rather than being boilerplate: the objects are rendered
+# handwriting, which CLAUDE.md's hygiene rules name as a thing that must never
+# leave this account.
+#
+# Same location as the service so a read is in-region. Nothing here sets a
+# lifecycle rule: the sync deletes an object when it deletes the page it
+# belongs to, and a rule that expired objects by age would delete the ink of a
+# page nobody has edited in a year.
+# ---------------------------------------------------------------------------
+ensure_resource "Cloud Storage bucket $MIRROR_BUCKET ($REGION)" \
+  gcloud storage buckets describe "gs://$MIRROR_BUCKET" --project="$PROJECT" \
+  -- \
+  gcloud storage buckets create "gs://$MIRROR_BUCKET" \
+    --location="$REGION" \
+    --uniform-bucket-level-access \
+    --public-access-prevention \
+    --project="$PROJECT"
+
+# ---------------------------------------------------------------------------
 # Service accounts
 # ---------------------------------------------------------------------------
 ensure_resource "runtime service account $RUNTIME_SA" \
@@ -184,6 +216,16 @@ gcloud projects add-iam-policy-binding "$PROJECT" \
   --role="roles/datastore.user" \
   --condition=None --quiet >/dev/null
 
+# Scoped to the bucket, not the project. The runtime service account creates,
+# reads and deletes the mirror's ink and HTML objects; a project-level grant
+# would reach every bucket in the project instead of only this one. Same
+# reasoning as the serviceAccountUser binding further down.
+log "granting roles/storage.objectAdmin on gs://$MIRROR_BUCKET to $RUNTIME_SA"
+gcloud storage buckets add-iam-policy-binding "gs://$MIRROR_BUCKET" \
+  --member="serviceAccount:$RUNTIME_SA" \
+  --role="roles/storage.objectAdmin" \
+  --project="$PROJECT" --quiet >/dev/null
+
 for role in roles/run.admin roles/artifactregistry.writer; do
   log "granting $role to $DEPLOY_SA"
   gcloud projects add-iam-policy-binding "$PROJECT" \
@@ -201,6 +243,63 @@ gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" \
   --member="serviceAccount:$DEPLOY_SA" \
   --role="roles/iam.serviceAccountUser" \
   --project="$PROJECT" --quiet >/dev/null
+
+# ---------------------------------------------------------------------------
+# Firestore composite indexes for the page mirror (issue #30).
+#
+# Firestore indexes single fields automatically and composite queries not at
+# all. A query with no index fails at runtime with FAILED_PRECONDITION and a
+# console link -- which is a fine developer experience and a bad production
+# one, because nothing in CI notices and the first person to hit it is a model
+# mid-conversation. So they are created here.
+#
+# `indexes composite create` has no describe-by-definition form to guard on, so
+# ensure_resource does not fit: a second run answers ALREADY_EXISTS, which is
+# the idempotent outcome and not a failure. The `|| true` is that, and only
+# that -- a real failure still prints its own error above it.
+#
+# Collection ids are the last segment of MIRROR_ROOT_DOC's subcollections, so
+# they are fixed strings rather than derived: a collection-group index is
+# keyed by the collection id alone, and every deployment uses the same three.
+# ---------------------------------------------------------------------------
+log "creating Firestore composite indexes for the page mirror"
+
+# Pages in one section, newest first. Backs list_pages and the scoped form of
+# search_pages.
+gcloud firestore indexes composite create \
+  --collection-group=pages \
+  --field-config=field-path=sectionId,order=ascending \
+  --field-config=field-path=lastModified,order=descending \
+  --database='(default)' --project="$PROJECT" --quiet >/dev/null 2>&1 || true
+
+# Sections to visit this sync run, least recently synced first. A
+# budget-bounded run round-robins on this rather than starving the tail.
+gcloud firestore indexes composite create \
+  --collection-group=sections \
+  --field-config=field-path=mirrored,order=ascending \
+  --field-config=field-path=pagesSyncedThrough,order=ascending \
+  --database='(default)' --project="$PROJECT" --quiet >/dev/null 2>&1 || true
+
+# Children of one container, by name. Two collections, same shape, because
+# Graph exposes sections and section groups as separate relationships and
+# list_sections returns them as one tagged list.
+for collection in sections sectionGroups; do
+  gcloud firestore indexes composite create \
+    --collection-group="$collection" \
+    --field-config=field-path=parentId,order=ascending \
+    --field-config=field-path=displayName,order=ascending \
+    --database='(default)' --project="$PROJECT" --quiet >/dev/null 2>&1 || true
+done
+
+# An index exemption on the one big string. Page HTML is stored untrimmed and
+# is never queried -- it is fetched by document key -- so indexing it costs
+# write throughput and storage for no query at all. Firestore's index entries
+# also count toward the 1 MB document limit, which is what the mirror's spill
+# threshold is sized against.
+gcloud firestore indexes fields update html \
+  --collection-group=pageContent \
+  --disable-indexes \
+  --database='(default)' --project="$PROJECT" --quiet >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # Workload Identity Federation
@@ -281,6 +380,7 @@ gh variable set GAR_REGION  --body "$GAR_REGION"
 gh variable set WIF_PROVIDER --body "$WIF_PROVIDER"
 gh variable set DEPLOY_SA    --body "$DEPLOY_SA"
 gh variable set RUNTIME_SA   --body "$RUNTIME_SA"
+gh variable set MIRROR_BUCKET --body "$MIRROR_BUCKET"
 GH_VARS
 echo
 log "These values this script cannot know. Fill in the client ID from issue #1;"

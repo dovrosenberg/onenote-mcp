@@ -154,6 +154,16 @@ jobs:
       # MCP_KEEPALIVE_SECRET is listed unconditionally: an unset repository secret
       # produces an empty value, loadConfig treats an empty value as unset, and
       # POST /keepalive is then not mounted at all.
+      #
+      # The five MIRROR_* variables (issue #30) are listed unconditionally for the same
+      # reason. Every one is optional, so an unconfigured repository deploys a service
+      # with the page mirror switched off, which is byte-identical in behaviour to one
+      # built before the group existed. MIRROR_READ_ENABLED is the rollback switch: set
+      # the repository variable to false and redeploy, and every read tool goes back to
+      # Graph with no code change and no data migration. Note that loadConfig refuses a
+      # MIRROR_SYNC_SECRET or a true MIRROR_READ_ENABLED without a MIRROR_BUCKET, so a
+      # half-configured repository fails at container startup rather than at the first
+      # object write.
       - name: Deploy to Cloud Run
         uses: google-github-actions/deploy-cloudrun@v2
         with:
@@ -172,6 +182,11 @@ jobs:
             MCP_PUBLIC_URL=${{ steps.public-url.outputs.url }}
             MCP_KEEPALIVE_SECRET=${{ secrets.MCP_KEEPALIVE_SECRET }}
             FIRESTORE_CACHE_DOC=${{ vars.FIRESTORE_CACHE_DOC || 'tokencache/msal' }}
+            MIRROR_ROOT_DOC=${{ vars.MIRROR_ROOT_DOC || 'onenoteMirror/default' }}
+            MIRROR_SYNC_SECRET=${{ secrets.MIRROR_SYNC_SECRET }}
+            MIRROR_BUCKET=${{ vars.MIRROR_BUCKET }}
+            MIRROR_READ_ENABLED=${{ vars.MIRROR_READ_ENABLED || 'false' }}
+            MIRROR_SYNC_REQUEST_BUDGET=${{ vars.MIRROR_SYNC_REQUEST_BUDGET || '120' }}
 
       # Only on the first deploy. The service now exists, so it has a URL; --update-env-vars
       # changes that one variable and leaves the rest of the environment the deploy above

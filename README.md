@@ -763,8 +763,13 @@ missing, rather than deploying half-configured.
 | `MCP_OAUTH_CLIENT_SECRET` | **secret** | Layer-1 OAuth client secret |
 | `MCP_TOKEN_SIGNING_KEY` | **secret** | Access-token signing key, at least 32 characters |
 | `MCP_KEEPALIVE_SECRET` | **secret** | Optional; unset means `POST /keepalive` is not mounted |
+| `MIRROR_BUCKET` | variable | Optional; the page mirror's Cloud Storage bucket. `scripts/gcp-bootstrap.sh` prints the name it created |
+| `MIRROR_READ_ENABLED` | variable | Optional; defaults to `false`. The switch that makes read tools use the mirror |
+| `MIRROR_ROOT_DOC` | variable | Optional; defaults to `onenoteMirror/default` |
+| `MIRROR_SYNC_REQUEST_BUDGET` | variable | Optional; defaults to `120` |
+| `MIRROR_SYNC_SECRET` | **secret** | Optional; unset means `POST /sync` is not mounted |
 
-Only three of these are credentials. The WIF provider name and the service account
+Only four of these are credentials. The WIF provider name and the service account
 emails are identifiers, useless to anyone who cannot present this repository's OIDC
 identity, so they are variables rather than secrets.
 
@@ -819,6 +824,28 @@ and the process exits 1 without a stack trace.
 | `GOOGLE_CLOUD_PROJECT` | server: no · bootstrap: **yes** | — | GCP project; inferred automatically on Cloud Run |
 | `PORT` | no | `8080` | Bind port. Cloud Run sets this; the server never hardcodes one. |
 | `MCP_KEEPALIVE_SECRET` | no | — | At least 32 characters. Set it and `POST /keepalive` is mounted; leave it unset and the path 404s. See **Keepalive**. |
+| `MIRROR_ROOT_DOC` | no | `onenoteMirror/default` | Firestore document holding the hand-edited list of notebook ids to mirror. Its subcollections are the mirror. Document path, even segment count, same rule as `FIRESTORE_CACHE_DOC`. |
+| `MIRROR_SYNC_SECRET` | no | — | At least 32 characters. Set it and `POST /sync` is mounted; leave it unset and the path 404s. |
+| `MIRROR_BUCKET` | conditionally | — | Cloud Storage bucket for rendered ink and oversized page HTML. Required once `MIRROR_SYNC_SECRET` or `MIRROR_READ_ENABLED` is set; see below. |
+| `MIRROR_READ_ENABLED` | no | `false` | `true` or `false`, nothing else. When true the read tools answer from the mirror and fall back to Graph on a miss. |
+| `MIRROR_SYNC_REQUEST_BUDGET` | no | `120` | Graph requests one sync run may spend before it stops and reports more outstanding. 10–350, against an hourly limit of 400. |
+
+The five `MIRROR_*` variables configure the Firestore page mirror. All are optional, so a
+service deployed with none of them set behaves exactly as it did before the mirror
+existed — which is what makes `MIRROR_READ_ENABLED` a complete rollback switch rather
+than a code change.
+
+`MIRROR_BUCKET` is the one cross-field rule in `loadConfig`. A `VarSpec` says
+required-or-not per variable and cannot say "required when another is present", but a
+sync has nowhere to put a rendered ink PNG without a bucket and a mirror read has nowhere
+to fetch one from. So setting `MIRROR_SYNC_SECRET`, or setting `MIRROR_READ_ENABLED` to
+`true`, without a bucket fails at container startup with `MIRROR_BUCKET` in the missing
+list — rather than hours into a backfill at the first object write.
+
+`MIRROR_READ_ENABLED` accepts only `true` and `false`, case-insensitively. It is
+deliberately not lenient: `1`, `yes` and `on` all read as true to a human, and a parser
+that accepted them would also have to decide what `off` and `0` mean, at which point a
+typo like `ture` becomes `false` and switches the mirror off with nothing to say so.
 
 `FIRESTORE_CACHE_DOC` names the document the MSAL cache plugin in `src/token-cache.ts`
 reads and writes. Its value must be a document path, meaning an even number of

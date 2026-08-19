@@ -3,7 +3,11 @@ import { createApp } from './server.ts';
 
 let config: Config;
 try {
-  config = loadConfig(['graph', 'firestore', 'oauth', 'server']);
+  // 'mirror' is requested unconditionally even though nothing reads it yet: every
+  // variable in that group is optional, so an unset environment validates and produces a
+  // mirror config that is switched off. Requesting it here is what makes a malformed
+  // MIRROR_* value fail at startup with the rest rather than at first use.
+  config = loadConfig(['graph', 'firestore', 'oauth', 'server', 'mirror']);
 } catch (err) {
   exitOnConfigError(err);
 }

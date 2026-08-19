@@ -71,7 +71,7 @@ run_bootstrap() {
 
 # Every describe the script makes, as underscore-joined patterns for
 # STUB_MISSING (the stub converts underscores back to spaces).
-ALL_MISSING="artifacts_repositories_describe firestore_databases_describe iam_service-accounts_describe iam_workload-identity-pools_describe iam_workload-identity-pools_providers_describe"
+ALL_MISSING="artifacts_repositories_describe firestore_databases_describe storage_buckets_describe iam_service-accounts_describe iam_workload-identity-pools_describe iam_workload-identity-pools_providers_describe"
 
 echo "--- Phase 1: parameters and preflight ---"
 
@@ -93,7 +93,7 @@ echo "--- Phase 2: APIs, Artifact Registry, Firestore ---"
 
 run_bootstrap PROJECT=test-project STUB_MISSING="$ALL_MISSING"
 assert_status 0 "fresh project run exits 0"
-for api in run artifactregistry firestore iamcredentials sts cloudresourcemanager cloudscheduler; do
+for api in run artifactregistry firestore storage iamcredentials sts cloudresourcemanager cloudscheduler; do
   assert_logged "${api}.googleapis.com" "services enable includes ${api}.googleapis.com"
 done
 assert_logged "artifacts repositories create onenote-mcp" "fresh run creates the Artifact Registry repo"
@@ -106,12 +106,50 @@ assert_status 0 "already-configured run exits 0"
 assert_logged "services enable" "already-configured run still enables APIs"
 assert_not_logged "artifacts repositories create" "already-configured run skips repo create"
 assert_not_logged "firestore databases create" "already-configured run skips database create"
+assert_not_logged "storage buckets create" "already-configured run skips bucket create"
 
 run_bootstrap PROJECT=test-project REGION=nam5 GAR_REGION=europe-west4 STUB_MISSING="$ALL_MISSING"
 assert_logged "artifacts repositories create onenote-mcp --repository-format=docker --location=europe-west4" \
   "GAR_REGION drives the Artifact Registry location"
 assert_logged "firestore databases create --location=nam5" \
   "REGION drives the Firestore location, independently of GAR_REGION"
+
+echo "--- Phase 2b: the page mirror's bucket and indexes (issue #30) ---"
+
+run_bootstrap PROJECT=test-project STUB_MISSING="$ALL_MISSING"
+assert_logged "storage buckets create gs://onenote-mcp-mirror-project" \
+  "fresh run creates the mirror bucket, named from the project"
+# Both flags matter rather than being boilerplate: the objects are rendered
+# handwriting, which must never become publicly reachable.
+assert_logged "--uniform-bucket-level-access" "the bucket disables per-object ACLs"
+assert_logged "--public-access-prevention" "the bucket refuses any public binding"
+
+run_bootstrap PROJECT=test-project REGION=nam5 STUB_MISSING="$ALL_MISSING"
+assert_logged "storage buckets create gs://onenote-mcp-mirror-project --location=nam5" \
+  "REGION drives the bucket location"
+
+run_bootstrap PROJECT=test-project MIRROR_BUCKET=my-own-bucket STUB_MISSING="$ALL_MISSING"
+assert_logged "storage buckets create gs://my-own-bucket" \
+  "MIRROR_BUCKET overrides the derived name"
+
+run_bootstrap PROJECT=test-project SERVICE=other-name STUB_MISSING="$ALL_MISSING"
+assert_logged "storage buckets create gs://other-name-mirror-project" \
+  "SERVICE override drives the bucket name"
+
+# The indexes are created on every run, not guarded: `indexes composite create`
+# has no describe-by-definition form, and a second run answering ALREADY_EXISTS
+# is the idempotent outcome rather than a failure.
+run_bootstrap PROJECT=test-project STUB_MISSING=
+assert_logged "firestore indexes composite create --collection-group=pages --field-config=field-path=sectionId,order=ascending --field-config=field-path=lastModified,order=descending" \
+  "the pages-in-a-section index is created"
+assert_logged "firestore indexes composite create --collection-group=sections --field-config=field-path=mirrored,order=ascending --field-config=field-path=pagesSyncedThrough,order=ascending" \
+  "the sections-to-sync index is created"
+assert_logged "firestore indexes composite create --collection-group=sections --field-config=field-path=parentId,order=ascending --field-config=field-path=displayName,order=ascending" \
+  "the sections-by-parent index is created"
+assert_logged "firestore indexes composite create --collection-group=sectionGroups --field-config=field-path=parentId,order=ascending --field-config=field-path=displayName,order=ascending" \
+  "the sectionGroups-by-parent index is created"
+assert_logged "firestore indexes fields update html --collection-group=pageContent --disable-indexes" \
+  "raw page HTML is exempted from indexing"
 
 echo "--- Phase 3: service accounts and IAM grants ---"
 
@@ -134,6 +172,10 @@ assert_logged "iam service-accounts add-iam-policy-binding $RUN_SA --member=serv
   "roles/iam.serviceAccountUser is scoped to the runtime SA"
 assert_not_logged "projects add-iam-policy-binding test-project --member=serviceAccount:$DEP_SA --role=roles/iam.serviceAccountUser" \
   "roles/iam.serviceAccountUser is NOT granted at the project level"
+assert_logged "storage buckets add-iam-policy-binding gs://onenote-mcp-mirror-project --member=serviceAccount:$RUN_SA --role=roles/storage.objectAdmin" \
+  "roles/storage.objectAdmin is scoped to the mirror bucket"
+assert_not_logged "projects add-iam-policy-binding test-project --member=serviceAccount:$RUN_SA --role=roles/storage.objectAdmin" \
+  "roles/storage.objectAdmin is NOT granted at the project level"
 
 run_bootstrap PROJECT=test-project SERVICE=other-name STUB_MISSING="$ALL_MISSING"
 assert_logged "iam service-accounts create other-name-run" "SERVICE override drives the runtime SA id"
@@ -180,6 +222,7 @@ assert_out "gh variable set GAR_REGION  --body \"us-central1\"" "GAR_REGION line
 assert_out "gh variable set WIF_PROVIDER --body \"$WIF_RES\"" "WIF_PROVIDER line carries the full resource name"
 assert_out "gh variable set DEPLOY_SA    --body \"$DEP_SA\"" "DEPLOY_SA line"
 assert_out "gh variable set RUNTIME_SA   --body \"$RUN_SA\"" "RUNTIME_SA line"
+assert_out "gh variable set MIRROR_BUCKET --body \"onenote-mcp-mirror-project\"" "MIRROR_BUCKET line"
 assert_out "gh variable set ONENOTE_CLIENT_ID" "ONENOTE_CLIENT_ID placeholder line"
 assert_out "gh variable set ONENOTE_AUTHORITY" "ONENOTE_AUTHORITY placeholder line"
 assert_out "gh variable set MCP_OAUTH_CLIENT_ID" "MCP_OAUTH_CLIENT_ID placeholder line"

@@ -16,7 +16,13 @@
 // Nothing here reads process.env at module scope and nothing here exits the process
 // except exitOnConfigError, which is only ever called from an entrypoint.
 
-export type ConfigGroup = 'graph' | 'firestore' | 'firestore-explicit' | 'oauth' | 'server';
+export type ConfigGroup =
+  | 'graph'
+  | 'firestore'
+  | 'firestore-explicit'
+  | 'oauth'
+  | 'server'
+  | 'mirror';
 
 export class ConfigError extends Error {
   readonly missing: readonly string[];
@@ -48,6 +54,18 @@ interface VarSpec {
 }
 
 const MIN_SIGNING_KEY_LENGTH = 32;
+
+/**
+ * Below this a sync run cannot get past the structure read and the first section, so it
+ * would burn a scheduler slot without making progress.
+ */
+const MIN_SYNC_REQUEST_BUDGET = 10;
+
+/**
+ * Above this one run could spend most of OneNote's hourly limit of 400 and leave nothing
+ * for the interactive tools, which is the failure the budget exists to prevent.
+ */
+const MAX_SYNC_REQUEST_BUDGET = 350;
 
 const SPECS: readonly VarSpec[] = [
   {
@@ -135,6 +153,49 @@ const SPECS: readonly VarSpec[] = [
       'Shared secret a scheduler presents to POST /keepalive, which refreshes the Microsoft token so it does not expire from disuse; the route is not mounted when this is unset',
     check: checkSecretLength,
   },
+  {
+    name: 'MIRROR_ROOT_DOC',
+    group: 'mirror',
+    required: false,
+    fallback: 'onenoteMirror/default',
+    purpose:
+      'Firestore document holding the hand-edited list of notebook ids to mirror; its subcollections are the mirror itself',
+    check: checkDocumentPath,
+  },
+  {
+    name: 'MIRROR_SYNC_SECRET',
+    group: 'mirror',
+    required: false,
+    purpose:
+      'Shared secret a scheduler presents to POST /sync, which refreshes the mirrored page copies; the route is not mounted when this is unset',
+    check: checkSecretLength,
+  },
+  {
+    name: 'MIRROR_BUCKET',
+    group: 'mirror',
+    required: false,
+    purpose:
+      'Cloud Storage bucket holding rendered ink PNGs and any page HTML too large for a Firestore document; required once MIRROR_SYNC_SECRET or MIRROR_READ_ENABLED is set',
+    check: checkBucketName,
+  },
+  {
+    name: 'MIRROR_READ_ENABLED',
+    group: 'mirror',
+    required: false,
+    fallback: 'false',
+    purpose:
+      "'true' or 'false'; when true the read tools answer from the Firestore mirror and fall back to Graph on a miss",
+    check: checkBoolean,
+  },
+  {
+    name: 'MIRROR_SYNC_REQUEST_BUDGET',
+    group: 'mirror',
+    required: false,
+    fallback: '120',
+    purpose:
+      'How many Graph requests one POST /sync run may spend before it stops and reports more work outstanding; 10-350, against an hourly limit of 400',
+    check: checkSyncRequestBudget,
+  },
 ];
 
 export interface GraphConfig {
@@ -171,11 +232,32 @@ export interface ServerConfig {
   readonly keepaliveSecret?: string;
 }
 
+/** The Firestore page mirror (issue #30). Every field is off or defaulted by default. */
+export interface MirrorConfig {
+  /** The hand-edited selection document; its subcollections hold the mirror. */
+  readonly rootDocumentPath: string;
+  /** The secret POST /sync requires, or undefined to not serve that route at all. */
+  readonly syncSecret?: string;
+  /**
+   * The Cloud Storage bucket for rendered ink and oversized page HTML.
+   *
+   * Optional in the table but required in practice once anything is switched on, which
+   * `loadConfig` enforces as a cross-field rule: a sync has nowhere to put a PNG without
+   * it, and a read has nowhere to fetch one from.
+   */
+  readonly bucket?: string;
+  /** Do the read tools consult the mirror at all. False is a complete rollback. */
+  readonly readEnabled: boolean;
+  /** Graph requests one sync run may spend before stopping and reporting more to do. */
+  readonly syncRequestBudget: number;
+}
+
 export interface Config {
   readonly graph?: GraphConfig;
   readonly firestore?: FirestoreConfig;
   readonly oauth?: OAuthConfig;
   readonly server?: ServerConfig;
+  readonly mirror?: MirrorConfig;
 }
 
 /**
@@ -232,6 +314,7 @@ export function loadConfig(
     firestore?: FirestoreConfig;
     oauth?: OAuthConfig;
     server?: ServerConfig;
+    mirror?: MirrorConfig;
   } = {};
 
   if (wanted.has('graph')) {
@@ -263,6 +346,33 @@ export function loadConfig(
       // Spread rather than assigned as possibly-undefined: exactOptionalPropertyTypes
       // treats an explicit undefined as a different type from an absent property.
       ...(keepaliveSecret === undefined ? {} : { keepaliveSecret }),
+    };
+  }
+  if (wanted.has('mirror')) {
+    const syncSecret = values.get('MIRROR_SYNC_SECRET');
+    const bucket = values.get('MIRROR_BUCKET');
+    // Lowercased to match checkBoolean, which accepts either case. A case-sensitive
+    // comparison here would let "True" pass validation and then read as false, which is
+    // the silent inversion the strict validator exists to prevent.
+    const readEnabled = required(values, 'MIRROR_READ_ENABLED').toLowerCase() === 'true';
+
+    // The one cross-field rule in this file. SPECS says "required" per variable and
+    // cannot say "required when another is present", and a bucket is not needed to run
+    // the service with the mirror switched off — but a sync has nowhere to put a
+    // rendered ink PNG without one, and a mirror read has nowhere to fetch one from. So
+    // the pair is checked here, and the failure joins the same list as everything else
+    // rather than surfacing hours into a backfill at the first PUT.
+    if (bucket === undefined && (syncSecret !== undefined || readEnabled)) {
+      throw new ConfigError(['MIRROR_BUCKET'], [], purposes);
+    }
+
+    config.mirror = {
+      rootDocumentPath: required(values, 'MIRROR_ROOT_DOC'),
+      // Spread rather than assigned as possibly-undefined, per exactOptionalPropertyTypes.
+      ...(syncSecret === undefined ? {} : { syncSecret }),
+      ...(bucket === undefined ? {} : { bucket }),
+      readEnabled,
+      syncRequestBudget: Number(required(values, 'MIRROR_SYNC_REQUEST_BUDGET')),
     };
   }
 
@@ -396,6 +506,56 @@ function checkPort(value: string): string | null {
   const port = Number(value);
   if (port < 1 || port > 65535) {
     return `expected a port in 1-65535, got ${port}`;
+  }
+  return null;
+}
+
+/**
+ * Exactly `true` or `false`, case-insensitively, and nothing else.
+ *
+ * Deliberately not lenient. "1", "yes" and "on" all read as true to a human, and a
+ * lenient parser that accepted them would also have to decide what "0" and "off" mean —
+ * at which case a typo like "ture" would quietly become false and turn the mirror off
+ * with nothing to say so.
+ */
+function checkBoolean(value: string): string | null {
+  const lowered = value.toLowerCase();
+  if (lowered !== 'true' && lowered !== 'false') {
+    return `expected "true" or "false", got ${JSON.stringify(value)}`;
+  }
+  return null;
+}
+
+/**
+ * A Cloud Storage bucket name, per Google's documented rules for the simple case.
+ *
+ * Checked here so a typo fails at startup beside every other configuration problem,
+ * rather than at the first object write hours into a backfill. Only the flat-name rules
+ * are enforced — 3 to 63 characters of lowercase letters, digits, dashes, underscores
+ * and dots, starting and ending alphanumeric. Dotted domain-named buckets are longer
+ * and need domain verification; nothing here creates one.
+ */
+function checkBucketName(value: string): string | null {
+  if (value.startsWith('gs://')) {
+    return `expected a bare bucket name with no gs:// prefix, got ${JSON.stringify(value)}`;
+  }
+  if (value.length < 3 || value.length > 63) {
+    return `expected 3-63 characters, got ${value.length}`;
+  }
+  if (!/^[a-z0-9][a-z0-9._-]*[a-z0-9]$/.test(value)) {
+    return `expected lowercase letters, digits, dashes, underscores and dots, starting and ending alphanumeric, got ${JSON.stringify(value)}`;
+  }
+  return null;
+}
+
+/** Floor and ceiling on what one sync run may spend. See the spec entry for why. */
+function checkSyncRequestBudget(value: string): string | null {
+  if (!/^\d+$/.test(value)) {
+    return `expected an integer, got ${JSON.stringify(value)}`;
+  }
+  const budget = Number(value);
+  if (budget < MIN_SYNC_REQUEST_BUDGET || budget > MAX_SYNC_REQUEST_BUDGET) {
+    return `expected ${MIN_SYNC_REQUEST_BUDGET}-${MAX_SYNC_REQUEST_BUDGET}, got ${budget}`;
   }
   return null;
 }
