@@ -961,16 +961,33 @@ client with the read tools, so a resync passes through the same process-wide req
 as everything else — a burst of writes cannot outrun the per-user rate limit through this
 path.
 
-**Cloud Run freezes an overrunning request rather than killing it, and the lease release
-is written for that.** The service runs with CPU throttling — the default, and unset in
-the deploy — so a request cut at the 300-second timeout does not finish: the process is
-suspended and resumes whenever the next request arrives, possibly many minutes later. By
-then the sync lease has expired on age and another run has taken it. An unconditional
-`releaseLease` would then clear the *live* run's lease and let a third start alongside it,
-both spending the same hourly Graph budget — the exact failure the lease exists to
-prevent, reached by way of the lease itself. `releaseLease(heldSince)` therefore runs in a
-transaction and clears nothing unless `runningSince` still matches the value this run
-wrote. A superseded run logs `mirror-lease-superseded` and leaves the document alone.
+**An overrunning request either freezes or vanishes, and the lease release is written for
+the first.** The service runs with CPU throttling — the default, unset in the deploy — and
+`minScale` is unset, so a request cut at the 300-second timeout has two possible fates and
+Cloud Run guarantees neither. If the instance is still warm the process is *suspended* and
+resumes whenever the next request arrives, possibly many minutes later; if the instance has
+scaled to zero it is gone. The scheduled sync is what makes the first case likely rather
+than theoretical, because it wakes the instance on its own interval.
+
+In the warm case the sync lease has expired on age by the time the run resumes, and another
+run has taken it. An unconditional `releaseLease` would then clear the *live* run's lease
+and let a third start alongside it, both spending the same hourly Graph budget — the exact
+failure the lease exists to prevent, reached by way of the lease itself. So
+`releaseLease(heldSince)` runs in a transaction and clears nothing unless `runningSince`
+still matches the value that run wrote. A superseded run logs `mirror-lease-superseded` and
+leaves the document alone.
+
+**Nothing that matters is in memory, and that is a design position rather than an
+accident.** An instance can disappear between any two requests. What is held in memory is
+MSAL's access token (rebuilt from the Firestore cache, one token round trip), the memoised
+Firestore and Storage clients (rebuilt lazily, no connection at construction), the request
+gate's pacing state (a fresh instance may open its 4 concurrent immediately rather than
+spacing from the last request), and the pending OAuth codes (single-use, 60 seconds, cap
+100 — losing one costs a retry of the consent click, which is the one moment a human is
+already present). Everything with a real cost to lose is elsewhere on purpose: access and
+refresh tokens are signed rather than stored, the consent form rides in a signed hidden
+field, the Microsoft refresh token is in Firestore, and the whole mirror is in Firestore
+and GCS. Do not add a cache that a request depends on having.
 
 **`POST /sync` is the page mirror's way in, on the same terms as `/keepalive` and for the
 same reason.** Its own secret rather than the keepalive one, because the two reach

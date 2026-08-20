@@ -796,12 +796,19 @@ inside Cloud Run's 300-second request timeout, so the ordinary answer is a 200 w
 `"done": false`. A 504 means something took longer than expected — almost always a 429
 from OneNote with a long `Retry-After`.
 
-What happens then is worth knowing, because the service is deployed with CPU throttling:
-the request is cut and the container is **suspended**, not killed. It resumes when the
-next request arrives. So the run does not finish, its lease is not released, and every
-retry answers 409 until the lease expires 15 minutes later. The next scheduled run then
-proceeds normally, and nothing is lost — watermarks advance per section and only after
-that section's pages are stored, so a cut run keeps everything it committed.
+What happens then is worth knowing. The service is deployed with CPU throttling and no
+minimum instance count, so a cut request meets one of two fates and Cloud Run promises
+neither: if the instance is still warm the process is **suspended** and resumes when the
+next request arrives, and if it has scaled to zero the work is simply gone. Either way the
+run does not finish, its lease is not released, and retries answer 409 until the lease
+expires 15 minutes later. The next scheduled run then proceeds normally.
+
+Nothing is lost in either case. Watermarks advance per section and only after that
+section's pages are stored, so a cut run keeps everything it committed and the next run
+resumes from there. The same holds for an instance that simply disappears between runs:
+the mirror, the Microsoft refresh token, and every token this server issues are stored or
+signed rather than held in memory, so an instance can vanish at any moment without costing
+more than one token round trip.
 
 The one thing to check if you see repeated 504s is the request log for 429s. A sustained
 throttle is the only realistic way to reach the timeout, and the cure is a smaller
