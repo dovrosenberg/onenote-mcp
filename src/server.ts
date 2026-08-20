@@ -13,6 +13,7 @@ import {
   createGraphAuthFor,
   createMirrorWriteSyncFor,
   createMirrorReaderFor,
+  createReadSyncFor,
   createSyncTargetFor,
   createTools,
 } from './tools.ts';
@@ -127,6 +128,7 @@ export function createApp(config: Config): Application {
         auth,
         createMirrorReaderFor(config),
         createMirrorWriteSyncFor(config, auth, createGraphPageContent(auth)),
+        createReadSyncFor(config, auth),
       ),
     ),
   );

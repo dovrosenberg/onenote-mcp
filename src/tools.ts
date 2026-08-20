@@ -27,6 +27,12 @@ import {
   type SyncDeps,
 } from './mirror-sync.ts';
 import { createGraphPageContent } from './page-content.ts';
+import {
+  INLINE_SYNC_REQUEST_BUDGET,
+  INLINE_SYNC_TIME_BUDGET_MS,
+  createReadSync,
+  type ReadSync,
+} from './read-sync.ts';
 import { createPageTools } from './page-tools.ts';
 import { createGraphPageWrite } from './page-write.ts';
 import { createStructureTools } from './structure-tools.ts';
@@ -133,6 +139,7 @@ export function createTools(
   auth: GraphAuth,
   mirror?: MirrorReader,
   writeSync?: MirrorWriteSync,
+  readSync?: ReadSync,
 ): ToolDefinition[] {
   // One page-content client serves both the reading tool and `append_to_page`, which
   // reads a page's layout before it writes so its content does not land on handwriting.
@@ -144,15 +151,69 @@ export function createTools(
   const structure = createGraphStructure(auth);
 
   return [
-    // The mirror is passed to the read tools only. Writes always go to Graph, which
-    // stays the source of truth; the mirror is a copy that the sync refreshes.
-    ...createStructureTools(structure, {}, mirror),
-    ...createPageTools(content, undefined, mirror),
+    // The mirror and its inline sync are passed to the read tools only. Writes always go
+    // to Graph, which stays the source of truth; the mirror is a copy that the sync
+    // refreshes, and the read tools refresh it themselves before every read.
+    ...createStructureTools(structure, {}, mirror, readSync),
+    ...createPageTools(content, undefined, mirror, readSync),
     // The mirror reaches the write tools only as a write-sync: a successful write
     // re-reads its page from Graph and stores it, so the next read answers with what was
     // just written rather than falling through until the next scheduled run.
     ...createWriteTools(createGraphPageWrite(auth), content, structure, writeSync),
   ];
+}
+
+/**
+ * The sync's dependencies, or undefined when the mirror is not configured at all.
+ *
+ * Shared by the scheduled route and by the inline refresh the read tools run, so the two
+ * cannot end up talking to different Firestore roots or different buckets. Each caller
+ * gets its own object; the Firestore client underneath is memoised by project id in
+ * ./firestore.ts, and all three Graph clients pass through the same process-wide request
+ * gate, so an inline refresh cannot outrun the per-user rate limit.
+ */
+function syncDepsFor(config: Config, auth: GraphAuth): SyncDeps | undefined {
+  const mirror = config.mirror;
+  const firestore = config.firestore;
+  if (mirror === undefined || firestore === undefined || mirror.bucket === undefined) {
+    return undefined;
+  }
+
+  return {
+    graph: createGraphStructure(auth),
+    content: createGraphPageContent(auth),
+    store: createMirrorStore(firestoreFor(firestore), mirror.rootDocumentPath),
+    blobs: createMirrorBlobStore(mirror.bucket, firestore.projectId),
+  };
+}
+
+/**
+ * The refresh every read tool attempts before it reads the mirror.
+ *
+ * Built only when reads are enabled, because it exists to make the `source` a tool
+ * reports an honest claim and a tool with no mirror to read reports `onenote` anyway.
+ * With `MIRROR_READ_ENABLED=false` this is undefined, every read goes straight to Graph,
+ * and no tool call spends a Graph request on a sync — which is what keeps the flag a
+ * complete rollback.
+ *
+ * The budgets are the inline ones in ./read-sync.ts, not `MIRROR_SYNC_REQUEST_BUDGET`:
+ * that variable sizes a scheduled job with 300 seconds to spend, and this runs inside a
+ * tool call a person is waiting on.
+ */
+export function createReadSyncFor(config: Config, auth: GraphAuth): ReadSync | undefined {
+  if (config.mirror?.readEnabled !== true) return undefined;
+
+  const deps = syncDepsFor(config, auth);
+  if (deps === undefined) {
+    throw new Error('internal: MIRROR_READ_ENABLED is true without MIRROR_BUCKET');
+  }
+
+  return createReadSync(() =>
+    runIncremental(deps, {
+      requestBudget: INLINE_SYNC_REQUEST_BUDGET,
+      timeBudgetMs: INLINE_SYNC_TIME_BUDGET_MS,
+    }),
+  );
 }
 
 /**
@@ -172,16 +233,11 @@ export function createSyncTargetFor(config: Config, auth: GraphAuth): SyncTarget
   const firestore = config.firestore;
   if (mirror?.syncSecret === undefined || firestore === undefined) return undefined;
 
-  if (mirror.bucket === undefined) {
+  const deps = syncDepsFor(config, auth);
+  if (deps === undefined) {
     throw new Error("internal: MIRROR_SYNC_SECRET is set without MIRROR_BUCKET");
   }
 
-  const deps: SyncDeps = {
-    graph: createGraphStructure(auth),
-    content: createGraphPageContent(auth),
-    store: createMirrorStore(firestoreFor(firestore), mirror.rootDocumentPath),
-    blobs: createMirrorBlobStore(mirror.bucket, firestore.projectId),
-  };
   const options = { requestBudget: mirror.syncRequestBudget };
 
   return {

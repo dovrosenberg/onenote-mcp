@@ -36,6 +36,7 @@ import {
   type MirrorReadStore,
 } from '../src/mirror-reader.ts';
 import type { ScanResult } from '../src/mirror-store.ts';
+import type { ReadFreshness, ReadSync } from '../src/read-sync.ts';
 
 setEventSink(() => {});
 
@@ -473,11 +474,16 @@ test('findSectionsByName matches a substring and carries the parents', async () 
 
 // ---------------------------------------------------------------------------
 // readSourced
+//
+// Three steps in one function: refresh the mirror, read the mirror, report what the
+// answer is worth. Most of what matters is the third — a wrong label is a confident wrong
+// answer, where a wrong branch is only a slower right one.
 // ---------------------------------------------------------------------------
 
 interface Counts {
   mirror: number;
   graph: number;
+  refresh: number;
 }
 
 function counting(counts: Counts, hit: unknown | null): {
@@ -496,39 +502,137 @@ function counting(counts: Counts, hit: unknown | null): {
   };
 }
 
-test('a mirror hit never touches Graph', async () => {
-  const counts: Counts = { mirror: 0, graph: 0 };
+/** A refresh that answers whatever it is told to, and counts how often it was asked. */
+function fakeSync(counts: Counts, freshness: ReadFreshness): ReadSync {
+  return {
+    refresh: () => {
+      counts.refresh += 1;
+      return Promise.resolve(freshness);
+    },
+  };
+}
+
+test('a refreshed mirror answers as OneNote and never touches Graph', async () => {
+  const counts: Counts = { mirror: 0, graph: 0, refresh: 0 };
   const { fromMirror, fromGraph } = counting(counts, 'from mirror');
   const { reader: r } = reader();
 
-  const answer = await readSourced(r, 'a_tool', false, fromMirror, fromGraph);
+  const answer = await readSourced({
+    tool: 'a_tool',
+    mirror: r,
+    sync: fakeSync(counts, 'current'),
+    fromMirror,
+    fromGraph,
+  });
 
-  assert.equal(answer.source, 'mirror');
+  // The label is the claim the caller acts on, and `origin` is what selects the shape.
+  // They are separate fields because this case is both: mirror data, OneNote's content.
+  assert.equal(answer.source, 'onenote');
+  assert.equal(answer.origin, 'mirror');
   assert.equal(answer.data, 'from mirror');
   assert.equal(counts.graph, 0);
+  assert.equal(counts.refresh, 1);
 });
 
-test('useLiveData never touches the mirror', async () => {
-  // The point of the argument: a caller that needs an edit from thirty seconds ago must
-  // not pay a Firestore read to be told the mirror does not have it yet.
-  const counts: Counts = { mirror: 0, graph: 0 };
+test('a refresh that did not finish downgrades the answer to mirror', async () => {
+  // The budget ran out, the lease was held, the tree read failed — from here they are one
+  // outcome, and reporting `onenote` for any of them would claim the copy is current when
+  // nothing checked.
+  const counts: Counts = { mirror: 0, graph: 0, refresh: 0 };
   const { fromMirror, fromGraph } = counting(counts, 'from mirror');
   const { reader: r } = reader();
 
-  const answer = await readSourced(r, 'a_tool', true, fromMirror, fromGraph);
+  const answer = await readSourced({
+    tool: 'a_tool',
+    mirror: r,
+    sync: fakeSync(counts, 'behind'),
+    fromMirror,
+    fromGraph,
+  });
 
-  assert.equal(answer.source, 'graph');
-  assert.equal(counts.mirror, 0);
+  assert.equal(answer.source, 'mirror');
+  assert.equal(answer.origin, 'mirror');
+  assert.equal(counts.graph, 0, 'a stale label is still an answer, not a fallback');
 });
 
-test('a miss falls through to Graph', async () => {
-  const counts: Counts = { mirror: 0, graph: 0 };
+test('no sync bound is the same as a refresh that did not finish', async () => {
+  const counts: Counts = { mirror: 0, graph: 0, refresh: 0 };
+  const { fromMirror, fromGraph } = counting(counts, 'from mirror');
+  const { reader: r } = reader();
+
+  const answer = await readSourced({
+    tool: 'a_tool',
+    mirror: r,
+    sync: undefined,
+    fromMirror,
+    fromGraph,
+  });
+
+  assert.equal(answer.source, 'mirror');
+});
+
+test('staleTracked reports OneNote even when the refresh did not finish', async () => {
+  // get_page_content and nothing else. A page document carries its own contentState and
+  // every write marks its page stale before touching OneNote, so a hit is a page nothing
+  // has superseded — which is a fact about that page rather than about the account-wide
+  // refresh.
+  const counts: Counts = { mirror: 0, graph: 0, refresh: 0 };
+  const { fromMirror, fromGraph } = counting(counts, 'from mirror');
+  const { reader: r } = reader();
+
+  const answer = await readSourced({
+    tool: 'get_page_content',
+    mirror: r,
+    sync: fakeSync(counts, 'behind'),
+    staleTracked: true,
+    fromMirror,
+    fromGraph,
+  });
+
+  assert.equal(answer.source, 'onenote');
+  assert.equal(answer.origin, 'mirror');
+});
+
+test('the refresh runs before the mirror is read, not after', async () => {
+  // A refresh that landed afterwards would have answered the question the caller already
+  // asked with data it never saw.
+  const order: string[] = [];
+  const { reader: r } = reader();
+
+  await readSourced({
+    tool: 'a_tool',
+    mirror: r,
+    sync: {
+      refresh: () => {
+        order.push('refresh');
+        return Promise.resolve('current');
+      },
+    },
+    fromMirror: () => {
+      order.push('read');
+      return Promise.resolve('held');
+    },
+    fromGraph: () => Promise.resolve('live'),
+  });
+
+  assert.deepEqual(order, ['refresh', 'read']);
+});
+
+test('a miss falls through to Graph, which is OneNote by definition', async () => {
+  const counts: Counts = { mirror: 0, graph: 0, refresh: 0 };
   const { fromMirror, fromGraph } = counting(counts, null);
   const { reader: r } = reader();
 
-  const answer = await readSourced(r, 'a_tool', false, fromMirror, fromGraph);
+  const answer = await readSourced({
+    tool: 'a_tool',
+    mirror: r,
+    sync: fakeSync(counts, 'current'),
+    fromMirror,
+    fromGraph,
+  });
 
-  assert.equal(answer.source, 'graph');
+  assert.equal(answer.source, 'onenote');
+  assert.equal(answer.origin, 'graph');
   assert.equal(counts.mirror, 1);
   assert.equal(counts.graph, 1);
 });
@@ -537,58 +641,69 @@ test('a Firestore failure falls through to Graph rather than failing the call', 
   // The mirror is an optimisation and Graph is the ground truth. Refusing a tool call
   // because a cache is down would be strictly worse than the behaviour before the mirror
   // existed.
-  const counts: Counts = { mirror: 0, graph: 0 };
+  const counts: Counts = { mirror: 0, graph: 0, refresh: 0 };
   const { reader: r } = reader();
 
-  const answer = await readSourced(
-    r,
-    'a_tool',
-    false,
-    () => Promise.reject(new Error('firestore down')),
-    () => {
+  const answer = await readSourced({
+    tool: 'a_tool',
+    mirror: r,
+    sync: fakeSync(counts, 'current'),
+    fromMirror: () => Promise.reject(new Error('firestore down')),
+    fromGraph: () => {
       counts.graph += 1;
       return Promise.resolve('from graph');
     },
-  );
+  });
 
-  assert.equal(answer.source, 'graph');
+  assert.equal(answer.source, 'onenote');
+  assert.equal(answer.origin, 'graph');
   assert.equal(answer.data, 'from graph');
   assert.equal(counts.graph, 1);
 });
 
-test('no mirror at all means Graph, with no fallback logging', async () => {
+test('no mirror at all means Graph, and no refresh is attempted', async () => {
   // MIRROR_READ_ENABLED=false. Every tool module treats an absent mirror as "always
-  // Graph", which is what makes the flag a complete rollback.
-  const counts: Counts = { mirror: 0, graph: 0 };
+  // Graph", which is what makes the flag a complete rollback — including the promise that
+  // no tool call spends a Graph request on a sync it has no use for.
+  const counts: Counts = { mirror: 0, graph: 0, refresh: 0 };
   const { fromMirror, fromGraph } = counting(counts, 'from mirror');
 
-  const answer = await readSourced(undefined, 'a_tool', false, fromMirror, fromGraph);
+  const answer = await readSourced({
+    tool: 'a_tool',
+    mirror: undefined,
+    sync: fakeSync(counts, 'current'),
+    fromMirror,
+    fromGraph,
+  });
 
-  assert.equal(answer.source, 'graph');
+  assert.equal(answer.source, 'onenote');
+  assert.equal(answer.origin, 'graph');
   assert.equal(counts.mirror, 0);
+  assert.equal(counts.refresh, 0);
 });
 
 test('mirroredAt is reported on a hit and absent on a fallback', async () => {
   const { reader: r } = reader();
+  const counts: Counts = { mirror: 0, graph: 0, refresh: 0 };
 
-  const hit = await readSourced(
-    r,
-    'a_tool',
-    false,
-    () => Promise.resolve('held'),
-    () => Promise.resolve('live'),
-    () => Promise.resolve('2026-08-19T12:00:00.000Z'),
-  );
+  const hit = await readSourced({
+    tool: 'a_tool',
+    mirror: r,
+    sync: fakeSync(counts, 'current'),
+    fromMirror: () => Promise.resolve('held'),
+    fromGraph: () => Promise.resolve('live'),
+    mirroredAt: () => Promise.resolve('2026-08-19T12:00:00.000Z'),
+  });
   assert.equal(hit.mirroredAt, '2026-08-19T12:00:00.000Z');
 
-  const missed = await readSourced(
-    r,
-    'a_tool',
-    false,
-    () => Promise.resolve(null),
-    () => Promise.resolve('live'),
-    () => Promise.resolve('2026-08-19T12:00:00.000Z'),
-  );
+  const missed = await readSourced({
+    tool: 'a_tool',
+    mirror: r,
+    sync: fakeSync(counts, 'current'),
+    fromMirror: () => Promise.resolve(null),
+    fromGraph: () => Promise.resolve('live'),
+    mirroredAt: () => Promise.resolve('2026-08-19T12:00:00.000Z'),
+  });
   assert.equal(missed.mirroredAt, undefined, 'a Graph answer has no sync time');
 });
 
@@ -596,17 +711,19 @@ test('a failure reading mirroredAt does not lose the answer', async () => {
   // It is a nicety. Losing the whole hit because a timestamp could not be read would
   // trade a real saving for a cosmetic field.
   const { reader: r } = reader();
+  const counts: Counts = { mirror: 0, graph: 0, refresh: 0 };
 
-  const answer = await readSourced(
-    r,
-    'a_tool',
-    false,
-    () => Promise.resolve('held'),
-    () => Promise.resolve('live'),
-    () => Promise.reject(new Error('firestore down')),
-  );
+  const answer = await readSourced({
+    tool: 'a_tool',
+    mirror: r,
+    sync: fakeSync(counts, 'current'),
+    fromMirror: () => Promise.resolve('held'),
+    fromGraph: () => Promise.resolve('live'),
+    mirroredAt: () => Promise.reject(new Error('firestore down')),
+  });
 
-  assert.equal(answer.source, 'mirror');
+  assert.equal(answer.source, 'onenote');
+  assert.equal(answer.origin, 'mirror');
   assert.equal(answer.data, 'held');
   assert.equal(answer.mirroredAt, undefined);
 });

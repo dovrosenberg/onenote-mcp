@@ -195,6 +195,15 @@ from paying 61 Graph requests over an unrelated write; and a hold older than
 `LISTING_HOLD_EXPIRY_MS` answers from the mirror again, because a hold a dead process left
 behind must not wedge a section permanently.
 
+`test/read-sync.test.ts` covers the inline refresh the read tools run, and it drives the
+policy rather than a sync: the run function is a fake and the clock is injected, the way
+`SyncDeps.now` is in `test/mirror-sync.test.ts`. Two things are asserted and nothing else
+touches either. Which sync reports license `source: "onenote"` — four conditions, and a
+test that negates each one separately, because a single `outcome === 'complete'` check
+passes three of the four ways a run returns with work left behind. And how often a refresh
+may run: every assertion about a refresh that did **not** run is an assertion about
+OneNote's 400 requests an hour, which is the budget this feature spends.
+
 `test/mirror-reader.test.ts` and `test/mirror-tools.test.ts` cover the read path, and
 they are separate from `test/structure-tools.test.ts` and `test/page-tools.test.ts` on
 purpose: those two build their tools with no mirror argument, and every assertion in them
@@ -333,7 +342,10 @@ new variable to the `SPECS` table, not to a new `process.env` read somewhere els
 Every `MIRROR_*` variable defaults or may be absent, so a service deployed with none of
 them set behaves exactly as one built before the group existed. `MIRROR_READ_ENABLED` is
 set back to `false` and redeployed to turn the whole page mirror off — no code change, no
-data migration, and the tool modules are identical under both settings. The server asks
+data migration, and the tool modules are identical under both settings. That includes the
+refresh: `createReadSyncFor` answers undefined when reads are off, so no tool call spends
+a Graph request on a sync whose result it has no use for, and every answer reports
+`source: "onenote"` because Graph is the only thing it read. The server asks
 for the group unconditionally even while nothing reads it, so a malformed `MIRROR_*` value
 fails at startup beside every other configuration problem rather than at first use.
 
@@ -878,6 +890,64 @@ keepalive: the whole point of `GraphAuth.refresh()` is the side effect, a replac
 refresh token with a fresh inactivity window written back to Firestore. Do not add it to
 the tool path — every forced refresh is a token-endpoint round trip and a Firestore write.
 
+**Every covered read is refresh, read, report — in that order.** `readSourced` in
+`src/mirror-reader.ts` is the one place it is written. The refresh is the inline
+incremental sync in `src/read-sync.ts`; it runs *before* the mirror is read, because a
+refresh landing afterwards would have answered the question the caller already asked with
+data it never saw. A miss still falls through to Graph, unchanged, which is what keeps a
+notebook outside the mirrored selection readable.
+
+**`source` is a claim about the answer, `origin` is a fact about its shape, and they are
+separate fields for that reason.** `origin` is `mirror` or `graph` and decides which
+branch of `Sourced<M, G>` a handler reads — `list_pages` from the mirror carries `total`
+and from Graph carries an array, and a cast is exactly how a field that means nothing on
+one path ends up in the other path's result. `source` is `onenote` or `mirror` and is the
+only one of the two that reaches the caller: `onenote` when the answer equals what OneNote
+holds, `mirror` when it may be behind, with `mirroredAt` saying how far. A mirror-origin
+read carries either label, which is why one field cannot do both jobs.
+
+**`source` is `onenote` in three cases and `mirror` in one.** Graph answered; or the
+mirror answered and the refresh finished; or the mirror answered a single page nothing has
+marked stale. Otherwise `mirror`. "Finished" is `freshnessOf` in `src/read-sync.ts`: the
+outcome is `complete`, `done` is true, `treeRead` is true, and `pagesFailed` is zero. The
+last two are the ones a simplification would drop and they are not decoration — a failed
+expanded-tree read is deliberately non-fatal to a sync, so a run that carried on against
+the structure already in Firestore returns `complete` while missing every notebook created
+since the last good tree read; and a failed page fetch leaves that page's stored copy
+exactly where it was.
+
+**`staleTracked` is set on `get_page_content` and must not be set on anything else.** It
+is what lets a page hit report `onenote` without a finished refresh, and the licence comes
+from the page document rather than from the sync: every write calls `markPageStale` before
+it touches OneNote, and `MirrorReader.getPageContent` answers a miss for anything but
+`present`. The other six tools answer from *listings*, and a page created in a section this
+process never wrote to leaves every stored document in that section untouched and still
+correct-looking — so a listing has no per-document staleness to lean on and its label has
+to come from the refresh.
+
+**The refresh is rate-limited, and the interval is the cost control.** Without it a
+conversation of thirty tool calls runs thirty syncs. A finished refresh holds for
+`INLINE_SYNC_MIN_INTERVAL_MS` (30 seconds) and one that did not finish holds for
+`INLINE_SYNC_RETRY_INTERVAL_MS` (5 minutes) — longer, not shorter, because a budget that
+ran out, a lease that was held and a Graph that refused are none of them better in thirty
+seconds, and retrying at the fast cadence would spend the hourly budget learning the same
+thing repeatedly. Two callers arriving together share one run; the second would be refused
+by the sync lease anyway, and sharing gives it the first one's answer rather than a
+`behind` it did not earn.
+
+**A refresh never fails a read, and never throws.** Graph refusing it, Firestore being
+unreachable and the scheduler holding the sync lease all end as `behind` with a
+`read-sync-skipped` log line. The tool still has its Graph fallback and the mirror still
+holds whatever it held; the only consequence is the weaker label.
+
+**There is no `useLiveData` argument, and adding one back would be a regression.** It
+existed to force a read past a mirror that might be behind. A read that refreshes first
+and then reports whether the refresh finished answers the same question without a schema
+field the calling model has to reason about, and `mirror` in the result is a stronger
+signal than an argument the model has to know to pass. The escape hatch for a notebook
+outside the mirrored selection is `sectionId` on `search_pages`, which misses in the
+mirror and walks that section in OneNote.
+
 **The read branch lives in the tool modules, not behind an adapter.** An adapter
 implementing `StructureClient` would return `PageSummary[]` with nowhere to say who
 answered; reporting the source would need either state on an object `createTools` shares
@@ -885,12 +955,13 @@ across every request — wrong the moment two calls overlap — or a widening of
 interface's return type, which would change every existing fake in three test files. And
 "which source answered" is part of the tool's contract with the model, exactly like
 `moreAvailable`, `stoppedEarly` and `deepSearchUsed`. `readSourced` in
-`src/mirror-reader.ts` is the one place the branch is written; every covered tool calls it
-and spreads `source` and `mirroredAt` into its JSON.
+`src/mirror-reader.ts` is the one place the branch is written; every covered tool calls it,
+narrows on `origin` where the two shapes differ, and spreads `source` and `mirroredAt` into
+its JSON.
 
 **Every mirror read answers `null` on a miss, and every miss means "ask Graph".** A page
-the mirror does not hold, a write-marked-stale page, a Firestore outage, and a caller that
-passed `useLiveData` all end in the same place. Refusing a tool call because a cache is
+the mirror does not hold, a write-marked-stale page, and a Firestore outage all end in the
+same place. Refusing a tool call because a cache is
 down would be strictly worse than the behaviour before the mirror existed, which is the
 bar. Four misses look like hits if you write them carelessly: a page whose stored ink
 object is gone (answering `ink: null` claims the page has no handwriting), a section group
@@ -910,7 +981,8 @@ held. Unscoped `search_pages` still reports `notebooksSearched` against
 
 **A `NameLookupError` from the mirror is a miss, not an answer.** The mirror's structure
 equals Graph's expanded tree by construction but is only as fresh as the last sync, so a
-section created ten minutes ago is absent and `resolveSection` would turn that into
+section created ten minutes ago is absent — the inline refresh narrows that window but a
+run that did not finish leaves it open — and `resolveSection` would turn that into
 "sectionName matched nothing" listing the wrong siblings — which reads to a model as "no
 such section". Both `_by_name` reading tools retry the whole resolve-and-list against
 Graph before reporting. The retry costs one request and only on a failure, and a name that
@@ -1331,6 +1403,18 @@ seconds, so one unscoped search costs up to 61 requests — a seventh of the hou
 for a sample of roughly a tenth of the account, and the result says so through
 `stoppedEarly` and the counts. Removing that cost is most of the point of the Firestore
 mirror in issue #30.
+
+**The inline refresh is a third term in the hourly arithmetic, and it is bounded by an
+interval rather than by a budget.** With `MIRROR_READ_ENABLED=true` every covered read
+runs `runIncremental` at `INLINE_SYNC_REQUEST_BUDGET` (12) and
+`INLINE_SYNC_TIME_BUDGET_MS` (15s) — small on purpose, because this runs inside a tool call
+a person is waiting on and a refresh needing more than a dozen requests is a backfill
+rather than a catch-up. What actually bounds the spend is how often it may run at all: at
+most once per 30 seconds when refreshes are finishing, which on a quiet account is one
+request each and about 120/hour from a continuously busy conversation, and once per 5
+minutes when they are not, which is at most 144/hour. Both numbers sit beside the
+scheduler's own runs under the same 400, so raising either constant means redoing the
+schedule arithmetic in `README.md`.
 
 **Prefer a cached structure over re-reading it.** Notebooks, section groups and sections
 change rarely; pages change often. Anything that needs the tree more than once in an
