@@ -315,8 +315,10 @@ export function buildStructure(
  * An unchanged hash skips every structure write. The account has 55 notebooks and 568
  * sections; rewriting all of them every fifteen minutes would be millions of writes a
  * month for a tree that changes when someone adds a notebook. The timestamps are
- * deliberately **excluded** — they move constantly and are read from the live tree, not
- * from the stored copy, so including them would defeat the whole point.
+ * deliberately **excluded**, because they move constantly and would rewrite every
+ * document on every run. `reconcileStructure` therefore returns them separately, and
+ * `withLiveMtimes` overlays them onto the stored sections before `pickCandidates` reads
+ * them — without that overlay the stored copies freeze here and the sync goes blind.
  */
 export function structureHashOf(built: BuiltStructure): string {
   const hash = createHash('sha256');
@@ -496,7 +498,7 @@ async function incrementalPass(ctx: PassContext): Promise<void> {
     return;
   }
 
-  const structureChanged = await reconcileStructure(ctx);
+  const structure = await reconcileStructure(ctx);
   const reactivated = await reconcileActivity(ctx);
 
   const sections = await ctx.deps.store.listSectionsToSync();
@@ -507,7 +509,11 @@ async function incrementalPass(ctx: PassContext): Promise<void> {
   // snapshot taken before that write, so tier 1 would still compare against the old
   // cutoff on this very run — the run the reset exists to widen.
   const state = reactivated ? { ...ctx.state, sectionsScannedThrough: null } : ctx.state;
-  const candidates = pickCandidates(eligible, state, ctx.tally.treeRead && !structureChanged);
+  const candidates = pickCandidates(
+    withLiveMtimes(eligible, structure.liveMtimes),
+    state,
+    ctx.tally.treeRead && !structure.rewritten,
+  );
 
   for (const section of candidates) {
     if (ctx.budget.exhausted) {
@@ -528,19 +534,36 @@ async function incrementalPass(ctx: PassContext): Promise<void> {
   }
 }
 
+/** Section `lastModifiedDateTime` as one tree read saw it, by section id. */
+export type SectionMtimes = ReadonlyMap<string, string | null>;
+
+/** What one structure pass learned. Empty timestamps mean the tree read failed. */
+interface StructureResult {
+  /** True when the structure documents were written. */
+  readonly rewritten: boolean;
+  readonly liveMtimes: SectionMtimes;
+  /** Ids of the notebooks the selection covers. */
+  readonly mirroredNotebookIds: readonly string[];
+}
+
 /**
  * Read the tree and write the structure, or carry on without it.
  *
- * Returns true when the structure was rewritten. A failed tree read is logged and
- * survived: `$expand` on `/notebooks` was measured unavailable for minutes at a time on
- * 2026-08-19 while un-expanded calls answered 200, and refusing to sync pages because
- * the structure read failed would skip a whole poll cycle over the slowest-changing
- * thing in the account.
+ * A failed tree read is logged and survived: `$expand` on `/notebooks` was measured
+ * unavailable for minutes at a time on 2026-08-19 while un-expanded calls answered 200,
+ * and refusing to sync pages because the structure read failed would skip a whole poll
+ * cycle over the slowest-changing thing in the account.
  */
-async function reconcileStructure(ctx: PassContext): Promise<boolean> {
+async function reconcileStructure(ctx: PassContext): Promise<StructureResult> {
+  const none: StructureResult = {
+    rewritten: false,
+    liveMtimes: new Map(),
+    mirroredNotebookIds: [],
+  };
+
   if (ctx.budget.exhausted) {
     ctx.tally.done = false;
-    return false;
+    return none;
   }
 
   ctx.budget.take();
@@ -551,12 +574,21 @@ async function reconcileStructure(ctx: PassContext): Promise<boolean> {
     if (!(err instanceof GraphRequestError)) throw err;
     logEvent('sync-tree-failed', { status: err.status, reason: reasonOf(err) });
     await ctx.deps.store.patchSyncState({ lastTreeFailureAt: ctx.startedAtIso });
-    return false;
+    return none;
   }
 
   ctx.tally.treeRead = true;
 
   const built = buildStructure(tree, ctx.selection);
+
+  // Taken whether or not the hash moved. This is the whole fix: `structureHashOf`
+  // excludes timestamps on purpose, so when the hash matches nothing writes them and the
+  // stored copies stay at whatever the last structure rewrite recorded.
+  const liveMtimes: SectionMtimes = new Map(
+    built.sections.map((section) => [section.id, section.graphLastModifiedDateTime]),
+  );
+  const mirroredNotebookIds = built.notebooks.filter((n) => n.mirrored).map((n) => n.id);
+
   ctx.tally.unknownNotebookIds = built.unknownNotebookIds.length;
   if (built.unknownNotebookIds.length > 0) {
     // Ids only in the count, never the ids themselves — a notebook id is opaque, but the
@@ -570,11 +602,13 @@ async function reconcileStructure(ctx: PassContext): Promise<boolean> {
   }
 
   const hash = structureHashOf(built);
-  if (hash === ctx.state.structureHash) return false;
+  if (hash === ctx.state.structureHash) {
+    return { rewritten: false, liveMtimes, mirroredNotebookIds };
+  }
 
   await ctx.deps.store.putStructure(built);
   await ctx.deps.store.patchSyncState({ structureHash: hash });
-  return true;
+  return { rewritten: true, liveMtimes, mirroredNotebookIds };
 }
 
 /**
@@ -675,6 +709,24 @@ export function activeSelectionHashOf(selection: NotebookSelection): string {
   const hash = createHash('sha256');
   for (const id of [...selection.activeNotebookIds].sort()) hash.update(`${id}\n`);
   return hash.digest('hex');
+}
+
+/**
+ * Stored sections carrying this run's observed timestamps.
+ *
+ * A section absent from `live` keeps its stored value rather than losing it. That case is
+ * only reachable when the tree read failed, and `timestampsAreFresh` is false then, so
+ * `pickCandidates` returns everything regardless.
+ */
+export function withLiveMtimes(
+  sections: readonly MirrorSection[],
+  live: SectionMtimes,
+): MirrorSection[] {
+  return sections.map((section) =>
+    live.has(section.id)
+      ? { ...section, graphLastModifiedDateTime: live.get(section.id) ?? null }
+      : section,
+  );
 }
 
 export function pickCandidates(
@@ -1003,7 +1055,7 @@ async function sweepPass(
 ): Promise<void> {
   if (ctx.selection.notebookIds.length === 0) return;
 
-  await reconcileStructure(ctx);
+  const structure = await reconcileStructure(ctx);
   await learnNestedGroups(ctx);
 
   const stored = await ctx.deps.store.listSectionsToSync();
@@ -1019,7 +1071,9 @@ async function sweepPass(
     ctx.tally.sectionsSkippedInactive = split.skippedInactive;
   }
 
-  const sections = unscoped ? all : pickCandidates(all, ctx.state, ctx.tally.treeRead);
+  const sections = unscoped
+    ? all
+    : pickCandidates(withLiveMtimes(all, structure.liveMtimes), ctx.state, ctx.tally.treeRead);
 
   const resumeAt = ctx.state.sweepCursorSectionId;
   const start = resumeAt === null ? 0 : Math.max(0, sections.findIndex((s) => s.id === resumeAt));

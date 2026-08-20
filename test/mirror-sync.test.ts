@@ -33,6 +33,7 @@ import type {
   ContainerChildren,
   ExpandedNotebook,
   PageSummary,
+  Section,
 } from '../src/graph-structure.ts';
 import { setEventSink } from '../src/logging.ts';
 import {
@@ -226,14 +227,27 @@ function fakeStore(initial: Partial<StoreState> = {}): {
       calls.releases.push(heldSince);
       return Promise.resolve();
     },
-    putStructure: () => {
+    // Firestore's `putStructure` replaces the collections wholesale — `#replaceCollection`
+    // calls `batch.set` with no merge — so a fake that only counted calls could not see a
+    // stored section's timestamp go stale, which is the failure this file's regression
+    // test is about.
+    putStructure: (structure) => {
       calls.structures += 1;
+      data.sections = [...structure.sections];
+      data.groups = [...structure.sectionGroups];
       return Promise.resolve();
     },
     listSectionsToSync: () => Promise.resolve(data.sections.filter((s) => s.mirrored)),
     listAllSectionGroups: () => Promise.resolve(data.groups),
+    // Merged onto the stored section, the way the real store's `set(…, { merge: true })`
+    // does. A fake that only counted the call left every section looking never-synced, so
+    // tier 1 of `pickCandidates` never applied and no test could reach the timestamp
+    // filter across two runs.
     setSectionWatermark: (sectionId, watermark) => {
       calls.watermarks.push({ sectionId, watermark });
+      data.sections = data.sections.map((s) =>
+        s.id === sectionId ? { ...s, pagesSyncedThrough: watermark } : s,
+      );
       return Promise.resolve();
     },
     setSectionSweepResult: (sectionId) => {
@@ -301,14 +315,62 @@ interface Harness {
   data: StoreState;
 }
 
+/**
+ * The expanded tree that would produce `data`'s sections and groups.
+ *
+ * A test that scripts no tree used to get `[]`, which was harmless while the store fake
+ * ignored `putStructure`. With a faithful fake an empty tree deletes every section, so
+ * the default has to describe what the store was seeded with.
+ */
+function treeFrom(data: StoreState): ExpandedNotebook[] {
+  // A conditional spread rather than `?? undefined`: `exactOptionalPropertyTypes` is on,
+  // so writing `lastModifiedDateTime: undefined` on an optional property is a type error.
+  const asGraphSection = (s: MirrorSection): Section => ({
+    id: s.id,
+    displayName: s.displayName,
+    ...(s.graphLastModifiedDateTime === null
+      ? {}
+      : { lastModifiedDateTime: s.graphLastModifiedDateTime }),
+  });
+
+  return [
+    {
+      id: NB,
+      displayName: '2026',
+      sections: data.sections.filter((s) => s.parentKind === 'notebook').map(asGraphSection),
+      sectionGroups: data.groups.map((g) => ({
+        id: g.id,
+        displayName: g.displayName,
+        sections: data.sections
+          .filter((s) => s.parentKind === 'sectionGroup' && s.parentId === g.id)
+          .map(asGraphSection),
+      })),
+    },
+  ];
+}
+
 function harness(
   script: GraphScript = {},
   storeInit: Partial<StoreState> = {},
   content?: SyncDeps['content'],
 ): Harness {
-  const { graph, calls: graphCalls } = fakeGraph(script);
   const { store, calls: storeCalls, data } = fakeStore(storeInit);
+  const tree = script.tree ?? treeFrom(data);
+  const { graph, calls: graphCalls } = fakeGraph({ ...script, tree });
   const { blobs, calls: blobCalls } = fakeBlobs();
+
+  // A harness starts in the steady state: the stored structure already matches the
+  // account, so `reconcileStructure` reads the tree and writes nothing. Without this the
+  // stored hash is null, every first run rewrites the structure, and `putStructure` —
+  // which replaces the collections wholesale and emits `pagesSyncedThrough: null` —
+  // discards whatever sections and watermarks the test seeded. A test that wants a
+  // structure rewrite says so by seeding a `structureHash` that does not match.
+  if (data.state.structureHash === null && typeof tree !== 'function') {
+    data.state = {
+      ...data.state,
+      structureHash: structureHashOf(buildStructure(tree, data.selection)),
+    };
+  }
 
   return {
     graphCalls,
@@ -479,6 +541,77 @@ test('the overlap window is applied, so a section on the boundary is not skipped
   assert.deepEqual(pickCandidates(sections, state, true).map((s) => s.id), ['just-before']);
 });
 
+test('an edit is still noticed after the structure has stopped changing', async () => {
+  // The failure this guards: `graphLastModifiedDateTime` is written only by
+  // `putStructure`, which runs only when the tree hash moves — and the hash excludes
+  // timestamps. A stored copy therefore freezes while `sectionsScannedThrough` advances
+  // on every completed run, and the section stops being a candidate for ever.
+  //
+  // Three runs, because two are not enough: the first writes the structure, the second is
+  // what advances the cutoff past the frozen timestamp, and only the third can be wrongly
+  // skipped.
+  let sectionMtime = '2026-08-19T09:00:00Z';
+  let pageMtime = '2026-08-19T09:00:00Z';
+  let html = '<p>before</p>';
+
+  const tree = (): ExpandedNotebook[] => [
+    {
+      id: NB,
+      displayName: '2026',
+      lastModifiedDateTime: sectionMtime,
+      sections: [{ id: 'sec-1', displayName: 'Daily', lastModifiedDateTime: sectionMtime }],
+      sectionGroups: [],
+    },
+  ];
+
+  // A stored hash that matches nothing, so the first run writes the structure and the
+  // section's timestamp reaches the store the only way it ever does.
+  const h = harness(
+    { tree: tree() },
+    {
+      sections: [],
+      state: { ...initialSyncState(), structureHash: 'written-under-an-older-tree' },
+    },
+    { fetchRaw: () => Promise.resolve(rawHtml(html)) },
+  );
+
+  // The scripted tree is a fixed value; re-point both calls at the live ones.
+  h.deps.graph.getExpandedTree = () => Promise.resolve(tree());
+  h.deps.graph.listPagesChangedSince = (sectionId, since) => {
+    h.graphCalls.changedSince.push(sectionId);
+    return Promise.resolve(
+      pageMtime >= since ? [{ id: 'p1', title: 'Page', lastModifiedDateTime: pageMtime }] : [],
+    );
+  };
+
+  let clock = Date.parse('2026-08-19T10:00:00Z');
+  const deps = { ...h.deps, now: () => clock };
+
+  await runIncremental(deps, { requestBudget: 100 });
+  assert.equal(h.storeCalls.structures, 1, 'the structure is written once, and then never');
+
+  // A quiet run two hours later. Nothing changed, and the cutoff advances past the
+  // section's stored timestamp.
+  clock += 2 * 3600_000;
+  await runIncremental(deps, { requestBudget: 100 });
+  assert.equal(h.storeCalls.structures, 1);
+
+  // Two hours after that, someone edits the page in the OneNote client.
+  clock += 2 * 3600_000;
+  sectionMtime = '2026-08-19T14:00:00Z';
+  pageMtime = '2026-08-19T14:00:00Z';
+  html = '<p>after the client edit</p>';
+
+  const listedBefore = h.graphCalls.changedSince.length;
+  const report = await runIncremental(deps, { requestBudget: 100 });
+
+  assert.ok(
+    h.graphCalls.changedSince.length > listedBefore,
+    'the section whose timestamp moved must be listed again',
+  );
+  assert.equal(report.pagesUpdated, 1, 'the edit must reach the mirror');
+});
+
 // ---------------------------------------------------------------------------
 // Incremental
 // ---------------------------------------------------------------------------
@@ -496,13 +629,15 @@ test('an empty selection costs no Graph request at all', async () => {
 });
 
 test('a quiet run reads the tree, writes no structure, and visits nothing', async () => {
-  const built = buildStructure(TREE, sel([NB]));
+  // No scripted tree, so the harness answers one derived from the store: the account
+  // agrees with the mirror, and the section really has not moved. That has to be the tree
+  // rather than only the stored copy, because the timestamp the filter reads is the live
+  // one.
   const h = harness(
-    { tree: TREE },
+    {},
     {
       state: {
         ...initialSyncState(),
-        structureHash: structureHashOf(built),
         sectionsScannedThrough: '2026-08-19T11:55:00.000Z',
       },
       sections: [section({ graphLastModifiedDateTime: '2026-08-01T00:00:00Z' })],
@@ -878,13 +1013,12 @@ test('a state document that predates the field records the hash and widens nothi
   // Null is "written before this existed", not "the set changed". Treating it as a change
   // would make the first run after every deploy a full-width scan.
   const h = harness(
-    { tree: TREE },
+    {},
     {
       selection: sel([NB]),
       sections: [section({ graphLastModifiedDateTime: '2020-01-01T00:00:00Z' })],
       state: {
         ...initialSyncState(),
-        structureHash: structureHashOf(buildStructure(TREE, sel([NB]))),
         sectionsScannedThrough: '2026-08-19T11:55:00.000Z',
       },
     },
