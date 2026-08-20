@@ -734,11 +734,25 @@ export async function writePageFromRaw(
   const html = pageHtml(raw) ?? '';
   const hash = createHash('sha256').update(html).digest('hex');
 
+  // The short-circuit that makes the watermark overlap nearly free: a page re-read
+  // because it fell inside the window, and unchanged, costs one request and no write.
+  //
+  // It compares the title and the section as well as the content hash, and both are
+  // load-bearing rather than defensive. `update_page_title` changes a page's title and
+  // nothing else, so a content-hash-only comparison short-circuited every rename and the
+  // mirror kept serving the old title — which `find_page_by_name` and `search_pages` then
+  // matched against. A page moved between sections is the same shape of miss.
+  //
+  // `lastModifiedDateTime` is deliberately NOT compared. It moves on every write, so
+  // including it would rewrite every page the overlap re-read and defeat the whole point.
   const stored = await deps.store.getPage(summary.id);
-  if (stored !== null && stored.contentHash === hash && stored.contentState === 'present') {
-    // The page's timestamp moved but its content did not — an ink stroke edited and
-    // undone, a title change, or the watermark overlap re-reading a page already held.
-    // Writing nothing here is what makes the overlap nearly free.
+  if (
+    stored !== null &&
+    stored.contentState === 'present' &&
+    stored.contentHash === hash &&
+    stored.title === summary.title &&
+    stored.sectionId === placement.sectionId
+  ) {
     return false;
   }
 

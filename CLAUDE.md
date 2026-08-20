@@ -922,6 +922,24 @@ cannot change it, and `lastModifiedDateTime` is stamped locally. Reading either 
 Graph here would trade a correct value for an unreliable one. Do not "improve" this by
 fetching page metadata.
 
+**`writePageFromRaw`'s short-circuit compares the title and the section, not just the
+content hash, and both are load-bearing.** `update_page_title` changes a title and nothing
+else, so a content-hash-only comparison short-circuited every rename: the mirror kept
+serving the old title, which `find_page_by_name` and `search_pages` then matched against.
+A page moved between sections is the same shape of miss — page ids are stable across a
+move, so only the placement changed. `lastModifiedDateTime` is deliberately **not**
+compared: it moves on every write, so including it would rewrite every page the watermark
+overlap re-read and defeat the short-circuit entirely.
+
+**An append or create that resyncs to `unchanged` is treated as a lost race, and the page
+is marked stale.** Those two always change a page's content, so a resync that found
+nothing to write did not read what was just written. Measured 2026-08-19, a PATCH is
+visible to the next content read at 3.7 seconds — but that is one observation, and if the
+read ever loses the race the stored copy is pre-write content marked `present`, which the
+read path serves as current with nothing saying so. A stale marker sends the next read to
+Graph, which cannot be wrong. A rename does not fall through this branch, because it
+changes no content by design.
+
 **There is one page writer, `writePageFromRaw`, shared by the sync and the resync.** A
 second copy that skipped the ink render, or spilled to GCS at a different threshold, would
 make a page's stored form depend on which path last touched it — and the difference would

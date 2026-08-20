@@ -57,6 +57,7 @@ import {
   planInkClearance,
   type ClearancePlan,
 } from './page-layout.ts';
+import type { ResyncOutcome } from './mirror-sync.ts';
 import type { CreatedPage } from './page-write.ts';
 
 /** These tools write. `openWorldHint` because the world is someone's notebook. */
@@ -131,7 +132,10 @@ const NAME_PATH_PROPERTIES = {
  * An absent object means no mirror is configured and there is nothing to tell.
  */
 export interface MirrorWriteSync {
-  resyncPage(pageId: string, hint: { title?: string; sectionId?: string }): Promise<void>;
+  resyncPage(
+    pageId: string,
+    hint: { title?: string; sectionId?: string },
+  ): Promise<ResyncOutcome>;
   markPageStale(pageId: string): Promise<void>;
 }
 
@@ -284,7 +288,12 @@ export function createWriteTools(
         // sectionId is passed because the page is not in the mirror yet, so there is no
         // stored placement to read it from. The title comes from the create response,
         // which carries the right one — a metadata read here would not.
-        await resync(mirror, page.id, { title: page.title === '' ? title : page.title, sectionId });
+        await resync(
+          mirror,
+          page.id,
+          { title: page.title === '' ? title : page.title, sectionId },
+          true,
+        );
 
         return jsonResult({
           pageId: page.id,
@@ -345,10 +354,12 @@ export function createWriteTools(
 
         const resolved = await resolveSection(lookup, path);
         const page = await write.createPage(resolved.section.id, title, htmlFragment);
-        await resync(mirror, page.id, {
-          title: page.title === '' ? title : page.title,
-          sectionId: resolved.section.id,
-        });
+        await resync(
+          mirror,
+          page.id,
+          { title: page.title === '' ? title : page.title, sectionId: resolved.section.id },
+          true,
+        );
 
         return jsonResult({
           ...resolvedPayload(resolved),
@@ -404,7 +415,7 @@ export function createWriteTools(
         await write.updatePageTitle(pageId, newTitle);
         // The title comes from here rather than from a read-back: measured 2026-08-19,
         // page metadata read immediately after a write can come back empty.
-        await resync(mirror, pageId, { title: newTitle });
+        await resync(mirror, pageId, { title: newTitle }, false);
 
         return jsonResult({
           pageId,
@@ -437,7 +448,7 @@ async function append(
 
   await write.appendToPage(pageId, content);
   // No title hint: an append cannot change one.
-  await resync(mirror, pageId, {});
+  await resync(mirror, pageId, {}, true);
 
   return {
     pageId,
@@ -605,12 +616,28 @@ async function resync(
   mirror: MirrorWriteSync | undefined,
   pageId: string,
   hint: { title?: string; sectionId?: string },
+  expectContentChange: boolean,
 ): Promise<void> {
   if (mirror === undefined) return;
 
   try {
-    await mirror.resyncPage(pageId, hint);
-    return;
+    const outcome = await mirror.resyncPage(pageId, hint);
+
+    // An append or a create always changes the page's content, so a resync that found
+    // nothing to write did not read what was just written. Measured 2026-08-19, a PATCH
+    // is visible to the next content read at 3.7 seconds — but that is one observation,
+    // and if the read ever does lose the race the stored copy is pre-write content
+    // marked `present`, which the read path would serve as current with nothing saying
+    // so. Marking it stale is the safe direction: the next read misses and goes to
+    // Graph, which cannot be wrong.
+    //
+    // A rename is the opposite case and must not fall through here: it changes no
+    // content by design, so `unchanged` would be the normal answer — except that the
+    // title comparison in `writePageFromRaw` makes it `updated`, which is why this is
+    // reached only when something really did not take.
+    if (outcome !== 'unchanged' || !expectContentChange) return;
+
+    logEvent('mirror-resync-stale-read', { pageId });
   } catch (err) {
     logEvent('mirror-resync-failed', { pageId, reason: reasonOf(err) });
   }

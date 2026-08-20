@@ -116,9 +116,7 @@ export function createMirrorWriteSyncFor(
   const deps = { store, blobs, content };
 
   return {
-    resyncPage: async (pageId, hint) => {
-      await resyncPage(deps, pageId, hint);
-    },
+    resyncPage: (pageId, hint) => resyncPage(deps, pageId, hint),
     markPageStale: (pageId) => store.markPageStale(pageId),
   };
 }

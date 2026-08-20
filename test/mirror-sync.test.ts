@@ -1004,3 +1004,58 @@ test('the resync and the sync build the same document from the same response', a
   assert.equal(a.sectionPath, b.sectionPath);
   assert.equal(a.notebookId, b.notebookId);
 });
+
+test('a rename reaches the mirror even though it changes no content', async () => {
+  // This was a bug. writePageFromRaw short-circuited on the content hash alone, so
+  // update_page_title -- which changes a title and nothing else -- wrote nothing and the
+  // mirror kept serving the old title. find_page_by_name and search_pages both match on
+  // that title, so the wrong one was live until the next scheduled sync corrected it.
+  const first = resyncDeps();
+  await resyncPage(first.deps, 'p-1', { sectionId: 'sec-1', title: 'Old Title' });
+  const stored = first.data.pages.get('p-1');
+  assert.ok(stored);
+  assert.equal(stored.title, 'Old Title');
+
+  const renamed = resyncDeps({ pages: new Map([['p-1', stored]]) });
+  const outcome = await resyncPage(renamed.deps, 'p-1', { sectionId: 'sec-1', title: 'New Title' });
+
+  assert.equal(outcome, 'updated');
+  assert.equal(renamed.storeCalls.puts[0]?.page.title, 'New Title');
+  assert.equal(renamed.storeCalls.puts[0]?.page.titleLower, 'new title');
+});
+
+test('a page moved to another section is rewritten even with identical content', async () => {
+  // Same shape of miss as the rename: page ids are stable across a move, so the content
+  // hash matches and only the placement changed.
+  const first = resyncDeps();
+  await resyncPage(first.deps, 'p-1', { sectionId: 'sec-1', title: 'Monday' });
+  const stored = first.data.pages.get('p-1');
+  assert.ok(stored);
+
+  const moved = resyncDeps({
+    pages: new Map([['p-1', stored]]),
+    sections: [section({ id: 'sec-2', displayName: 'Elsewhere', path: '2026 / Elsewhere' })],
+  });
+  const outcome = await resyncPage(moved.deps, 'p-1', { sectionId: 'sec-2', title: 'Monday' });
+
+  assert.equal(outcome, 'updated');
+  assert.equal(moved.storeCalls.puts[0]?.page.sectionId, 'sec-2');
+  assert.equal(moved.storeCalls.puts[0]?.page.sectionPath, '2026 / Elsewhere');
+});
+
+test('the timestamp alone never forces a rewrite', async () => {
+  // lastModifiedDateTime moves on every write, so comparing it would rewrite every page
+  // the watermark overlap re-read and defeat the point of the short-circuit.
+  const first = harness({ tree: TREE, changed: { 'sec-1': [summary('p-1', '2026-08-19T11:00:00Z')] } });
+  await runIncremental(first.deps, BUDGET);
+  const stored = first.data.pages.get('p-1');
+  assert.ok(stored);
+
+  const later = harness(
+    { tree: TREE, changed: { 'sec-1': [summary('p-1', '2026-08-19T11:59:00Z')] } },
+    { pages: new Map([['p-1', stored]]) },
+  );
+  await runIncremental(later.deps, BUDGET);
+
+  assert.deepEqual(later.storeCalls.puts, []);
+});

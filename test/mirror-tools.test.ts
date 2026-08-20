@@ -38,6 +38,7 @@ import type { ScanResult } from '../src/mirror-store.ts';
 import type { ToolDefinition } from '../src/mcp-tools.ts';
 import { createPageTools, type PageContentClient } from '../src/page-tools.ts';
 import { createStructureTools, type StructureClient } from '../src/structure-tools.ts';
+import type { ResyncOutcome } from '../src/mirror-sync.ts';
 import {
   createWriteTools,
   type MirrorWriteSync,
@@ -507,14 +508,14 @@ interface SyncCalls {
 
 function fakeWriteSync(
   calls: SyncCalls,
-  options: { resyncFails?: boolean; staleFails?: boolean } = {},
+  options: { resyncFails?: boolean; staleFails?: boolean; outcome?: ResyncOutcome } = {},
 ): MirrorWriteSync {
   return {
     resyncPage: (pageId, hint) => {
       calls.resynced.push({ pageId, hint });
       return options.resyncFails === true
         ? Promise.reject(new Error('graph down'))
-        : Promise.resolve();
+        : Promise.resolve(options.outcome ?? 'updated');
     },
     markPageStale: (pageId) => {
       calls.staled.push(pageId);
@@ -637,4 +638,68 @@ test('with no mirror configured the write tools behave exactly as before', async
   });
 
   assert.equal(payload(result)['appended'], true);
+});
+
+test('an append that resynced to "unchanged" is marked stale, not left as current', async () => {
+  // An append always changes content, so a resync finding nothing to write means the
+  // read did not see the write. Leaving the page `present` would serve pre-write content
+  // as current, with nothing saying so. Marking it stale sends the next read to Graph,
+  // which cannot be wrong.
+  const calls: SyncCalls = { resynced: [], staled: [] };
+  const writeTools = createWriteTools(
+    fakeWriteClient(),
+    fakeLayoutReader(),
+    fakeWriteLookup(),
+    fakeWriteSync(calls, { outcome: 'unchanged' }),
+  );
+
+  await byName(writeTools, 'append_to_page').handle({
+    pageId: 'p-held',
+    htmlFragment: '<p>added</p>',
+  });
+  await byName(writeTools, 'create_page').handle({
+    sectionId: 'sec-daily',
+    title: 'Fresh',
+    htmlFragment: '<p>new</p>',
+  });
+
+  assert.deepEqual(calls.staled, ['p-held', 'p-new']);
+});
+
+test('a rename that resynced to "unchanged" is left alone', async () => {
+  // A rename changes no content by design, so `unchanged` is not evidence of a lost
+  // write here — and the title comparison in writePageFromRaw is what makes a real
+  // rename come back `updated` anyway.
+  const calls: SyncCalls = { resynced: [], staled: [] };
+  const writeTools = createWriteTools(
+    fakeWriteClient(),
+    fakeLayoutReader(),
+    fakeWriteLookup(),
+    fakeWriteSync(calls, { outcome: 'unchanged' }),
+  );
+
+  await byName(writeTools, 'update_page_title').handle({
+    pageId: 'p-held',
+    newTitle: 'Renamed',
+  });
+
+  assert.deepEqual(calls.staled, []);
+});
+
+test('a page outside the mirrored set needs no stale marker', async () => {
+  // `not-mirrored` means there is no copy to be wrong.
+  const calls: SyncCalls = { resynced: [], staled: [] };
+  const writeTools = createWriteTools(
+    fakeWriteClient(),
+    fakeLayoutReader(),
+    fakeWriteLookup(),
+    fakeWriteSync(calls, { outcome: 'not-mirrored' }),
+  );
+
+  await byName(writeTools, 'append_to_page').handle({
+    pageId: 'p-elsewhere',
+    htmlFragment: '<p>added</p>',
+  });
+
+  assert.deepEqual(calls.staled, []);
 });
