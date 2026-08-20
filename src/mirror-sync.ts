@@ -18,7 +18,9 @@
 // 1. A page create, edit **and delete** each move the parent section's
 //    `lastModifiedDateTime`, and nothing else does (2026-08-19, api-overview.md). That is
 //    what makes tier 1 work, and it is what lets the nightly sweep visit only the
-//    sections that moved.
+//    sections that moved. The value compared is the one *this run's* tree read observed,
+//    overlaid onto the stored sections before the filter: the stored copy only moves on a
+//    structure rewrite, so filtering on it goes blind an hour after the last one.
 // 2. `$expand` on `/notebooks` has multi-minute outages — twice observed on 2026-08-19 —
 //    while un-expanded calls on the same collection answer 200 throughout. So a failed
 //    tree read is not fatal: the run keeps the structure already in Firestore and carries
@@ -510,7 +512,8 @@ async function incrementalPass(ctx: PassContext): Promise<void> {
   // cutoff on this very run — the run the reset exists to widen.
   const state = reactivated ? { ...ctx.state, sectionsScannedThrough: null } : ctx.state;
   const candidates = pickCandidates(
-    withLiveMtimes(eligible, structure.liveMtimes),
+    eligible,
+    structure.liveMtimes,
     state,
     ctx.tally.treeRead && !structure.rewritten,
   );
@@ -537,12 +540,21 @@ async function incrementalPass(ctx: PassContext): Promise<void> {
 /** Section `lastModifiedDateTime` as one tree read saw it, by section id. */
 export type SectionMtimes = ReadonlyMap<string, string | null>;
 
-/** What one structure pass learned. Empty timestamps mean the tree read failed. */
+/**
+ * What one structure pass learned.
+ *
+ * Empty timestamps mean no tree read happened — the budget was exhausted, or the read
+ * failed.
+ */
 interface StructureResult {
   /** True when the structure documents were written. */
   readonly rewritten: boolean;
   readonly liveMtimes: SectionMtimes;
-  /** Ids of the notebooks the selection covers. */
+  /**
+   * The selected notebooks the tree returned, which is not `selection.notebookIds`: an id
+   * in the selection that no notebook in the tree carries is an `unknownNotebookIds` entry
+   * and is absent here.
+   */
   readonly mirroredNotebookIds: readonly string[];
 }
 
@@ -715,29 +727,57 @@ export function activeSelectionHashOf(selection: NotebookSelection): string {
  * Stored sections carrying this run's observed timestamps.
  *
  * A section absent from `live` keeps its stored value rather than losing it. That case is
- * only reachable when the tree read failed, and `timestampsAreFresh` is false then, so
- * `pickCandidates` returns everything regardless.
+ * only reachable when no tree read happened — the budget was exhausted, or the read
+ * failed — and `mayFilterByTimestamp` is false then, so `pickCandidates` returns
+ * everything regardless.
+ *
+ * A live entry of `null` is Graph reporting no timestamp on the section, and it overwrites
+ * the stored value like any other observation. Falling back to the stored one there would
+ * be the frozen-timestamp bug reached through a narrower door.
  */
 export function withLiveMtimes(
   sections: readonly MirrorSection[],
   live: SectionMtimes,
 ): MirrorSection[] {
-  return sections.map((section) =>
-    live.has(section.id)
-      ? { ...section, graphLastModifiedDateTime: live.get(section.id) ?? null }
-      : section,
-  );
+  return sections.map((section) => {
+    const observed = live.get(section.id);
+    return observed === undefined ? section : { ...section, graphLastModifiedDateTime: observed };
+  });
 }
 
+/**
+ * The sections worth listing this run.
+ *
+ * The timestamps compared are `live` — what this run's tree read saw — overlaid onto the
+ * stored sections here rather than by the caller, because a call site that forgot the
+ * overlay would filter on stored values that only move when the structure is rewritten,
+ * and the sync would go blind an hour after the last rewrite with nothing to say so.
+ *
+ * `mayFilterByTimestamp` is not "the timestamps are fresh": they are fresh whenever a tree
+ * read succeeded, rewrite or not. It means the filter may be applied at all, which needs a
+ * tree read **and** an unchanged tree shape. A rewrite disables it because the tree
+ * changed — a section that was created, renamed or moved has a stored watermark that no
+ * longer describes what the mirror holds for it, and one wide pass settles all of them.
+ * The incremental pass therefore passes `treeRead && !rewritten`; the sweep passes
+ * `treeRead` alone, because `putStructure` has already replaced its section list and a
+ * sweep reconciles page ids rather than resuming a watermark.
+ *
+ * Two sections are always candidates whatever the clock says: one never synced
+ * (`pagesSyncedThrough === null`), and one Graph reports no timestamp for — "the field is
+ * absent" and "the roll-up cannot be trusted" have to be the same branch, or a service
+ * that quietly stopped returning it would silently stop the mirror updating.
+ */
 export function pickCandidates(
   sections: readonly MirrorSection[],
+  live: SectionMtimes,
   state: MirrorSyncState,
-  timestampsAreFresh: boolean,
+  mayFilterByTimestamp: boolean,
 ): MirrorSection[] {
-  if (!state.sectionRollUpTrusted || !timestampsAreFresh) return [...sections];
+  const observed = withLiveMtimes(sections, live);
+  if (!state.sectionRollUpTrusted || !mayFilterByTimestamp) return observed;
 
   const since = overlapFrom(state.sectionsScannedThrough);
-  return sections.filter(
+  return observed.filter(
     (section) =>
       section.pagesSyncedThrough === null ||
       section.graphLastModifiedDateTime === null ||
@@ -1073,7 +1113,7 @@ async function sweepPass(
 
   const sections = unscoped
     ? all
-    : pickCandidates(withLiveMtimes(all, structure.liveMtimes), ctx.state, ctx.tally.treeRead);
+    : pickCandidates(all, structure.liveMtimes, ctx.state, ctx.tally.treeRead);
 
   const resumeAt = ctx.state.sweepCursorSectionId;
   const start = resumeAt === null ? 0 : Math.max(0, sections.findIndex((s) => s.id === resumeAt));

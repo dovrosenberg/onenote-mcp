@@ -40,6 +40,7 @@ import {
   initialSyncState,
   type MirrorPage,
   type MirrorPageContent,
+  type MirrorNotebook,
   type MirrorSection,
   type MirrorSectionGroup,
   type MirrorSyncState,
@@ -60,6 +61,7 @@ import {
   structureHashOf,
   withLiveMtimes,
   type ResyncDeps,
+  type SectionMtimes,
   type SyncDeps,
   type SyncStore,
 } from '../src/mirror-sync.ts';
@@ -104,7 +106,12 @@ function summary(id: string, modified = '2026-08-19T11:30:00Z'): PageSummary {
 // ---------------------------------------------------------------------------
 
 interface GraphScript {
-  tree?: ExpandedNotebook[] | (() => never);
+  /**
+   * A fixed tree, or a thunk. A thunk that returns is how a test varies the tree between
+   * runs without reassigning `deps.graph.getExpandedTree`, which would drop the call
+   * counter; a thunk that throws simulates a Graph failure.
+   */
+  tree?: ExpandedNotebook[] | (() => ExpandedNotebook[]);
   changed?: Record<string, PageSummary[] | (() => never)>;
   ids?: Record<string, string[] | (() => never)>;
   children?: ContainerChildren;
@@ -121,9 +128,10 @@ interface GraphCalls {
 function fakeGraph(script: GraphScript): { graph: SyncDeps['graph']; calls: GraphCalls } {
   const calls: GraphCalls = { tree: 0, changedSince: [], unfiltered: [], pageIds: [], children: [] };
 
-  // A scripted value, or a thunk that throws to simulate a Graph failure.
-  const resolve = <T>(value: T | (() => never) | undefined, fallback: T): T => {
-    if (typeof value === 'function') (value as () => never)();
+  // A scripted value, or a thunk called for it. A thunk that throws simulates a Graph
+  // failure; one that returns lets a test change the answer between runs.
+  const resolve = <T>(value: T | (() => T) | undefined, fallback: T): T => {
+    if (typeof value === 'function') return (value as () => T)();
     return (value as T | undefined) ?? fallback;
   };
 
@@ -167,6 +175,7 @@ function sel(notebookIds: string[], activeNotebookIds: string[] | null = null): 
 interface StoreState {
   selection: NotebookSelection;
   state: MirrorSyncState;
+  notebooks: MirrorNotebook[];
   sections: MirrorSection[];
   groups: MirrorSectionGroup[];
   pages: Map<string, MirrorPage>;
@@ -193,6 +202,7 @@ function fakeStore(initial: Partial<StoreState> = {}): {
   const data: StoreState = {
     selection: sel([NB]),
     state: initialSyncState(),
+    notebooks: [],
     sections: [section()],
     groups: [],
     pages: new Map(),
@@ -234,6 +244,7 @@ function fakeStore(initial: Partial<StoreState> = {}): {
     // test is about.
     putStructure: (structure) => {
       calls.structures += 1;
+      data.notebooks = [...structure.notebooks];
       data.sections = [...structure.sections];
       data.groups = [...structure.sectionGroups];
       return Promise.resolve();
@@ -322,6 +333,14 @@ interface Harness {
  * A test that scripts no tree used to get `[]`, which was harmless while the store fake
  * ignored `putStructure`. With a faithful fake an empty tree deletes every section, so
  * the default has to describe what the store was seeded with.
+ *
+ * It describes `NB` alone, with every stored group placed directly under it and every
+ * `parentKind: 'notebook'` section too, whatever the section's own `notebookId` says. A
+ * test seeding a second notebook, a group inside a group, or a section under a group whose
+ * own parent is a group has to script the tree instead. Two tests do seed
+ * `sel([NB, NB2], [NB])` against this default and so report `unknownNotebookIds: 1` where
+ * they used to report 0 — the selection names a notebook the tree does not return, which
+ * is what that counter is for.
  */
 function treeFrom(data: StoreState): ExpandedNotebook[] {
   // A conditional spread rather than `?? undefined`: `exactOptionalPropertyTypes` is on,
@@ -450,11 +469,21 @@ test('a selected notebook id matching nothing is reported rather than ignored', 
   // nobody can eyeball. This count is the only thing that says so.
   const built = buildStructure(TREE, sel([NB, 'nb-typo']));
   assert.deepEqual(built.unknownNotebookIds, ['nb-typo']);
+
+  // And it is absent from the mirrored set, which is why `reconcileStructure` reports that
+  // set rather than `selection.notebookIds`: the two differ by exactly the ids above, and
+  // a caller expanding "every mirrored notebook" from the selection would name one that
+  // does not exist.
+  assert.deepEqual(
+    built.notebooks.filter((n) => n.mirrored).map((n) => n.id),
+    [NB],
+  );
 });
 
 test('the structure hash ignores timestamps and notices everything else', () => {
-  // Timestamps move constantly and are read from the live tree rather than the stored
-  // copy. Including them would make the hash differ on every run and defeat the skip.
+  // Timestamps move constantly, so including them would make the hash differ on every run
+  // and defeat the skip. `reconcileStructure` returns them separately and `pickCandidates`
+  // overlays them, which is what stops the exclusion freezing the stored copies.
   const base = structureHashOf(buildStructure(TREE, sel([NB])));
 
   const restamped = structureHashOf(
@@ -478,6 +507,10 @@ test('the structure hash ignores timestamps and notices everything else', () => 
 // pickCandidates
 // ---------------------------------------------------------------------------
 
+// No observation for any section, so each keeps its stored timestamp and these tests
+// assert the filter alone. The overlay itself is asserted directly below them.
+const NO_LIVE: SectionMtimes = new Map();
+
 test('with the roll-up trusted, only sections whose timestamp moved are candidates', () => {
   const state: MirrorSyncState = {
     ...initialSyncState(),
@@ -489,7 +522,7 @@ test('with the roll-up trusted, only sections whose timestamp moved are candidat
   ];
 
   assert.deepEqual(
-    pickCandidates(sections, state, true).map((s) => s.id),
+    pickCandidates(sections, NO_LIVE, state, true).map((s) => s.id),
     ['moved'],
   );
 });
@@ -503,7 +536,7 @@ test('a never-synced section is always a candidate, however old its timestamp', 
     section({ id: 'fresh', graphLastModifiedDateTime: '2020-01-01T00:00:00Z', pagesSyncedThrough: null }),
   ];
 
-  assert.deepEqual(pickCandidates(sections, state, true).map((s) => s.id), ['fresh']);
+  assert.deepEqual(pickCandidates(sections, NO_LIVE, state, true).map((s) => s.id), ['fresh']);
 });
 
 test('an absent timestamp behaves exactly like a distrusted one', () => {
@@ -516,7 +549,7 @@ test('an absent timestamp behaves exactly like a distrusted one', () => {
   };
   const sections = [section({ id: 'no-stamp', graphLastModifiedDateTime: null })];
 
-  assert.deepEqual(pickCandidates(sections, state, true).map((s) => s.id), ['no-stamp']);
+  assert.deepEqual(pickCandidates(sections, NO_LIVE, state, true).map((s) => s.id), ['no-stamp']);
 });
 
 test('with the roll-up distrusted, or the tree stale, every section is a candidate', () => {
@@ -526,8 +559,11 @@ test('with the roll-up distrusted, or the tree stale, every section is a candida
   ];
   const scanned = { ...initialSyncState(), sectionsScannedThrough: '2026-08-19T11:00:00.000Z' };
 
-  assert.equal(pickCandidates(sections, { ...scanned, sectionRollUpTrusted: false }, true).length, 2);
-  assert.equal(pickCandidates(sections, scanned, false).length, 2, 'stale tree, so visit all');
+  assert.equal(
+    pickCandidates(sections, NO_LIVE, { ...scanned, sectionRollUpTrusted: false }, true).length,
+    2,
+  );
+  assert.equal(pickCandidates(sections, NO_LIVE, scanned, false).length, 2, 'no filter, visit all');
 });
 
 test('the overlap window is applied, so a section on the boundary is not skipped', () => {
@@ -539,7 +575,10 @@ test('the overlap window is applied, so a section on the boundary is not skipped
   };
   const sections = [section({ id: 'just-before', graphLastModifiedDateTime: '2026-08-19T11:10:00Z' })];
 
-  assert.deepEqual(pickCandidates(sections, state, true).map((s) => s.id), ['just-before']);
+  assert.deepEqual(
+    pickCandidates(sections, NO_LIVE, state, true).map((s) => s.id),
+    ['just-before'],
+  );
 });
 
 test('withLiveMtimes takes the observed timestamp, and keeps the stored one when there is none', () => {
@@ -596,10 +635,12 @@ test('an edit is still noticed after the structure has stopped changing', async 
     },
   ];
 
-  // A stored hash that matches nothing, so the first run writes the structure and the
-  // section's timestamp reaches the store the only way it ever does.
   const h = harness(
-    { tree: tree() },
+    // A thunk rather than a fixed value, so each run sees the tree as it is by then and
+    // `graphCalls.tree` still counts. The stored hash matches nothing, so the first run
+    // writes the structure and the section's timestamp reaches the store the only way it
+    // ever does.
+    { tree, ids: {} },
     {
       sections: [],
       state: { ...initialSyncState(), structureHash: 'written-under-an-older-tree' },
@@ -607,8 +648,6 @@ test('an edit is still noticed after the structure has stopped changing', async 
     { fetchRaw: () => Promise.resolve(rawHtml(html)) },
   );
 
-  // The scripted tree is a fixed value; re-point both calls at the live ones.
-  h.deps.graph.getExpandedTree = () => Promise.resolve(tree());
   h.deps.graph.listPagesChangedSince = (sectionId, since) => {
     h.graphCalls.changedSince.push(sectionId);
     return Promise.resolve(
@@ -877,6 +916,10 @@ test('the datetime filter failing falls back to the unfiltered list, once', asyn
   const { store, calls: storeCalls, data } = fakeStore();
   const { blobs } = fakeBlobs();
   data.sections = [section({ id: 'sec-1' }), section({ id: 'sec-2', path: '2026 / Other' })];
+  // These deps are built by hand, so nothing seeds the stored hash the way `harness` does.
+  // Without it the run rewrites the structure and `putStructure` replaces both sections
+  // with TREE's, and the assertion below would hold on TREE's ids rather than on these.
+  data.state = { ...data.state, structureHash: structureHashOf(buildStructure(TREE, sel([NB]))) };
 
   await runIncremental(
     { graph: failing, store, blobs, now: () => NOW, content: { fetchRaw: () => Promise.resolve(rawHtml('<p>x</p>')) } },
@@ -1195,16 +1238,53 @@ test('a budget-exhausted sweep records where to resume', async () => {
 });
 
 test('a scoped sweep visits only moved sections; a full sweep visits all of them', async () => {
+  // No scripted tree, so the harness derives one naming `still` at the same 2020 timestamp
+  // the store holds. That is what makes the scoped assertion mean something: the value the
+  // filter reads is the overlaid live one, and a section the tree does not name is a
+  // section `putStructure` would have deleted, which cannot happen in production.
   const stale = section({ id: 'still', graphLastModifiedDateTime: '2020-01-01T00:00:00Z' });
   const state = { ...initialSyncState(), sectionsScannedThrough: '2026-08-19T11:00:00.000Z' };
 
-  const scoped = harness({ tree: TREE, ids: { still: [] } }, { sections: [stale], state });
+  const scoped = harness({ ids: { still: [] } }, { sections: [stale], state });
   await runSweep(scoped.deps, BUDGET);
   assert.deepEqual(scoped.graphCalls.pageIds, [], 'nothing moved, so nothing is swept');
 
-  const full = harness({ tree: TREE, ids: { still: [] } }, { sections: [stale], state });
+  const full = harness({ ids: { still: [] } }, { sections: [stale], state });
   await runFullSweep(full.deps, BUDGET);
   assert.deepEqual(full.graphCalls.pageIds, ['still'], 'the weekly backstop visits everything');
+});
+
+test('a scoped sweep visits a section whose timestamp moved only in the live tree', async () => {
+  // The other half of the pair, and the one the overlay is for: the stored copy still says
+  // 2020 because no structure rewrite has happened since, and only the tree read knows the
+  // section moved. Without the overlay this section is skipped and a deletion made in the
+  // OneNote client is never noticed.
+  const stale = section({ id: 'still', graphLastModifiedDateTime: '2020-01-01T00:00:00Z' });
+  const state = { ...initialSyncState(), sectionsScannedThrough: '2026-08-19T11:00:00.000Z' };
+
+  const moved: ExpandedNotebook[] = [
+    {
+      id: NB,
+      displayName: '2026',
+      sections: [{ id: 'still', displayName: 'Daily', lastModifiedDateTime: '2026-08-19T11:30:00Z' }],
+      sectionGroups: [],
+    },
+  ];
+
+  // The stored hash matches the *shape*, which the timestamps are excluded from, so the
+  // run reads the tree and writes nothing — exactly the steady state the bug lived in.
+  const h = harness(
+    { tree: moved, ids: { still: [] } },
+    {
+      sections: [stale],
+      state: { ...state, structureHash: structureHashOf(buildStructure(moved, sel([NB]))) },
+    },
+  );
+
+  await runSweep(h.deps, BUDGET);
+
+  assert.equal(h.storeCalls.structures, 0, 'no rewrite, so nothing refreshed the stored copy');
+  assert.deepEqual(h.graphCalls.pageIds, ['still'], 'and the section is swept anyway');
 });
 
 test('the sweep learns the nested section groups $expand could not reach', async () => {
