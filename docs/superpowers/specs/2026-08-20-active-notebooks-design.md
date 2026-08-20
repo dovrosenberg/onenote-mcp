@@ -50,10 +50,15 @@ reports as its `source`, and one new route.
 ```ts
 export interface NotebookSelection {
   readonly notebookIds: readonly string[];
-  /** null means "every selected notebook is active". */
-  readonly activeNotebookIds: readonly string[] | null;
+  /** Absent or null means "every selected notebook is active". */
+  readonly activeNotebookIds?: readonly string[] | null;
 }
 ```
+
+The field is optional as well as nullable. `readSelection` always sets it, to an array or to
+`null`; optionality is for the callers that construct a selection literally — the sync tests
+and any future one — so that a literal written before this feature existed still compiles and
+still means "everything active". `isActive` treats absent and null identically.
 
 Reading rules, which follow the tolerance `readSelection` already has:
 
@@ -101,22 +106,35 @@ freshness they have today.
 
 All in `src/mirror-sync.ts`.
 
-| Place | Rule |
+| Pass | Rule |
 |---|---|
-| `pickCandidates` | A section in an inactive notebook is a candidate only when `pagesSyncedThrough === null`. |
-| `sweepPass` for `sweep` and `sweep-full` | Sections in inactive notebooks are filtered out before the cursor is applied. |
-| `sweepPass` for the new `sweep-all` | No activity filter. |
+| incremental | A section in an inactive notebook is eligible only when `pagesSyncedThrough === null`. |
+| `sweep`, `sweep-full` | Sections in inactive notebooks are dropped, backfilled or not. |
+| the new `sweep-all` | No activity filter. |
 
 The `pagesSyncedThrough === null` clause is the backfill. An inactive notebook fills up
 exactly once — one `listPagesChangedSince` per section from the epoch, plus one content
 fetch per page — and from then on no incremental run lists it again. This is what the
-requirement "the initial backfill should fill them up" means mechanically.
+requirement "the initial backfill should fill them up" means mechanically. A sweep never
+backfills, so it has no equivalent clause.
 
-`pickCandidates` is pure and exported so the rule is asserted directly rather than through a
-fake store. It gains a `selection: NotebookSelection` parameter. Its existing early return
-for `!state.sectionRollUpTrusted || !timestampsAreFresh` must apply the activity filter too:
-distrusting the section roll-up is a reason to visit every *active* section, not a reason to
-visit inactive ones.
+The filter is a new pure exported function rather than a parameter on `pickCandidates`:
+
+```ts
+export function splitByActivity(
+  sections: readonly MirrorSection[],
+  selection: NotebookSelection,
+  includeBackfill: boolean,
+): { eligible: MirrorSection[]; skippedInactive: number };
+```
+
+Each pass calls it on the output of `listSectionsToSync()` and hands `eligible` to
+`pickCandidates`, whose signature and behaviour are unchanged. Two reasons for that shape:
+the count of what was declined has to reach the report and a filter folded into
+`pickCandidates` would have to return it alongside the list; and `pickCandidates` has an
+early return for `!state.sectionRollUpTrusted || !timestampsAreFresh` that a folded-in filter
+would have to be applied on both sides of, which is the kind of duplication that ends with
+one side wrong.
 
 `learnNestedGroups` keeps its `group.mirrored && !group.childGroupsKnown` filter with no
 activity term. It is one request per group, once ever, and what it learns is structure.
@@ -218,8 +236,13 @@ failure there surfaces as a tool error, not as a `mirror` result.
 
 ```ts
 /** How much of this answer comes from notebooks the operator marked inactive. */
-inactiveCoverage?(reader: MirrorReader): Promise<'none' | 'some' | 'all'>;
+inactiveCoverage?(reader: MirrorReader, data: M): Promise<InactiveCoverage>;
 ```
+
+`data` is the mirror's answer, already in hand. The two `_by_name` reading tools need it:
+they resolve a section id inside `fromMirror`, and that id is the only thing that says which
+notebook the answer came from. The other tools ignore the parameter and use the id their
+handler already has.
 
 `readSourced` evaluates it only on a mirror hit, after `fromMirror` has answered. On
 `origin: 'graph'` the source is `onenote` unconditionally and the member is never called.
@@ -252,21 +275,26 @@ supports, and must not fail the read.
 `MirrorReadStore` gains `getSelection(): Promise<NotebookSelection>`. `MirrorStore` already
 has the method, so only the interface and the test fakes change.
 
-`MirrorReader` gains:
+`MirrorReader` gains three methods that answer in the coverage vocabulary directly, rather
+than a boolean the callers would each have to convert:
 
 ```ts
-notebookIsActive(notebookId: string): Promise<boolean>;
-inactiveCoverageOfAccount(): Promise<'none' | 'some' | 'all'>;
+coverageOfSection(sectionId: string): Promise<InactiveCoverage>;
+coverageOfPage(pageId: string): Promise<InactiveCoverage>;
+accountActivity(): Promise<{ coverage: InactiveCoverage; inactiveNotebooks: number }>;
 ```
 
-Both read the selection through one memoised accessor. The memo holds for
-`INLINE_SYNC_MIN_INTERVAL_MS` (30 s), matching the inline refresh's own interval; the worst
-consequence of the memo is a source label 30 seconds behind an operator's edit, and the memo
-is what stops every covered tool call adding a Firestore document read.
+All three read one memoised snapshot: the selection document and the notebook collection,
+held for `INLINE_SYNC_MIN_INTERVAL_MS` (30 s) to match the inline refresh's own interval. The
+worst consequence of the memo is a source label 30 seconds behind an operator's edit; without
+it every covered tool call would add a Firestore document read.
 
-`inactiveCoverageOfAccount` compares the mirrored notebooks against the active set:
-`'none'` when every mirrored notebook is active, `'all'` when none is, `'some'` otherwise.
-It reads `listNotebooks()`, which the unscoped search path has already read.
+`accountActivity` compares the mirrored notebooks against the active set: `'none'` when every
+mirrored notebook is active, `'all'` when none is, `'some'` otherwise, with the inactive count
+beside it for the search result. `coverageOfSection` and `coverageOfPage` each read one more
+document to get a `notebookId`, and answer `'none'` when that notebook is active, `'all'` when
+it is not, and `'some'` when the document is missing — a container the mirror cannot identify
+must not produce a claim stronger than the data supports.
 
 ### Per tool
 

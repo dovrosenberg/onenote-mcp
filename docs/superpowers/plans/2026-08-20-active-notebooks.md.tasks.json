@@ -1,0 +1,54 @@
+{
+  "planPath": "docs/superpowers/plans/2026-08-20-active-notebooks.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 1: The selection schema learns about activity",
+      "status": "pending",
+      "description": "**Goal:** `readSelection` reads an optional `activeNotebookIds`, `isActive` answers from it, and the sync state carries the two fields later tasks need.\n\n**Files:**\n- Modify: `src/mirror-schema.ts`\n- Test: `test/mirror-schema.test.ts`\n\n**Verify:** `npm run typecheck && npm test`\n\n```json:metadata\n{\"files\": [\"src/mirror-schema.ts\", \"test/mirror-schema.test.ts\"], \"verifyCommand\": \"npm run typecheck && npm test\", \"acceptanceCriteria\": [\"readSelection returns activeNotebookIds null when absent or not an array\", \"an explicitly empty array is distinct from absent\", \"isActive answers true for all when absent or null\", \"activeSelectionHashOf is order-independent and separates absent from empty\", \"MirrorSyncState carries activeSelectionHash and unknownActiveNotebookIds\", \"existing NotebookSelection literals still compile\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 2: The syncs skip inactive notebooks",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** The incremental pass backfills an inactive notebook once and never lists it again; the two existing sweeps drop it entirely; the report says how many sections were declined.\n\n**Files:**\n- Modify: `src/mirror-sync.ts`\n- Test: `test/mirror-sync.test.ts`\n\n**Verify:** `npm run typecheck && npm test`\n\n```json:metadata\n{\"files\": [\"src/mirror-sync.ts\", \"test/mirror-sync.test.ts\"], \"verifyCommand\": \"npm run typecheck && npm test\", \"acceptanceCriteria\": [\"splitByActivity is exported and pure and pickCandidates is unchanged\", \"includeBackfill true keeps a never-synced inactive section\", \"includeBackfill false drops every inactive section\", \"runIncremental skips a backfilled inactive section, both sweeps always skip\", \"SyncReport.sectionsSkippedInactive counts declined sections\", \"unknownActiveNotebookIds reaches the report and the sync state\", \"backfillComplete still considers every mirrored section\", \"structureHashOf ignores activeNotebookIds\", \"resyncPage writes a page in an inactive notebook\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 3: Re-activation forces a re-examination",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Changing the active set makes the next run re-examine every eligible section, so a notebook edited while it was inactive is not skipped for ever.\n\n**Files:**\n- Modify: `src/mirror-sync.ts`\n- Test: `test/mirror-sync.test.ts`\n\n**Verify:** `npm run typecheck && npm test`\n\n```json:metadata\n{\"files\": [\"src/mirror-sync.ts\", \"test/mirror-sync.test.ts\"], \"verifyCommand\": \"npm run typecheck && npm test\", \"acceptanceCriteria\": [\"a changed hash patches sectionsScannedThrough null and the new hash\", \"the run uses the corrected state rather than the stale snapshot\", \"an unchanged hash patches neither\", \"per-section pagesSyncedThrough values are untouched\", \"both incrementalPass and sweepPass apply it\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 4: POST /sync/sweep/all",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "**Goal:** A fourth route and a fourth sync mode that sweeps every mirrored section, active or not.\n\n**Files:**\n- Modify: `src/mirror-schema.ts`, `src/mirror-sync.ts`, `src/sync-route.ts`, `src/tools.ts`\n- Test: `test/mirror-sync.test.ts`, `test/sync-route.test.ts`, `test/mirror-schema.test.ts`\n\n**Verify:** `npm run typecheck && npm test`\n\n```json:metadata\n{\"files\": [\"src/mirror-schema.ts\", \"src/mirror-sync.ts\", \"src/sync-route.ts\", \"src/tools.ts\", \"test/mirror-sync.test.ts\", \"test/sync-route.test.ts\", \"test/mirror-schema.test.ts\"], \"verifyCommand\": \"npm run typecheck && npm test\", \"acceptanceCriteria\": [\"SyncMode includes sweep-all and syncModeOrNull accepts it\", \"runSweepAll visits inactive sections and runFullSweep still does not\", \"POST /sync/sweep/all reaches runSweepAll and no other mode\", \"GET /sync/sweep/all is 405 with Allow POST\", \"the route is absent when MIRROR_SYNC_SECRET is unset\", \"a request with no x-sync-secret gets the route's own 401 with no WWW-Authenticate\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 5: best-available, and the reader that decides it",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** `MirrorSource` gains a third value, the reader can say how much of an answer came from an inactive notebook, and `readSourced` turns the two into the label.\n\n**Files:**\n- Modify: `src/mirror-reader.ts`\n- Test: `test/mirror-reader.test.ts`, `test/mirror-tools.test.ts` (fake store gains getSelection)\n\n**Verify:** `npm run typecheck && npm test`\n\n```json:metadata\n{\"files\": [\"src/mirror-reader.ts\", \"test/mirror-reader.test.ts\", \"test/mirror-tools.test.ts\"], \"verifyCommand\": \"npm run typecheck && npm test\", \"acceptanceCriteria\": [\"sourceFor is exported and satisfies the six-row truth table\", \"MirrorReadStore requires getSelection\", \"coverageOfSection, coverageOfPage and accountActivity answer from one 30s memo against an injectable clock\", \"a missing section or page document is some, never all\", \"readSourced calls inactiveCoverage only on a mirror hit\", \"a throw from inactiveCoverage yields some rather than a failed read\", \"a Graph-origin answer is still onenote and never calls inactiveCoverage\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 6: Wire coverage into the tools",
+      "status": "pending",
+      "blockedBy": [4],
+      "description": "**Goal:** Each covered tool reports the right coverage, `list_notebooks` says which notebooks are active, unscoped `search_pages` says how many it skipped, and every covered description explains the three source values.\n\n**Files:**\n- Modify: `src/mcp-tools.ts`, `src/structure-tools.ts`, `src/page-tools.ts`, `src/mirror-reader.ts`\n- Test: `test/mirror-tools.test.ts`\n\n**Verify:** `npm run typecheck && npm test`\n\n```json:metadata\n{\"files\": [\"src/mcp-tools.ts\", \"src/structure-tools.ts\", \"src/page-tools.ts\", \"src/mirror-reader.ts\", \"test/mirror-tools.test.ts\"], \"verifyCommand\": \"npm run typecheck && npm test\", \"acceptanceCriteria\": [\"five scoped tools report best-available for an inactive notebook and onenote for an active one\", \"unscoped search_pages reports the mix and carries inactiveNotebooks\", \"list_notebooks and list_sections pass no coverage\", \"mirror-origin list_notebooks entries carry pagesActive and Graph-origin entries carry neither flag\", \"all eight covered descriptions end with SOURCE_NOTE\", \"structure-tools.test.ts and page-tools.test.ts still pass untouched\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 7: Documentation",
+      "status": "pending",
+      "blockedBy": [3, 5],
+      "description": "**Goal:** `CLAUDE.md`, `README.md` and `project-spec.md` describe the feature, so the next agent does not undo it.\n\n**Files:**\n- Modify: `CLAUDE.md`, `README.md`, `project-spec.md`\n\n**Verify:** `npm run typecheck && npm test`, then read each edited section back once.\n\n```json:metadata\n{\"files\": [\"CLAUDE.md\", \"README.md\", \"project-spec.md\"], \"verifyCommand\": \"npm run typecheck && npm test\", \"acceptanceCriteria\": [\"CLAUDE.md carries the new convention blocks in the surrounding style\", \"README.md documents the fourth route, the new selection field, and the schedule\", \"project-spec.md's mirror section describes activity\", \"no document names a real notebook, a tenant, or a secret\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-08-20"
+}
