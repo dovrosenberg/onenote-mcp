@@ -413,13 +413,22 @@ export class MirrorStore {
   async markPageStale(pageId: string): Promise<void> {
     await this.#run('marking a mirrored page stale', async () => {
       const batch = this.#firestoreOf(this.#root).batch();
-      batch.set(
-        this.#pages().doc(encodeMirrorId(pageId)),
-        { contentState: 'stale' },
-        { merge: true },
-      );
+      // `update`, not `set({merge:true})`. A merging set *creates* the document when it
+      // is absent, and the write tools reach the whole account while only the selection
+      // is mirrored — so every write to an unmirrored page would leave a stub carrying
+      // nothing but `contentState: 'stale'`. Harmless to read, but it fills the queried
+      // collection with rows for pages the mirror does not hold.
+      batch.update(this.#pages().doc(encodeMirrorId(pageId)), { contentState: 'stale' });
       batch.delete(this.#pageContent().doc(encodeMirrorId(pageId)));
-      await batch.commit();
+
+      try {
+        await batch.commit();
+      } catch (err) {
+        // NOT_FOUND means there was no copy to invalidate, which is the ordinary answer
+        // for a page outside the mirrored set. Anything else is a real failure.
+        if (isNotFound(err)) return;
+        throw err;
+      }
     });
   }
 
@@ -553,6 +562,11 @@ export class MirrorStore {
       throw new MirrorUnavailableError(operation, { cause: err });
     }
   }
+}
+
+/** Firestore's gRPC status for a document that is not there. */
+function isNotFound(err: unknown): boolean {
+  return (err as { code?: unknown }).code === 5;
 }
 
 /** A reason string for a log line. Never a message, which can carry a request body. */

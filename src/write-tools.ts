@@ -412,6 +412,7 @@ export function createWriteTools(
         const pageId = requiredString(args, 'pageId');
         const newTitle = titleArgument(args, 'newTitle');
 
+        await beginWrite(mirror, pageId);
         await write.updatePageTitle(pageId, newTitle);
         // The title comes from here rather than from a read-back: measured 2026-08-19,
         // page metadata read immediately after a write can come back empty.
@@ -446,6 +447,7 @@ async function append(
   const clearance = await inkClearance(layout, pageId);
   const content = clearance === null ? htmlFragment : clearanceHtml(clearance, htmlFragment);
 
+  await beginWrite(mirror, pageId);
   await write.appendToPage(pageId, content);
   // No title hint: an append cannot change one.
   await resync(mirror, pageId, {}, true);
@@ -591,6 +593,42 @@ export function titleArgument(args: Readonly<Record<string, unknown>>, name: str
 /** One JSON text block, the shape every other tool in this server answers with. */
 function jsonResult(payload: unknown): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+}
+
+/**
+ * Mark the page stale *before* the Graph write, so the window cannot end badly.
+ *
+ * This is not the same guard as the fallback inside `resync`, and it covers a case that
+ * one cannot. Between the PATCH succeeding and the resync completing, the mirror holds a
+ * copy that OneNote no longer agrees with. If the process merely errors, `resync` catches
+ * it and marks the page stale. If the process *stops* — Cloud Run cutting the request at
+ * 300 seconds, or the instance being reclaimed after an idle period — nothing catches
+ * anything: the resync is sitting in the request gate's queue, the queue is wiped with
+ * the instance, and no `catch` ever runs because nothing threw.
+ *
+ * The mirror would then keep serving pre-write content as `present`, reporting
+ * `source: "mirror"` and a recent `mirroredAt`, until the next scheduled sync noticed the
+ * page's `lastModifiedDateTime` had moved. Marking stale first makes that window
+ * pessimistic instead: a death anywhere in it leaves the page a miss, and a miss goes to
+ * Graph, which cannot be wrong.
+ *
+ * The cost is one Firestore write per tool write, and — if the Graph write then fails —
+ * a discarded cached copy that the next read re-fetches. Both are cheap against serving
+ * content the user can see is wrong.
+ *
+ * `create_page` does not call this: its page is not in the mirror, so a read is already
+ * a miss.
+ */
+async function beginWrite(mirror: MirrorWriteSync | undefined, pageId: string): Promise<void> {
+  if (mirror === undefined) return;
+
+  try {
+    await mirror.markPageStale(pageId);
+  } catch (err) {
+    // Never fails the write. This is a narrowing of an existing window, not a
+    // precondition for writing.
+    logEvent('mirror-invalidate-failed', { pageId, reason: reasonOf(err) });
+  }
 }
 
 /**

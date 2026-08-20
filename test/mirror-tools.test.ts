@@ -210,12 +210,20 @@ function fakeMirror(
 // Write side: the narrowest fakes that let a write succeed.
 // ---------------------------------------------------------------------------
 
-function fakeWriteClient(): PageWriteClient {
+function fakeWriteClient(order: string[] = []): PageWriteClient {
   return {
-    appendToPage: () => Promise.resolve(),
-    updatePageTitle: () => Promise.resolve(),
-    createPage: () =>
-      Promise.resolve({ id: 'p-new', title: 'Fresh', webUrl: null, clientUrl: null }),
+    appendToPage: () => {
+      order.push('graph-write');
+      return Promise.resolve();
+    },
+    updatePageTitle: () => {
+      order.push('graph-write');
+      return Promise.resolve();
+    },
+    createPage: () => {
+      order.push('graph-write');
+      return Promise.resolve({ id: 'p-new', title: 'Fresh', webUrl: null, clientUrl: null });
+    },
   };
 }
 
@@ -508,16 +516,23 @@ interface SyncCalls {
 
 function fakeWriteSync(
   calls: SyncCalls,
-  options: { resyncFails?: boolean; staleFails?: boolean; outcome?: ResyncOutcome } = {},
+  options: {
+    resyncFails?: boolean;
+    staleFails?: boolean;
+    outcome?: ResyncOutcome;
+    order?: string[];
+  } = {},
 ): MirrorWriteSync {
   return {
     resyncPage: (pageId, hint) => {
+      options.order?.push('resync');
       calls.resynced.push({ pageId, hint });
       return options.resyncFails === true
         ? Promise.reject(new Error('graph down'))
         : Promise.resolve(options.outcome ?? 'updated');
     },
     markPageStale: (pageId) => {
+      options.order?.push('mark-stale');
       calls.staled.push(pageId);
       return options.staleFails === true
         ? Promise.reject(new Error('firestore down'))
@@ -531,11 +546,12 @@ test('every write resyncs its page, including create_page', async () => {
   // an append answers from the mirror with the appended text, instead of falling through
   // to Graph until the next scheduled run.
   const calls: SyncCalls = { resynced: [], staled: [] };
+  const order: string[] = [];
   const writeTools = createWriteTools(
-    fakeWriteClient(),
+    fakeWriteClient(order),
     fakeLayoutReader(),
     fakeWriteLookup(),
-    fakeWriteSync(calls),
+    fakeWriteSync(calls, { order }),
   );
 
   await byName(writeTools, 'append_to_page').handle({
@@ -553,7 +569,14 @@ test('every write resyncs its page, including create_page', async () => {
   });
 
   assert.deepEqual(calls.resynced.map((r) => r.pageId), ['p-held', 'p-held', 'p-new']);
-  assert.deepEqual(calls.staled, [], 'the fallback is not used when the resync worked');
+  // The whole sequence, rather than counts: an append and a rename each pre-mark, write,
+  // then resync; create_page skips the pre-mark because its page is not in the mirror;
+  // and no resync is followed by a fallback, because all three succeeded.
+  assert.deepEqual(order, [
+    'mark-stale', 'graph-write', 'resync',
+    'mark-stale', 'graph-write', 'resync',
+    'graph-write', 'resync',
+  ]);
 });
 
 test('the hints carry what a metadata read cannot be trusted for', async () => {
@@ -591,11 +614,12 @@ test('the hints carry what a metadata read cannot be trusted for', async () => {
 
 test('a failed resync falls back to marking the page stale', async () => {
   const calls: SyncCalls = { resynced: [], staled: [] };
+  const order: string[] = [];
   const writeTools = createWriteTools(
-    fakeWriteClient(),
+    fakeWriteClient(order),
     fakeLayoutReader(),
     fakeWriteLookup(),
-    fakeWriteSync(calls, { resyncFails: true }),
+    fakeWriteSync(calls, { resyncFails: true, order }),
   );
 
   const result = await byName(writeTools, 'append_to_page').handle({
@@ -604,7 +628,7 @@ test('a failed resync falls back to marking the page stale', async () => {
   });
 
   // Stale is correct, just slower: the next read is a miss and goes to Graph.
-  assert.deepEqual(calls.staled, ['p-held']);
+  assert.deepEqual(order, ['mark-stale', 'graph-write', 'resync', 'mark-stale']);
   assert.equal(payload(result)['appended'], true);
 });
 
@@ -646,11 +670,12 @@ test('an append that resynced to "unchanged" is marked stale, not left as curren
   // as current, with nothing saying so. Marking it stale sends the next read to Graph,
   // which cannot be wrong.
   const calls: SyncCalls = { resynced: [], staled: [] };
+  const order: string[] = [];
   const writeTools = createWriteTools(
-    fakeWriteClient(),
+    fakeWriteClient(order),
     fakeLayoutReader(),
     fakeWriteLookup(),
-    fakeWriteSync(calls, { outcome: 'unchanged' }),
+    fakeWriteSync(calls, { outcome: 'unchanged', order }),
   );
 
   await byName(writeTools, 'append_to_page').handle({
@@ -663,7 +688,11 @@ test('an append that resynced to "unchanged" is marked stale, not left as curren
     htmlFragment: '<p>new</p>',
   });
 
-  assert.deepEqual(calls.staled, ['p-held', 'p-new']);
+  // Each write's resync reported nothing to store, so each is followed by a fallback.
+  assert.deepEqual(order, [
+    'mark-stale', 'graph-write', 'resync', 'mark-stale',
+    'graph-write', 'resync', 'mark-stale',
+  ]);
 });
 
 test('a rename that resynced to "unchanged" is left alone', async () => {
@@ -671,11 +700,12 @@ test('a rename that resynced to "unchanged" is left alone', async () => {
   // write here — and the title comparison in writePageFromRaw is what makes a real
   // rename come back `updated` anyway.
   const calls: SyncCalls = { resynced: [], staled: [] };
+  const order: string[] = [];
   const writeTools = createWriteTools(
-    fakeWriteClient(),
+    fakeWriteClient(order),
     fakeLayoutReader(),
     fakeWriteLookup(),
-    fakeWriteSync(calls, { outcome: 'unchanged' }),
+    fakeWriteSync(calls, { outcome: 'unchanged', order }),
   );
 
   await byName(writeTools, 'update_page_title').handle({
@@ -683,17 +713,18 @@ test('a rename that resynced to "unchanged" is left alone', async () => {
     newTitle: 'Renamed',
   });
 
-  assert.deepEqual(calls.staled, []);
+  assert.deepEqual(order, ['mark-stale', 'graph-write', 'resync']);
 });
 
 test('a page outside the mirrored set needs no stale marker', async () => {
   // `not-mirrored` means there is no copy to be wrong.
   const calls: SyncCalls = { resynced: [], staled: [] };
+  const order: string[] = [];
   const writeTools = createWriteTools(
-    fakeWriteClient(),
+    fakeWriteClient(order),
     fakeLayoutReader(),
     fakeWriteLookup(),
-    fakeWriteSync(calls, { outcome: 'not-mirrored' }),
+    fakeWriteSync(calls, { outcome: 'not-mirrored', order }),
   );
 
   await byName(writeTools, 'append_to_page').handle({
@@ -701,5 +732,76 @@ test('a page outside the mirrored set needs no stale marker', async () => {
     htmlFragment: '<p>added</p>',
   });
 
-  assert.deepEqual(calls.staled, []);
+  // The pre-mark is issued blind -- the tool does not know whether a copy exists, and
+  // MirrorStore.markPageStale no-ops on NOT_FOUND rather than creating a stub. What must
+  // not happen is a second one after the resync reported there was nothing to hold.
+  assert.deepEqual(order, ['mark-stale', 'graph-write', 'resync']);
+});
+
+test('the page is marked stale BEFORE the Graph write, not only after it', async () => {
+  // The window that ordering closes: between the PATCH succeeding and the resync
+  // completing, OneNote and the mirror disagree. If the process merely errors, resync's
+  // catch marks the page stale. If the process *stops* -- Cloud Run cutting the request,
+  // or the instance being reclaimed -- the resync is sitting in the request gate's queue,
+  // the queue goes with the instance, and no catch runs because nothing threw. The mirror
+  // would keep serving pre-write content as `present` until the next scheduled sync.
+  //
+  // Marking first makes the window pessimistic: a death anywhere in it leaves a miss, and
+  // a miss goes to Graph.
+  for (const [name, args] of [
+    ['append_to_page', { pageId: 'p-held', htmlFragment: '<p>added</p>' }],
+    ['update_page_title', { pageId: 'p-held', newTitle: 'Renamed' }],
+  ] as const) {
+    const order: string[] = [];
+    const calls: SyncCalls = { resynced: [], staled: [] };
+    const writeTools = createWriteTools(
+      fakeWriteClient(order),
+      fakeLayoutReader(),
+      fakeWriteLookup(),
+      fakeWriteSync(calls, { order }),
+    );
+
+    await byName(writeTools, name).handle(args);
+
+    assert.deepEqual(order, ['mark-stale', 'graph-write', 'resync'], name);
+  }
+});
+
+test('create_page does not pre-mark, because its page is not in the mirror', async () => {
+  // A page the mirror has never seen is already a miss. A stale marker for it would be a
+  // Firestore write for nothing.
+  const order: string[] = [];
+  const calls: SyncCalls = { resynced: [], staled: [] };
+  const writeTools = createWriteTools(
+    fakeWriteClient(order),
+    fakeLayoutReader(),
+    fakeWriteLookup(),
+    fakeWriteSync(calls, { order }),
+  );
+
+  await byName(writeTools, 'create_page').handle({
+    sectionId: 'sec-daily',
+    title: 'Fresh',
+    htmlFragment: '<p>new</p>',
+  });
+
+  assert.deepEqual(order, ['graph-write', 'resync']);
+});
+
+test('a failed pre-mark does not stop the write', async () => {
+  // It narrows an existing window; it is not a precondition for writing.
+  const calls: SyncCalls = { resynced: [], staled: [] };
+  const writeTools = createWriteTools(
+    fakeWriteClient(),
+    fakeLayoutReader(),
+    fakeWriteLookup(),
+    fakeWriteSync(calls, { staleFails: true }),
+  );
+
+  const result = await byName(writeTools, 'append_to_page').handle({
+    pageId: 'p-held',
+    htmlFragment: '<p>added</p>',
+  });
+
+  assert.equal(payload(result)['appended'], true);
 });

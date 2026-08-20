@@ -946,6 +946,24 @@ make a page's stored form depend on which path last touched it — and the diffe
 only surface as a wrong answer to a model days later. `test/mirror-sync.test.ts` asserts
 both paths build the same document from the same response.
 
+**A write marks its page stale *before* it touches Graph, and that ordering closes a
+window nothing else can.** Between the PATCH succeeding and the resync completing, OneNote
+and the mirror disagree. If the process merely errors, the resync's `catch` marks the page
+stale. If the process **stops** — Cloud Run cutting the request at 300 seconds, or the
+instance being reclaimed after an idle period — nothing catches anything: the resync is
+sitting in the request gate's queue, the queue goes with the instance, and no `catch` runs
+because nothing threw. The mirror would keep serving pre-write content as `present`,
+reporting `source: "mirror"` and a recent `mirroredAt`, until the next scheduled sync
+noticed the page's `lastModifiedDateTime` had moved. Pre-marking makes the whole window
+pessimistic: a death anywhere in it leaves a miss, and a miss goes to Graph. `create_page`
+skips it — its page is not in the mirror, so a read is already a miss.
+
+**`markPageStale` uses `update`, not a merging `set`.** A merging set creates the document
+when it is absent, and the write tools reach the whole account while only the selection is
+mirrored — so every write to an unmirrored page would leave a stub in the queried
+collection carrying nothing but `contentState: 'stale'`. `NOT_FOUND` is swallowed, because
+"there was no copy to invalidate" is the ordinary answer for a page outside the selection.
+
 **Two failure levels below a write, and neither fails the write.** A resync that throws
 falls back to `markPageStale`, which makes the next read a miss — correct, just slower. If
 that fails too, the event is logged and nothing else happens. The write has already
