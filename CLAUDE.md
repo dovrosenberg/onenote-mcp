@@ -1040,22 +1040,41 @@ tidiness.** Activity is not a field on any structure document, so a structure pa
 nothing to say about it: the hash it moved would name no document to write, and
 `planStructureWrite` would skip every one of them on an unchanged identity. The two changes
 also need different responses — a structure change disables the timestamp filter for one
-pass, and an activation change clears `sectionsScannedThrough` so a re-activated notebook's
-months-old sections come back into range. So `active` gets its own `activeSelectionHash`,
-and `reconcileActivity` acts on it.
+pass, and an activation change widens the scan for the notebooks it named. So `active` is
+recorded separately, in `activeNotebookIdsSeen`, and `reconcileSelection` acts on it.
 
-**Changing the active set clears `sectionsScannedThrough`, and a null stored hash does
-not.** Tier 1 of `pickCandidates` skips a section whose `graphLastModifiedDateTime` is older
-than `overlapFrom(state.sectionsScannedThrough)`, and that cutoff advances on every completed
-run — so a notebook re-activated after three months would have every section older than the
-cutoff and would never be re-checked at all. Clearing it costs one wide run: each section
-still lists only its own changes against its own per-section watermark, which is untouched.
-A **null** stored hash is a state document written before the field existed rather than a
-change to the active set, so it records the hash and widens nothing; treating it as a change
-would make the first run after every deploy a full-width scan. `reconcileActivity` also
-returns whether it reset, because `ctx.state` is a snapshot taken before the patch and tier 1
-would otherwise still compare against the old cutoff on the very run the reset exists to
-widen.
+**A selection change widens the scan for the notebooks it named, and for no others.**
+Tier 1 of `pickCandidates` skips a section whose `graphLastModifiedDateTime` is older than
+`overlapFrom(state.sectionsScannedThrough)`, and that cutoff advances on every completed
+run — so a notebook just added to `notebookIds`, or just added to `activeNotebookIds`, has
+sections months older than the cutoff that nothing else would ever make candidates again.
+`notebooksNeedingWideScan` in `src/mirror-schema.ts` diffs the two lists the state document
+recorded against the two the selection document now holds, and returns only the ids that
+became mirrored or became active; `pickCandidates` bypasses the cutoff for those notebooks'
+sections and nothing else. The mechanism this replaced nulled `sectionsScannedThrough`,
+which is one global value: activating one notebook made every mirrored active section a
+candidate, about 70 listing requests on this account against an hourly budget of 400 for a
+change that concerned one notebook. Nothing here touches `sectionsScannedThrough` any more.
+
+Only *candidacy* is widened. Each named notebook's sections still list against their own
+`pagesSyncedThrough`, which no part of this touches, so a widened section costs one
+`listPagesChangedSince` and re-fetches only the pages that actually changed. The set is
+stored in `wideScanNotebookIds` rather than held for one run, because a run is
+budget-bounded and may stop with sections outstanding; it is cleared in the same block that
+advances `sectionsScannedThrough` and on exactly that condition, because a run stopped by
+its budget has not visited what it was widened for. `sweepPass` reads the set and never
+clears it — a sweep reconciles page ids rather than resuming a watermark, so it is not what
+the widening is waiting for.
+
+Removal widens nothing and is still recorded, and those are two separate rules.
+`notebooksNeedingWideScan` returns `[]` for a notebook dropped from either list, because
+there is no backlog to catch up on. `selectionMatchesSeen` is what decides whether to
+write, and it is a different question: a run that wrote only when it had something to widen
+would leave the deactivated notebook in `activeNotebookIdsSeen`, and re-activating it later
+would diff against a list it is already in and widen nothing. `selectionSeen` false is a
+state document written before these fields existed rather than a change to the lists — it
+records them and widens nothing, because treating it as a change would make the first run
+after the deploy a full-width scan.
 
 **Activity never touches the write path.** `resyncPage` consults `section.mirrored` and
 nothing else, so a write to a frozen notebook still marks the page stale, still reaches

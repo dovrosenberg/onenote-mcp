@@ -125,6 +125,93 @@ export function isActive(selection: NotebookSelection, notebookId: string): bool
 }
 
 /**
+ * The two selection lists a previous run recorded, as `MirrorSyncState` holds them.
+ *
+ * `mirrored` is null only when nothing was ever recorded; `active` is null both for that
+ * and for "every mirrored notebook is active". `notebooksNeedingWideScan` is given the
+ * pair so the caller does not have to decide which null it is looking at.
+ */
+export interface SeenSelection {
+  readonly mirrored: readonly string[] | null;
+  readonly active: readonly string[] | null;
+}
+
+/**
+ * Which notebooks a selection change has to widen the next scan for.
+ *
+ * A notebook that has just been added to `notebookIds`, or has just become active, holds
+ * sections whose `graphLastModifiedDateTime` may be months old. Tier 1 of
+ * `pickCandidates` in ./mirror-sync.ts skips a section older than the cutoff derived from
+ * `sectionsScannedThrough`, and that cutoff advances on every completed run, so nothing
+ * else would ever make those sections candidates again.
+ *
+ * Removal widens nothing. A notebook dropped from either list is one this run does less
+ * work for, and there is no backlog to catch up on.
+ *
+ * Only *candidacy* is widened. Each named notebook's sections still list against their own
+ * `pagesSyncedThrough`, which nothing here touches, so a widened section costs one
+ * `listPagesChangedSince` and re-fetches only the pages that actually changed.
+ *
+ * `previous.mirrored === null` means no run has ever recorded these lists — a state
+ * document written before the fields existed. Nothing was skipped for inactivity under it
+ * that a recorded list would have caught, so the answer is empty and the caller's job is
+ * to record.
+ *
+ * The active set of a `null` list is every mirrored notebook, so a list becoming null
+ * names everything that was not already in it. The result is deduped and sorted, because
+ * it is stored and compared and the order a diff produced it in is not information.
+ */
+export function notebooksNeedingWideScan(
+  previous: SeenSelection,
+  current: NotebookSelection,
+  mirroredNotebookIds: readonly string[],
+): string[] {
+  if (previous.mirrored === null) return [];
+
+  const wasMirrored = new Set(previous.mirrored);
+  const newlyMirrored = current.notebookIds.filter((id) => !wasMirrored.has(id));
+
+  const wasActive = new Set(previous.active ?? previous.mirrored);
+  const nowActive = current.activeNotebookIds ?? mirroredNotebookIds;
+  const newlyActive = nowActive.filter((id) => !wasActive.has(id));
+
+  return [...new Set([...newlyMirrored, ...newlyActive])].sort();
+}
+
+/**
+ * Do the recorded lists already say what the selection document says?
+ *
+ * `notebooksNeedingWideScan` answering `[]` is not the same question, and using it as one
+ * loses a re-activation. Deactivating a notebook widens nothing, so a run that only wrote
+ * when it had something to widen would leave `activeNotebookIdsSeen` naming the notebook
+ * that was just frozen — and re-activating it later would then diff against a list it is
+ * already in and widen nothing, which is the case the widening exists for.
+ *
+ * Order is not a change: `readSelection` preserves the order an operator typed, and
+ * retyping the same ids in another order means nothing here. A `null` active list is
+ * compared as a value rather than as a set, because `null` and a list naming every
+ * mirrored notebook are the same active set today and different ones the moment a
+ * notebook is added.
+ */
+export function selectionMatchesSeen(
+  previous: SeenSelection,
+  current: NotebookSelection,
+): boolean {
+  if (previous.mirrored === null) return false;
+  if (!sameIds(previous.mirrored, current.notebookIds)) return false;
+  if (previous.active === null || current.activeNotebookIds === null) {
+    return previous.active === null && current.activeNotebookIds === null;
+  }
+  return sameIds(previous.active, current.activeNotebookIds);
+}
+
+function sameIds(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const set = new Set(a);
+  return b.every((id) => set.has(id));
+}
+
+/**
  * Read the selection document, tolerating anything a person might leave in it.
  *
  * A missing document, an absent `notebookIds`, a non-array, or an array holding
@@ -736,16 +823,25 @@ export interface MirrorSyncState {
   /** How many selected notebook ids matched no notebook. A mistyped id is silent otherwise. */
   readonly unknownNotebookIds: number;
   /**
-   * sha256 over the active notebook ids, so a change to them is detectable.
+   * The two selection lists this service last reconciled, so a change can be diffed.
    *
-   * It is not folded into `structureHash`, and that is deliberate: activity is not a
-   * field on any structure document, so a structure write has nothing to say about it and
-   * the hash it moved would name no document to write. The two changes also need
-   * different responses — a structure change disables the timestamp filter for one pass,
-   * and an activation change clears `sectionsScannedThrough` so a re-activated notebook's
-   * months-old sections come back into range. `reconcileActivity` does the second.
+   * A hash could say *that* they changed and not *which* notebook, and which notebook is
+   * the whole point: widening the scan for every notebook when one was activated costs a
+   * listing request per section of the account. `activeNotebookIdsSeen` is `null` for
+   * "every mirrored notebook is active", exactly as in the selection document — which is
+   * why `selectionSeen` exists to tell that apart from "never recorded".
    */
-  readonly activeSelectionHash: string | null;
+  readonly selectionSeen: boolean;
+  readonly mirroredNotebookIdsSeen: readonly string[] | null;
+  readonly activeNotebookIdsSeen: readonly string[] | null;
+  /**
+   * Notebooks whose sections bypass the tier-1 timestamp cutoff until a run completes.
+   *
+   * Stored rather than held for one run, because a run is budget-bounded and may stop
+   * with sections outstanding. It is cleared in the same place `sectionsScannedThrough`
+   * advances — only when every candidate was visited.
+   */
+  readonly wideScanNotebookIds: readonly string[];
   /** How many *active* ids matched no notebook. Same failure as `unknownNotebookIds`. */
   readonly unknownActiveNotebookIds: number;
 }
@@ -768,7 +864,10 @@ export function initialSyncState(): MirrorSyncState {
     runningMode: null,
     runningSince: null,
     unknownNotebookIds: 0,
-    activeSelectionHash: null,
+    selectionSeen: false,
+    mirroredNotebookIdsSeen: null,
+    activeNotebookIdsSeen: null,
+    wideScanNotebookIds: [],
     unknownActiveNotebookIds: 0,
   };
 }
@@ -805,7 +904,10 @@ export function readSyncState(data: Record<string, unknown> | undefined): Mirror
     runningMode: syncModeOrNull(data['runningMode']),
     runningSince: stringOrNull(data['runningSince']),
     unknownNotebookIds: numberOr(data['unknownNotebookIds'], 0),
-    activeSelectionHash: stringOrNull(data['activeSelectionHash']),
+    selectionSeen: booleanOr(data['selectionSeen'], initial.selectionSeen),
+    mirroredNotebookIdsSeen: readIdList(data['mirroredNotebookIdsSeen']),
+    activeNotebookIdsSeen: readIdList(data['activeNotebookIdsSeen']),
+    wideScanNotebookIds: readIdList(data['wideScanNotebookIds']) ?? [],
     unknownActiveNotebookIds: numberOr(data['unknownActiveNotebookIds'], 0),
   };
 }

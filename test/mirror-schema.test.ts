@@ -35,9 +35,11 @@ import {
   overlapFrom,
   planStructureWrite,
   isActive,
+  notebooksNeedingWideScan,
   readSelection,
   readSyncState,
   sectionIdentity,
+  selectionMatchesSeen,
   utf8Bytes,
 } from '../src/mirror-schema.ts';
 
@@ -316,11 +318,140 @@ test('a well-formed sync-state document reads back verbatim', () => {
     runningMode: 'sweep',
     runningSince: '2026-08-19T12:05:00Z',
     unknownNotebookIds: 1,
-    activeSelectionHash: 'def456',
+    selectionSeen: true,
+    mirroredNotebookIdsSeen: ['nb-1', 'nb-2'],
+    activeNotebookIdsSeen: ['nb-1'],
+    wideScanNotebookIds: ['nb-2'],
     unknownActiveNotebookIds: 2,
   };
 
   assert.deepEqual(readSyncState(stored), stored);
+});
+
+test('notebooksNeedingWideScan names only what became mirrored or active', () => {
+  const mirroredIds = ['a', 'b', 'c'];
+
+  // Adding one notebook to the selection widens that one.
+  assert.deepEqual(
+    notebooksNeedingWideScan(
+      { mirrored: ['a', 'b'], active: ['a', 'b'] },
+      { notebookIds: ['a', 'b', 'c'], activeNotebookIds: ['a', 'b'] },
+      mirroredIds,
+    ),
+    ['c'],
+  );
+
+  // Activating one widens that one.
+  assert.deepEqual(
+    notebooksNeedingWideScan(
+      { mirrored: ['a', 'b'], active: ['a'] },
+      { notebookIds: ['a', 'b'], activeNotebookIds: ['a', 'b'] },
+      ['a', 'b'],
+    ),
+    ['b'],
+  );
+
+  // Removing widens nothing: nothing has to be caught up on.
+  assert.deepEqual(
+    notebooksNeedingWideScan(
+      { mirrored: ['a', 'b'], active: ['a', 'b'] },
+      { notebookIds: ['a'], activeNotebookIds: ['a'] },
+      ['a'],
+    ),
+    [],
+  );
+
+  // `null` means every mirrored notebook is active, so a list becoming null activates
+  // everything that was not already in the list.
+  assert.deepEqual(
+    notebooksNeedingWideScan(
+      { mirrored: ['a', 'b', 'c'], active: ['a'] },
+      { notebookIds: ['a', 'b', 'c'], activeNotebookIds: null },
+      mirroredIds,
+    ),
+    ['b', 'c'],
+  );
+
+  // ...and null becoming a subset activates nothing new.
+  assert.deepEqual(
+    notebooksNeedingWideScan(
+      { mirrored: ['a', 'b'], active: null },
+      { notebookIds: ['a', 'b'], activeNotebookIds: ['a'] },
+      ['a', 'b'],
+    ),
+    [],
+  );
+
+  // Never recorded — a state document written before these fields existed. Nothing was
+  // skipped under it, so there is nothing to widen; recording is the whole job.
+  assert.deepEqual(
+    notebooksNeedingWideScan(
+      { mirrored: null, active: null },
+      { notebookIds: ['a', 'b'], activeNotebookIds: null },
+      ['a', 'b'],
+    ),
+    [],
+  );
+});
+
+test('a state document written before the selection fields reads as never recorded', () => {
+  // What is actually deployed: `activeSelectionHash` and none of the fields that replaced
+  // it. `selectionSeen` false is what makes the first run after this deploy record the
+  // lists and widen nothing — reading the absent lists as "the selection was empty" would
+  // widen every mirrored notebook on that run instead.
+  const state = readSyncState({
+    schemaVersion: 1,
+    structureHash: 'abc123',
+    sectionsScannedThrough: '2026-08-19T12:00:00Z',
+    activeSelectionHash: 'def456',
+  });
+
+  assert.equal(state.selectionSeen, false);
+  assert.equal(state.mirroredNotebookIdsSeen, null);
+  assert.equal(state.activeNotebookIdsSeen, null);
+  assert.deepEqual(state.wideScanNotebookIds, []);
+  assert.deepEqual(
+    notebooksNeedingWideScan(
+      { mirrored: state.mirroredNotebookIdsSeen, active: state.activeNotebookIdsSeen },
+      { notebookIds: ['a', 'b'], activeNotebookIds: null },
+      ['a', 'b'],
+    ),
+    [],
+  );
+});
+
+test('selectionMatchesSeen asks a different question from the wide-scan diff', () => {
+  // A removal widens nothing and still has to be recorded, so "nothing to widen" cannot
+  // be the test for "nothing to write".
+  const removed = { mirrored: ['a', 'b'], active: ['a', 'b'] };
+  const now = { notebookIds: ['a', 'b'], activeNotebookIds: ['a'] };
+  assert.deepEqual(notebooksNeedingWideScan(removed, now, ['a', 'b']), []);
+  assert.equal(selectionMatchesSeen(removed, now), false);
+
+  // Order is not a change; nothing was typed that was not already there.
+  assert.equal(
+    selectionMatchesSeen(
+      { mirrored: ['a', 'b'], active: ['b', 'a'] },
+      { notebookIds: ['b', 'a'], activeNotebookIds: ['a', 'b'] },
+    ),
+    true,
+  );
+
+  // `null` and a list naming every mirrored notebook are the same active set today and
+  // different ones the moment a notebook is added, so they are not the same record.
+  assert.equal(
+    selectionMatchesSeen(
+      { mirrored: ['a', 'b'], active: null },
+      { notebookIds: ['a', 'b'], activeNotebookIds: ['a', 'b'] },
+    ),
+    false,
+  );
+
+  // Never recorded is never a match, whatever the selection says.
+  assert.equal(
+    selectionMatchesSeen({ mirrored: null, active: null }, { notebookIds: [], activeNotebookIds: null }),
+    false,
+  );
 });
 
 test('an empty string reads as null, so a cleared field is not a cursor', () => {

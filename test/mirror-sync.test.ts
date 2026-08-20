@@ -59,13 +59,13 @@ import {
 import {
   buildStructure,
   pickCandidates,
+  type CandidateOptions,
   runFullSweep,
   runIncremental,
   runSweep,
   runSweepAll,
   resyncPage,
   splitByActivity,
-  activeSelectionHashOf,
   structureHashOf,
   withLiveMtimes,
   type ResyncDeps,
@@ -883,6 +883,13 @@ test('a section group the tree just gained is created not knowing its nested gro
 // assert the filter alone. The overlay itself is asserted directly below them.
 const NO_LIVE: SectionMtimes = new Map();
 
+/** No notebook is being caught up on, so the timestamp filter is the only thing deciding. */
+const NO_WIDE_SCAN: ReadonlySet<string> = new Set<string>();
+
+function opts(state: MirrorSyncState, mayFilterByTimestamp: boolean): CandidateOptions {
+  return { state, mayFilterByTimestamp, wideScanNotebookIds: NO_WIDE_SCAN };
+}
+
 test('with the roll-up trusted, only sections whose timestamp moved are candidates', () => {
   const state: MirrorSyncState = {
     ...initialSyncState(),
@@ -894,7 +901,7 @@ test('with the roll-up trusted, only sections whose timestamp moved are candidat
   ];
 
   assert.deepEqual(
-    pickCandidates(sections, NO_LIVE, state, true).map((s) => s.id),
+    pickCandidates(sections, NO_LIVE, opts(state, true)).map((s) => s.id),
     ['moved'],
   );
 });
@@ -908,7 +915,7 @@ test('a never-synced section is always a candidate, however old its timestamp', 
     section({ id: 'fresh', graphLastModifiedDateTime: '2020-01-01T00:00:00Z', pagesSyncedThrough: null }),
   ];
 
-  assert.deepEqual(pickCandidates(sections, NO_LIVE, state, true).map((s) => s.id), ['fresh']);
+  assert.deepEqual(pickCandidates(sections, NO_LIVE, opts(state, true)).map((s) => s.id), ['fresh']);
 });
 
 test('an absent timestamp behaves exactly like a distrusted one', () => {
@@ -921,7 +928,7 @@ test('an absent timestamp behaves exactly like a distrusted one', () => {
   };
   const sections = [section({ id: 'no-stamp', graphLastModifiedDateTime: null })];
 
-  assert.deepEqual(pickCandidates(sections, NO_LIVE, state, true).map((s) => s.id), ['no-stamp']);
+  assert.deepEqual(pickCandidates(sections, NO_LIVE, opts(state, true)).map((s) => s.id), ['no-stamp']);
 });
 
 test('with the roll-up distrusted, or the tree stale, every section is a candidate', () => {
@@ -932,10 +939,37 @@ test('with the roll-up distrusted, or the tree stale, every section is a candida
   const scanned = { ...initialSyncState(), sectionsScannedThrough: '2026-08-19T11:00:00.000Z' };
 
   assert.equal(
-    pickCandidates(sections, NO_LIVE, { ...scanned, sectionRollUpTrusted: false }, true).length,
+    pickCandidates(sections, NO_LIVE, opts({ ...scanned, sectionRollUpTrusted: false }, true)).length,
     2,
   );
-  assert.equal(pickCandidates(sections, NO_LIVE, scanned, false).length, 2, 'no filter, visit all');
+  assert.equal(pickCandidates(sections, NO_LIVE, opts(scanned, false)).length, 2, 'no filter, visit all');
+});
+
+test('a wide-scan notebook is a candidate whatever the cutoff says', () => {
+  // The clause that has to come first: every other one declines these sections, and the
+  // cutoff only ever moves forward, so nothing else would make them candidates again.
+  const state: MirrorSyncState = {
+    ...initialSyncState(),
+    sectionsScannedThrough: '2026-08-19T11:00:00.000Z',
+  };
+  const sections = [
+    section({ id: 'widened', graphLastModifiedDateTime: '2020-01-01T00:00:00Z' }),
+    section({
+      id: 'elsewhere',
+      notebookId: 'nb-other',
+      graphLastModifiedDateTime: '2020-01-01T00:00:00Z',
+    }),
+  ];
+
+  assert.deepEqual(
+    pickCandidates(sections, NO_LIVE, {
+      state,
+      mayFilterByTimestamp: true,
+      wideScanNotebookIds: new Set([NB]),
+    }).map((s) => s.id),
+    ['widened'],
+    'and a section in a notebook the widening does not name is still skipped',
+  );
 });
 
 test('the overlap window is applied, so a section on the boundary is not skipped', () => {
@@ -948,7 +982,7 @@ test('the overlap window is applied, so a section on the boundary is not skipped
   const sections = [section({ id: 'just-before', graphLastModifiedDateTime: '2026-08-19T11:10:00Z' })];
 
   assert.deepEqual(
-    pickCandidates(sections, NO_LIVE, state, true).map((s) => s.id),
+    pickCandidates(sections, NO_LIVE, opts(state, true)).map((s) => s.id),
     ['just-before'],
   );
 });
@@ -1423,84 +1457,250 @@ test('a scoped and a full sweep skip inactive sections; sweep-all visits them', 
   assert.equal(report.sectionsSkippedInactive, 0);
 });
 
-test('changing the active set nulls sectionsScannedThrough, so a re-activation is seen', async () => {
-  // Tier 1 skips a section older than that cutoff, and the cutoff advances on every
-  // completed run. Without the reset, a notebook re-activated after three months would
-  // have every section older than the cutoff and would never be re-checked at all.
+/**
+ * Two mirrored notebooks, one section each, both last touched in 2020.
+ *
+ * `treeFrom` describes `NB` alone, so the widening tests script this instead: the property
+ * they assert is that one notebook's sections are listed and the other's are not, which
+ * needs the other notebook to really exist. Both timestamps are older than the
+ * `sectionsScannedThrough` these tests seed, so tier 1 declines both sections and the
+ * wide-scan set is the only thing that can make either a candidate.
+ */
+const STALE = '2020-01-01T00:00:00Z';
+const TWO_NOTEBOOKS: ExpandedNotebook[] = [
+  {
+    id: NB,
+    displayName: '2026',
+    sections: [{ id: 'sec-1', displayName: 'Daily', lastModifiedDateTime: STALE }],
+    sectionGroups: [],
+  },
+  {
+    id: NB2,
+    displayName: 'Other',
+    sections: [{ id: 'sec-other', displayName: 'Daily', lastModifiedDateTime: STALE }],
+    sectionGroups: [],
+  },
+];
+
+/** The stored pair the tree above describes, both filled so neither is a backfill. */
+function staleSections(): StoredSection[] {
+  return [
+    settled(section({ graphLastModifiedDateTime: STALE })),
+    settled(otherSection({ graphLastModifiedDateTime: STALE })),
+  ];
+}
+
+function seenState(seen: Partial<MirrorSyncState>): MirrorSyncState {
+  return {
+    ...initialSyncState(),
+    sectionsScannedThrough: '2026-08-19T11:55:00.000Z',
+    selectionSeen: true,
+    ...seen,
+  };
+}
+
+test('activating one notebook widens that notebook and lists no other', async () => {
+  // The requirement in one line: a change to one notebook starts no work on any other.
+  // The old mechanism nulled `sectionsScannedThrough`, which made every mirrored active
+  // section a candidate — about 70 listing requests on this account for a change that
+  // concerns one notebook.
   const h = harness(
-    // No scripted tree, so the account agrees with the mirror and `sec-1` really was last
-    // touched in 2020. A tree carrying a recent timestamp instead would make the section a
-    // candidate through `withLiveMtimes` whether or not the reset ran, and the second
-    // assertion below would hold with the reset deleted.
-    //
-    // The harness seeds a matching `structureHash`, so a structure rewrite is not what
-    // widens this run either: an unchanged hash makes the timestamps trusted, and the reset
-    // is then the only thing that can turn a section last touched in 2020 into a candidate.
-    { changed: { 'sec-1': [] } },
+    { tree: TWO_NOTEBOOKS },
     {
-      selection: sel([NB, NB2], [NB]),
-      sections: [section({ graphLastModifiedDateTime: '2020-01-01T00:00:00Z' })],
-      state: {
-        ...initialSyncState(),
-        sectionsScannedThrough: '2026-08-19T11:55:00.000Z',
-        activeSelectionHash: activeSelectionHashOf(sel([NB, NB2], [NB2])),
-      },
+      selection: sel([NB, NB2], [NB, NB2]),
+      sections: staleSections(),
+      state: seenState({
+        mirroredNotebookIdsSeen: [NB, NB2],
+        activeNotebookIdsSeen: [NB],
+      }),
     },
   );
 
   await runIncremental(h.deps, BUDGET);
 
+  assert.deepEqual(h.graphCalls.changedSince, ['sec-other']);
   assert.equal(
     h.storeCalls.patches.some((p) => p.sectionsScannedThrough === null),
-    true,
-    'the watermark is cleared so every active section is a candidate on this run',
+    false,
+    'the global cutoff is never nulled by a selection change',
   );
   assert.deepEqual(
-    h.graphCalls.changedSince,
-    ['sec-1'],
-    'and the widening applies to the run that noticed, not the one after it',
+    h.storeCalls.patches.find((p) => p.wideScanNotebookIds !== undefined)?.wideScanNotebookIds,
+    [NB2],
+    'the widening names the notebook that changed and nothing else',
   );
 });
 
-test('a state document that predates the field records the hash and widens nothing', async () => {
-  // Null is "written before this existed", not "the set changed". Treating it as a change
-  // would make the first run after every deploy a full-width scan.
+test('adding one notebook to the selection widens that notebook and lists no other', async () => {
+  // The same mechanism through the other list. Task 2 made watermarks survive a structure
+  // write, so a notebook removed and re-added lists from where it left off — but its
+  // sections' timestamps are older than the cutoff, so without this it would never become
+  // a candidate at all.
   const h = harness(
-    {},
+    { tree: TWO_NOTEBOOKS },
+    {
+      selection: sel([NB, NB2]),
+      sections: staleSections(),
+      state: seenState({ mirroredNotebookIdsSeen: [NB], activeNotebookIdsSeen: null }),
+    },
+  );
+
+  await runIncremental(h.deps, BUDGET);
+
+  assert.deepEqual(h.graphCalls.changedSince, ['sec-other']);
+});
+
+test('removing a notebook from either list widens nothing', async () => {
+  // Removal leaves no backlog: the notebook this run does less work for has nothing to be
+  // caught up on. Widening on a removal would cost a listing request per section of the
+  // whole selection for a change that only ever subtracts work.
+  const deactivated = harness(
+    { tree: TWO_NOTEBOOKS },
+    {
+      selection: sel([NB, NB2], [NB]),
+      sections: staleSections(),
+      state: seenState({ mirroredNotebookIdsSeen: [NB, NB2], activeNotebookIdsSeen: [NB, NB2] }),
+    },
+  );
+  await runIncremental(deactivated.deps, BUDGET);
+  assert.deepEqual(deactivated.graphCalls.changedSince, []);
+  assert.equal(
+    deactivated.storeCalls.patches.some(
+      (p) => p.wideScanNotebookIds !== undefined && p.wideScanNotebookIds.length > 0,
+    ),
+    false,
+    'nothing was widened',
+  );
+  // The removal is still recorded, or re-activating this notebook later would diff
+  // against a list it is already in and widen nothing.
+  assert.deepEqual(
+    deactivated.storeCalls.patches.find((p) => p.selectionSeen !== undefined)
+      ?.activeNotebookIdsSeen,
+    [NB],
+  );
+
+  const dropped = harness(
+    { tree: TWO_NOTEBOOKS },
     {
       selection: sel([NB]),
-      sections: [section({ graphLastModifiedDateTime: '2020-01-01T00:00:00Z' })],
-      state: {
-        ...initialSyncState(),
-        sectionsScannedThrough: '2026-08-19T11:55:00.000Z',
-      },
+      sections: staleSections(),
+      state: seenState({ mirroredNotebookIdsSeen: [NB, NB2], activeNotebookIdsSeen: null }),
+    },
+  );
+  await runIncremental(dropped.deps, BUDGET);
+  assert.deepEqual(dropped.graphCalls.changedSince, []);
+});
+
+test('deactivating then re-activating a notebook widens it the second time', async () => {
+  // The cycle the recording exists for. If the deactivation were not recorded, the
+  // re-activation would diff against a list still naming this notebook and widen nothing,
+  // and its sections would sit below the cutoff for ever.
+  const h = harness(
+    { tree: TWO_NOTEBOOKS },
+    {
+      selection: sel([NB, NB2], [NB]),
+      sections: staleSections(),
+      state: seenState({ mirroredNotebookIdsSeen: [NB, NB2], activeNotebookIdsSeen: [NB, NB2] }),
+    },
+  );
+
+  await runIncremental(h.deps, BUDGET);
+  assert.deepEqual(h.graphCalls.changedSince, [], 'the deactivation widens nothing');
+
+  h.data.selection = sel([NB, NB2], [NB, NB2]);
+  await runIncremental(h.deps, BUDGET);
+  assert.deepEqual(h.graphCalls.changedSince, ['sec-other']);
+
+  // And a third run over an unchanged selection writes nothing about it: on a steady
+  // account this is every run, and a write per run would be a Firestore write per poll.
+  h.storeCalls.patches.length = 0;
+  await runIncremental(h.deps, BUDGET);
+  assert.equal(
+    h.storeCalls.patches.some((p) => p.selectionSeen !== undefined),
+    false,
+  );
+});
+
+test('a budget-stopped run keeps the wide-scan set; a completed one clears it', async () => {
+  // The set is stored rather than held for one run because a run may stop with sections
+  // outstanding. Clearing it on a run that never reached them would leave those sections
+  // below the cutoff for ever, which is the failure the widening exists to prevent.
+  const seeded = {
+    selection: sel([NB, NB2], [NB, NB2]),
+    sections: staleSections(),
+    state: seenState({ mirroredNotebookIdsSeen: [NB, NB2], activeNotebookIdsSeen: [NB] }),
+  };
+
+  // One request, spent on the tree read, so the candidate loop stops before its first
+  // section.
+  const stopped = harness({ tree: TWO_NOTEBOOKS }, structuredClone(seeded));
+  await runIncremental(stopped.deps, TREE_READ_ONLY);
+  assert.deepEqual(stopped.graphCalls.changedSince, []);
+  assert.equal(
+    stopped.storeCalls.patches.some(
+      (p) => p.wideScanNotebookIds !== undefined && p.wideScanNotebookIds.length === 0,
+    ),
+    false,
+    'nothing cleared the set',
+  );
+
+  const completed = harness({ tree: TWO_NOTEBOOKS }, structuredClone(seeded));
+  await runIncremental(completed.deps, BUDGET);
+  assert.equal(
+    completed.storeCalls.patches.some(
+      (p) => p.wideScanNotebookIds !== undefined && p.wideScanNotebookIds.length === 0,
+    ),
+    true,
+    'and a run that visited every candidate does clear it',
+  );
+});
+
+test('a state document that predates the selection fields records them and widens nothing', async () => {
+  // `selectionSeen` false is "written before these fields existed", not "the selection
+  // changed". Treating it as a change would make the first run after this deploy widen
+  // every mirrored notebook.
+  const h = harness(
+    { tree: TWO_NOTEBOOKS },
+    {
+      selection: sel([NB, NB2], [NB, NB2]),
+      sections: staleSections(),
+      state: { ...initialSyncState(), sectionsScannedThrough: '2026-08-19T11:55:00.000Z' },
     },
   );
 
   await runIncremental(h.deps, BUDGET);
 
   assert.deepEqual(h.graphCalls.changedSince, []);
-  assert.equal(
-    h.storeCalls.patches.some((p) => p.activeSelectionHash === 'all'),
-    true,
-    'the hash is recorded, so the next real change is detectable',
+  const recorded = h.storeCalls.patches.find((p) => p.selectionSeen !== undefined);
+  assert.deepEqual(recorded?.mirroredNotebookIdsSeen, [NB, NB2]);
+  assert.deepEqual(recorded?.activeNotebookIdsSeen, [NB, NB2]);
+  assert.deepEqual(recorded?.wideScanNotebookIds, []);
+});
+
+test('an active list becoming null widens every mirrored notebook that was frozen', async () => {
+  // Null is "every mirrored notebook is active", so dropping the list activates whatever
+  // was not in it — and only that.
+  const h = harness(
+    { tree: TWO_NOTEBOOKS },
+    {
+      selection: sel([NB, NB2]),
+      sections: staleSections(),
+      state: seenState({ mirroredNotebookIdsSeen: [NB, NB2], activeNotebookIdsSeen: [NB] }),
+    },
   );
+
+  await runIncremental(h.deps, BUDGET);
+
+  assert.deepEqual(h.graphCalls.changedSince, ['sec-other']);
 });
 
 test('the structure hash does not move when only the active set changed', () => {
   // If it did, an activation edit would disable the timestamp filter for a pass and write
-  // an `activeSelectionHash` the structure documents say nothing about. The two changes
-  // need different responses, and `reconcileActivity` gives activity its own.
+  // a structure the documents say nothing about. The two changes need different
+  // responses, and `reconcileSelection` gives the selection lists their own.
   const base = structureHashOf(buildStructure(TREE, sel([NB])));
   assert.equal(structureHashOf(buildStructure(TREE, sel([NB], []))), base);
   assert.equal(structureHashOf(buildStructure(TREE, sel([NB], [NB]))), base);
-
-  assert.notEqual(activeSelectionHashOf(sel([NB], [])), activeSelectionHashOf(sel([NB], [NB])));
-  assert.equal(
-    activeSelectionHashOf(sel([NB], ['a', 'b'])),
-    activeSelectionHashOf(sel([NB], ['b', 'a'])),
-    'the order an operator typed them in is not a change',
-  );
 });
 
 test('an active id naming no mirrored notebook is counted rather than ignored', () => {

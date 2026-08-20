@@ -59,6 +59,8 @@ import {
   htmlObjectName,
   inkObjectName,
   isActive,
+  notebooksNeedingWideScan,
+  selectionMatchesSeen,
   inkmlObjectName,
   notebookIdentity,
   overlapFrom,
@@ -539,22 +541,17 @@ async function incrementalPass(ctx: PassContext): Promise<void> {
   }
 
   const structure = await reconcileStructure(ctx);
-  const reactivated = await reconcileActivity(ctx);
+  const wideScanNotebookIds = await reconcileSelection(ctx, structure.mirroredNotebookIds);
 
   const sections = await ctx.deps.store.listSectionsToSync();
   const { eligible, skippedInactive } = splitByActivity(sections, ctx.selection, true);
   ctx.tally.sectionsSkippedInactive = skippedInactive;
 
-  // `reactivated` nulled `sectionsScannedThrough` in the store, but `ctx.state` is a
-  // snapshot taken before that write, so tier 1 would still compare against the old
-  // cutoff on this very run — the run the reset exists to widen.
-  const state = reactivated ? { ...ctx.state, sectionsScannedThrough: null } : ctx.state;
-  const candidates = pickCandidates(
-    eligible,
-    structure.liveMtimes,
-    state,
-    ctx.tally.treeRead && !structure.rewritten,
-  );
+  const candidates = pickCandidates(eligible, structure.liveMtimes, {
+    state: ctx.state,
+    mayFilterByTimestamp: ctx.tally.treeRead && !structure.rewritten,
+    wideScanNotebookIds,
+  });
 
   for (const section of candidates) {
     if (ctx.budget.exhausted) {
@@ -570,6 +567,11 @@ async function incrementalPass(ctx: PassContext): Promise<void> {
   if (ctx.tally.done && ctx.tally.treeRead) {
     await ctx.deps.store.patchSyncState({
       sectionsScannedThrough: ctx.startedAtIso,
+      // Cleared on exactly the condition that advances the cutoff, and for the same
+      // reason. A run stopped by its budget has not visited the sections it was widened
+      // for, and clearing the set there would put them back below a cutoff that only
+      // moves forward.
+      wideScanNotebookIds: [],
       backfillComplete: sections.every((section) => section.pagesSyncedThrough !== null),
     });
   }
@@ -668,39 +670,68 @@ async function reconcileStructure(ctx: PassContext): Promise<StructureResult> {
 }
 
 /**
- * Notice a change to the active set, and widen this run so re-activation works.
+ * Record the selection lists, and name the notebooks a change to them has to widen.
  *
- * Returns true when the set changed. Without this a re-activated notebook would never be
- * re-checked: tier 1 of `pickCandidates` skips a section whose
- * `graphLastModifiedDateTime` is older than `overlapFrom(state.sectionsScannedThrough)`,
- * and that cutoff advances on every completed run. A section last edited three months
- * ago, while its notebook was inactive, is older than the cutoff for ever.
+ * Returns the notebooks whose sections bypass tier 1 of `pickCandidates` this run: the
+ * set carried in the state document, plus whatever this run's diff added. Without it a
+ * notebook just mirrored or just activated would never be re-checked — tier 1 skips a
+ * section whose `graphLastModifiedDateTime` is older than
+ * `overlapFrom(state.sectionsScannedThrough)`, and that cutoff advances on every completed
+ * run, so a section last edited three months ago while its notebook was frozen is older
+ * than the cutoff for ever.
  *
- * Nulling the watermark costs one wide run: `overlapFrom(null)` is the epoch, so every
- * mirrored active section becomes a candidate. Each still lists only its own changes,
- * against its own per-section watermark, which this does not touch — so the cost is one
- * `listPagesChangedSince` per section and no page re-fetches. The run is budget-bounded
- * and resumable like any other.
+ * `sectionsScannedThrough` is deliberately not touched. Nulling it is what this replaced,
+ * and it is a global value: one activation made every mirrored active section a
+ * candidate, which is one `listPagesChangedSince` per section of the whole selection —
+ * about 70 requests on this account, against an hourly budget of 400, for a change that
+ * concerned one notebook.
+ *
+ * Only candidacy is widened. Each named notebook's sections still list against their own
+ * `pagesSyncedThrough`, which nothing here touches, so no page is re-fetched that has not
+ * changed.
+ *
+ * `selectionSeen` false is a state document written before these fields existed rather
+ * than a change to the lists. Recording them is the whole job there; widening instead
+ * would make the first run after the deploy a full-width scan.
  */
-async function reconcileActivity(ctx: PassContext): Promise<boolean> {
-  const hash = activeSelectionHashOf(ctx.selection);
-  const stored = ctx.state.activeSelectionHash;
-  if (hash === stored) return false;
+async function reconcileSelection(
+  ctx: PassContext,
+  mirroredNotebookIds: readonly string[],
+): Promise<ReadonlySet<string>> {
+  const carried = new Set(ctx.state.wideScanNotebookIds);
+  const recorded = {
+    selectionSeen: true,
+    mirroredNotebookIdsSeen: [...ctx.selection.notebookIds],
+    activeNotebookIdsSeen:
+      ctx.selection.activeNotebookIds === null ? null : [...ctx.selection.activeNotebookIds],
+  };
 
-  // A null stored hash is a state document written before this field existed, not a
-  // change to the active set. Nothing was skipped for inactivity under it, so there is
-  // nothing to widen — record the hash and leave the watermark alone. Resetting here
-  // instead would make the first run after every deploy a full-width scan.
-  if (stored === null) {
-    await ctx.deps.store.patchSyncState({ activeSelectionHash: hash });
-    return false;
+  if (!ctx.state.selectionSeen) {
+    await ctx.deps.store.patchSyncState({ ...recorded, wideScanNotebookIds: [...carried] });
+    return carried;
   }
 
-  await ctx.deps.store.patchSyncState({
-    sectionsScannedThrough: null,
-    activeSelectionHash: hash,
-  });
-  return true;
+  const seen = {
+    mirrored: ctx.state.mirroredNotebookIdsSeen,
+    active: ctx.state.activeNotebookIdsSeen,
+  };
+  const added = notebooksNeedingWideScan(seen, ctx.selection, mirroredNotebookIds);
+  // Both halves, because a removal widens nothing and still has to be recorded: a run that
+  // wrote only when it had something to widen would leave the deactivated notebook in
+  // `activeNotebookIdsSeen`, and re-activating it later would diff against a list it is
+  // already in. On a steady account this is the branch every run takes, and it costs no
+  // write.
+  if (added.length === 0 && selectionMatchesSeen(seen, ctx.selection)) return carried;
+
+  const widened = new Set([...carried, ...added]);
+  await ctx.deps.store.patchSyncState({ ...recorded, wideScanNotebookIds: [...widened] });
+  if (added.length > 0) {
+    // A count rather than the ids: a notebook id is opaque and this line reaches a public
+    // log, and the count is what says whether one edit widened one notebook or fifty. A
+    // removal reaches here to be recorded and logs nothing, because it widened nothing.
+    logEvent('mirror-selection-widened', { count: added.length });
+  }
+  return widened;
 }
 
 /**
@@ -752,22 +783,6 @@ export function splitByActivity(
 }
 
 /**
- * A hash of the active set alone, so a change to it is detectable across runs.
- *
- * Over the active ids only, not the whole selection: a change to `notebookIds` already
- * moves the structure hash and rewrites the structure. The sentinel for "no active set
- * named" has to be a value no id list can produce, because `null` and `[]` mean opposite
- * things here.
- */
-export function activeSelectionHashOf(selection: NotebookSelection): string {
-  if (selection.activeNotebookIds === null) return 'all';
-
-  const hash = createHash('sha256');
-  for (const id of [...selection.activeNotebookIds].sort()) hash.update(`${id}\n`);
-  return hash.digest('hex');
-}
-
-/**
  * Stored sections carrying this run's observed timestamps.
  *
  * A section absent from `live` keeps its stored value rather than losing it. That case is
@@ -787,6 +802,23 @@ export function withLiveMtimes(
     const observed = live.get(section.id);
     return observed === undefined ? section : { ...section, graphLastModifiedDateTime: observed };
   });
+}
+
+/**
+ * The three decisions `pickCandidates` makes its filter from, named at the call site.
+ *
+ * An options object rather than three more positional parameters. A `ReadonlySet<string>`
+ * beside a `boolean` and a state object has no self-evident order, and both call sites
+ * pass a computed expression for `mayFilterByTimestamp` — `treeRead && !rewritten` in one
+ * and `treeRead` in the other — which is only legible next to the name it is answering.
+ * `sections` and `live` stay positional because they are the data being filtered and the
+ * overlay applied to it, and their types say which is which.
+ */
+export interface CandidateOptions {
+  readonly state: MirrorSyncState;
+  readonly mayFilterByTimestamp: boolean;
+  /** Notebooks whose sections skip the timestamp cutoff; see `reconcileSelection`. */
+  readonly wideScanNotebookIds: ReadonlySet<string>;
 }
 
 /**
@@ -819,15 +851,20 @@ export function withLiveMtimes(
 export function pickCandidates(
   sections: readonly MirrorSection[],
   live: SectionMtimes,
-  state: MirrorSyncState,
-  mayFilterByTimestamp: boolean,
+  options: CandidateOptions,
 ): MirrorSection[] {
+  const { state, mayFilterByTimestamp, wideScanNotebookIds } = options;
   const observed = withLiveMtimes(sections, live);
   if (!state.sectionRollUpTrusted || !mayFilterByTimestamp) return observed;
 
   const since = overlapFrom(state.sectionsScannedThrough);
   return observed.filter(
     (section) =>
+      // First, because it is the only clause that can be true of a section every other
+      // one declines. A notebook just mirrored or just activated holds sections whose
+      // timestamps predate the cutoff by months, and the cutoff only advances, so nothing
+      // else would ever make them candidates again.
+      wideScanNotebookIds.has(section.notebookId) ||
       section.pagesSyncedThrough === null ||
       section.graphLastModifiedDateTime === null ||
       section.graphLastModifiedDateTime >= since,
@@ -1162,7 +1199,13 @@ async function sweepPass(
 
   const sections = unscoped
     ? all
-    : pickCandidates(all, structure.liveMtimes, ctx.state, ctx.tally.treeRead);
+    : pickCandidates(all, structure.liveMtimes, {
+        state: ctx.state,
+        mayFilterByTimestamp: ctx.tally.treeRead,
+        // Read, never cleared: a sweep reconciles page ids rather than resuming a
+        // watermark, so it is not what the widening is waiting for.
+        wideScanNotebookIds: new Set(ctx.state.wideScanNotebookIds),
+      });
 
   const resumeAt = ctx.state.sweepCursorSectionId;
   const start = resumeAt === null ? 0 : Math.max(0, sections.findIndex((s) => s.id === resumeAt));
