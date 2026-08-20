@@ -7,8 +7,14 @@
 // a code path with its own bugs.
 //
 // Both fakes count their calls, because most of what matters here is what does *not*
-// happen: `useLiveData` must not touch the mirror, a mirror hit must not touch Graph, and
-// a mirror failure must still answer.
+// happen: a mirror hit must not touch Graph, a mirror failure must still answer, and an
+// absent mirror must not attempt a refresh.
+//
+// The third fake is the refresh. Every read is refresh-then-read, and whether the refresh
+// finished is what decides between the two labels a tool may report — `onenote` for an
+// answer that equals what OneNote holds, `mirror` for a copy that may be behind. The
+// harness below drives it to either answer, because the label is the claim the calling
+// model acts on and a wrong one is a confident wrong answer.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -35,6 +41,7 @@ import type {
 } from '../src/mirror-schema.ts';
 import { MirrorReader, type MirrorReadStore } from '../src/mirror-reader.ts';
 import type { ScanResult } from '../src/mirror-store.ts';
+import type { ReadFreshness, ReadSync } from '../src/read-sync.ts';
 import type { ToolDefinition } from '../src/mcp-tools.ts';
 import { createPageTools, type PageContentClient } from '../src/page-tools.ts';
 import { createStructureTools, type StructureClient } from '../src/structure-tools.ts';
@@ -275,27 +282,63 @@ function fakeContent(calls: GraphCalls): PageContentClient {
   };
 }
 
+/** How the refresh behaves for one run. `current` is the ordinary case. */
+interface RunOptions {
+  broken?: boolean;
+  empty?: boolean;
+  noMirror?: boolean;
+  freshness?: ReadFreshness;
+}
+
+interface SyncCounter {
+  refreshes: number;
+}
+
+function fakeReadSync(counter: SyncCounter, freshness: ReadFreshness): ReadSync {
+  return {
+    refresh: () => {
+      counter.refreshes += 1;
+      return Promise.resolve(freshness);
+    },
+  };
+}
+
 function tools(
   graphCalls: GraphCalls,
   mirrorCalls: MirrorCalls,
-  options: { broken?: boolean; empty?: boolean; noMirror?: boolean } = {},
+  syncCounter: SyncCounter,
+  options: RunOptions = {},
 ): ToolDefinition[] {
   const mirror = options.noMirror === true ? undefined : fakeMirror(mirrorCalls, options);
+  const sync = fakeReadSync(syncCounter, options.freshness ?? 'current');
   return [
-    ...createStructureTools(fakeGraph(graphCalls), {}, mirror),
-    ...createPageTools(fakeContent(graphCalls), undefined, mirror),
+    ...createStructureTools(fakeGraph(graphCalls), {}, mirror, sync),
+    ...createPageTools(fakeContent(graphCalls), undefined, mirror, sync),
   ];
 }
 
 async function run(
   name: string,
   args: Record<string, unknown>,
-  options: { broken?: boolean; empty?: boolean; noMirror?: boolean } = {},
-): Promise<{ body: Record<string, unknown>; graph: number; mirror: number }> {
+  options: RunOptions = {},
+): Promise<{
+  body: Record<string, unknown>;
+  graph: number;
+  mirror: number;
+  refreshes: number;
+}> {
   const graphCalls: GraphCalls = { total: 0 };
   const mirrorCalls: MirrorCalls = { total: 0 };
-  const body = payload(await byName(tools(graphCalls, mirrorCalls, options), name).handle(args));
-  return { body, graph: graphCalls.total, mirror: mirrorCalls.total };
+  const syncCounter: SyncCounter = { refreshes: 0 };
+  const body = payload(
+    await byName(tools(graphCalls, mirrorCalls, syncCounter, options), name).handle(args),
+  );
+  return {
+    body,
+    graph: graphCalls.total,
+    mirror: mirrorCalls.total,
+    refreshes: syncCounter.refreshes,
+  };
 }
 
 const COVERED = [
@@ -310,47 +353,50 @@ const COVERED = [
 
 // ---------------------------------------------------------------------------
 
-test('every covered tool declares useLiveData, and none of the others do', () => {
-  const all = tools({ total: 0 }, { total: 0 });
-  const covered = new Set(COVERED.map(([name]) => name as string));
-
-  for (const tool of all) {
+test('no covered tool takes a live-data argument, because every read refreshes first', () => {
+  // The argument existed to force a read past a mirror that might be behind. A read that
+  // refreshes the mirror first and reports whether the refresh finished answers the same
+  // question without a schema field the model has to reason about.
+  for (const tool of tools({ total: 0 }, { total: 0 }, { refreshes: 0 })) {
     const properties = (tool.inputSchema.properties ?? {}) as Record<string, unknown>;
-    assert.equal(
-      'useLiveData' in properties,
-      covered.has(tool.name),
-      `${tool.name} has useLiveData: ${String('useLiveData' in properties)}`,
-    );
-  }
-
-  // Seven, and the list above is the specification of which.
-  assert.equal(all.filter((t) => 'useLiveData' in (t.inputSchema.properties ?? {})).length, 7);
-});
-
-test('useLiveData is never required, so the argument can always be omitted', () => {
-  for (const tool of tools({ total: 0 }, { total: 0 })) {
-    const required = (tool.inputSchema.required ?? []) as string[];
-    assert.equal(required.includes('useLiveData'), false, tool.name);
+    assert.equal('useLiveData' in properties, false, tool.name);
   }
 });
 
-test('every covered tool answers from the mirror and reports it', async () => {
+test('every covered tool refreshes the mirror exactly once before it reads', async () => {
+  for (const [name, args] of COVERED) {
+    const { refreshes } = await run(name, args);
+    assert.equal(refreshes, 1, name);
+  }
+});
+
+test('a refreshed mirror answers every covered tool as OneNote, untouched by Graph', async () => {
   for (const [name, args] of COVERED) {
     const { body, graph } = await run(name, args);
-    assert.equal(body['source'], 'mirror', name);
+    assert.equal(body['source'], 'onenote', name);
     assert.equal(graph, 0, `${name} reached Graph on a mirror hit`);
   }
 });
 
-test('useLiveData true sends every covered tool to Graph, untouched by the mirror', async () => {
+test('a refresh that did not finish downgrades the label to mirror', async () => {
+  // The budget ran out, the lease was held, the tree read failed. The data is the same
+  // data; what changed is that nothing checked it against OneNote on this call, and
+  // saying `onenote` anyway would be a claim the server cannot make.
   for (const [name, args] of COVERED) {
-    const { body, graph, mirror } = await run(name, { ...args, useLiveData: true });
-    assert.equal(body['source'], 'graph', name);
-    assert.ok(graph > 0, `${name} did not reach Graph`);
-    // The point of the argument: a caller needing an edit from thirty seconds ago must
-    // not pay a Firestore read to be told the mirror does not have it yet.
-    assert.equal(mirror, 0, `${name} touched the mirror despite useLiveData`);
+    if (name === 'get_page_content') continue;
+    const { body, graph } = await run(name, args, { freshness: 'behind' });
+    assert.equal(body['source'], 'mirror', name);
+    assert.equal(graph, 0, `${name} fell through instead of labelling the answer`);
   }
+});
+
+test('get_page_content stays OneNote through a refresh that did not finish', async () => {
+  // The one exception, and the reason is per-page rather than per-account: a page
+  // document carries its own contentState, and every write marks its page stale before it
+  // touches OneNote. A hit is a page nothing has superseded.
+  const { body, graph } = await run('get_page_content', { pageId: 'p-held' }, { freshness: 'behind' });
+  assert.equal(body['source'], 'onenote');
+  assert.equal(graph, 0);
 });
 
 test('a mirror miss falls through to Graph on every covered tool', async () => {
@@ -362,7 +408,7 @@ test('a mirror miss falls through to Graph on every covered tool', async () => {
 
   for (const [name, args] of misses) {
     const { body, graph } = await run(name, args);
-    assert.equal(body['source'], 'graph', name);
+    assert.equal(body['source'], 'onenote', name);
     assert.ok(graph > 0, `${name} did not fall through`);
   }
 });
@@ -377,7 +423,7 @@ test('a container the mirror has not synced yet is retried against Graph', async
     ['list_pages_by_name', { notebookName: '2027', sectionName: 'Brand new' }],
   ] as const) {
     const { body, graph } = await run(name, args);
-    assert.equal(body['source'], 'graph', name);
+    assert.equal(body['source'], 'onenote', name);
     assert.ok(graph > 0, `${name} did not retry against Graph`);
   }
 });
@@ -385,7 +431,7 @@ test('a container the mirror has not synced yet is retried against Graph', async
 test('a name that exists nowhere is still an error, not a silent empty answer', async () => {
   // The retry must not turn "this section does not exist" into something softer. Both
   // paths raise, and Graph's error is the one that reaches the caller.
-  const all = tools({ total: 0 }, { total: 0 });
+  const all = tools({ total: 0 }, { total: 0 }, { refreshes: 0 });
   await assert.rejects(
     () =>
       byName(all, 'list_pages_by_name').handle({
@@ -400,17 +446,19 @@ test('a Firestore outage answers from Graph rather than failing the call', async
   // Strictly better than the behaviour before the mirror existed, which is the bar.
   for (const [name, args] of COVERED) {
     const { body, graph } = await run(name, args, { broken: true });
-    assert.equal(body['source'], 'graph', name);
+    assert.equal(body['source'], 'onenote', name);
     assert.ok(graph > 0, name);
   }
 });
 
-test('with no mirror configured every tool is Graph-only, and says so', async () => {
-  // MIRROR_READ_ENABLED=false. This is the rollback.
+test('with no mirror configured every tool is Graph-only, and refreshes nothing', async () => {
+  // MIRROR_READ_ENABLED=false. This is the rollback, and it includes the promise that no
+  // tool call spends a Graph request on a sync whose result it has no use for.
   for (const [name, args] of COVERED) {
-    const { body, graph, mirror } = await run(name, args, { noMirror: true });
-    assert.equal(body['source'], 'graph', name);
+    const { body, graph, mirror, refreshes } = await run(name, args, { noMirror: true });
+    assert.equal(body['source'], 'onenote', name);
     assert.equal(mirror, 0, name);
+    assert.equal(refreshes, 0, `${name} refreshed a mirror it does not read`);
     assert.ok(graph > 0, name);
   }
 });
@@ -425,8 +473,9 @@ test('list_notebooks reports every notebook and which have their pages held', as
 
 test('list_notebooks from Graph omits pagesMirrored rather than claiming false', async () => {
   // Graph knows nothing about the mirror. A `pagesMirrored: false` on every notebook
-  // would be a claim this path cannot make.
-  const { body } = await run('list_notebooks', { useLiveData: true });
+  // would be a claim this path cannot make. An empty mirror is the miss that gets here.
+  const { body } = await run('list_notebooks', {}, { empty: true });
+  assert.equal(body['source'], 'onenote');
   const notebooks = body['notebooks'] as Record<string, unknown>[];
   assert.equal('pagesMirrored' in (notebooks[0] ?? {}), false);
 });
@@ -437,22 +486,20 @@ test('an unscoped search from the mirror reports its scope, not a walk that neve
   // narrower than the account and a model has to be told.
   const { body } = await run('search_pages', { query: 'held' });
 
-  assert.equal(body['source'], 'mirror');
+  assert.equal(body['source'], 'onenote');
   assert.equal(body['notebooksSearched'], 1);
   assert.equal(body['notebooksInAccount'], 2);
   assert.equal(body['stoppedEarly'], undefined, 'no walk, so no walk bound to report');
   assert.match(String(body['note']), /1 of 2 notebooks/);
-  assert.match(String(body['note']), /useLiveData/);
+  // The escape hatch is naming a section, not an argument: a scoped search misses in the
+  // mirror and walks that one section in OneNote.
+  assert.match(String(body['note']), /sectionId/);
 });
 
-test('a search covering every notebook says so plainly', async () => {
-  const { body } = await run('search_pages', { query: 'held', useLiveData: false });
-  assert.equal(body['notebooksSearched'], 1);
-
-  // And the Graph path keeps its own vocabulary untouched.
-  const live = await run('search_pages', { query: 'held', useLiveData: true });
-  assert.equal(live.body['notebooksSearched'], undefined);
-  assert.notEqual(live.body['sectionsSearched'], undefined);
+test('the Graph search path keeps its own vocabulary', async () => {
+  const { body } = await run('search_pages', { query: 'held' }, { empty: true });
+  assert.equal(body['notebooksSearched'], undefined);
+  assert.notEqual(body['sectionsSearched'], undefined);
 });
 
 test('list_pages reports an exact moreAvailable from the mirror and the heuristic from Graph', async () => {
@@ -461,26 +508,26 @@ test('list_pages reports an exact moreAvailable from the mirror and the heuristi
   assert.equal(held.body['moreAvailable'], false, 'one page held, one asked for');
 
   // Graph returned exactly `top`, which is all it can ever do, so the heuristic stands.
-  const live = await run('list_pages', { sectionId: 'sec-daily', top: 1, useLiveData: true });
+  const live = await run('list_pages', { sectionId: 'sec-nope', top: 1 });
+  assert.equal(live.body['source'], 'onenote');
   assert.equal(live.body['moreAvailable'], true);
 });
 
-test('get_page_content carries the source in the JSON and in the note', async () => {
+test('get_page_content carries the source and the sync time in the JSON and in the note', async () => {
   const { body } = await run('get_page_content', { pageId: 'p-held' });
 
-  assert.equal(body['source'], 'mirror');
+  assert.equal(body['source'], 'onenote');
   assert.equal(body['mirroredAt'], '2026-08-19T12:30:00.000Z');
   assert.ok(String(body['html']).includes('held content'));
   // Said in prose too, so a model that ignores keys it does not recognise still learns
-  // the answer may be minutes old.
+  // the page came from a stored copy and when it was taken.
   assert.match(String(body['note']), /local copy/);
-  assert.match(String(body['note']), /useLiveData/);
 });
 
-test('a Graph-answered page carries no mirroredAt and no staleness note', async () => {
-  const { body } = await run('get_page_content', { pageId: 'p-held', useLiveData: true });
+test('a Graph-answered page carries no mirroredAt and no local-copy note', async () => {
+  const { body } = await run('get_page_content', { pageId: 'p-nope' });
 
-  assert.equal(body['source'], 'graph');
+  assert.equal(body['source'], 'onenote');
   assert.equal(body['mirroredAt'], undefined);
   assert.equal(String(body['note']).includes('local copy'), false);
 });
@@ -494,17 +541,9 @@ test('an empty mirror is a miss for the _by_name tools, not a NameLookupError', 
     ['list_pages_by_name', { notebookName: '2026', sectionName: 'Daily' }],
   ] as const) {
     const { body, graph } = await run(name, args, { empty: true });
-    assert.equal(body['source'], 'graph', name);
+    assert.equal(body['source'], 'onenote', name);
     assert.ok(graph > 0, name);
   }
-});
-
-test('useLiveData must be a boolean', async () => {
-  const all = tools({ total: 0 }, { total: 0 });
-  await assert.rejects(
-    () => byName(all, 'list_pages').handle({ sectionId: 'sec-daily', useLiveData: 'true' }),
-    /useLiveData/,
-  );
 });
 
 // ---------------------------------------------------------------------------

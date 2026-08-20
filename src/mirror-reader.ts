@@ -2,9 +2,13 @@
 //
 // **Every method here answers `null` on a miss**, and a miss always means "ask Graph".
 // That is the whole contract. The mirror is an optimisation and Graph is the ground
-// truth, so a page this does not hold, a section it has not seen, a Firestore outage, and
-// a caller that asked for live data all end in the same place: the tool's existing Graph
-// path, with the result saying so.
+// truth, so a page this does not hold, a section it has not seen, and a Firestore outage
+// all end in the same place: the tool's existing Graph path, with the result saying so.
+//
+// A read is three steps — refresh the mirror, read the mirror, report the source — and
+// `readSourced` is where all three happen. The refresh is the inline incremental sync in
+// ./read-sync.ts, and whether it finished is what decides between the two labels a tool
+// can report. See the comment on `readSourced`.
 //
 // A miss is only detectable when the tool names something the mirror can fail to find.
 // `list_notebooks` takes no arguments and unscoped `search_pages` takes only a query, so
@@ -49,43 +53,56 @@ import {
 import type { ScanResult } from './mirror-store.ts';
 import { trimPageHtml } from './page-html.ts';
 import type { PageContent } from './page-content.ts';
-
-export type MirrorSource = 'mirror' | 'graph';
+import type { ReadSync } from './read-sync.ts';
 
 /**
- * The forcing argument, defined once so the seven tool descriptions cannot drift.
+ * What a tool tells the calling model about its answer.
  *
- * It lives here rather than in either tool module because both need it and neither
- * should import the other. Named for what the caller wants rather than for the
- * implementation: a model asking for live data does not need to know a Firestore mirror
- * exists, only that there is a faster copy and a slower authority.
+ * `onenote` is a claim that the answer equals what OneNote holds: either it came from
+ * OneNote directly, or it came from the mirror after a refresh that finished. `mirror`
+ * is the weaker claim — a stored copy that may be behind, with `mirroredAt` saying how
+ * far.
+ *
+ * Deliberately **not** the same axis as which store answered. A model has no use for
+ * "Firestore or Graph", and reporting the store would make the common case — a mirror
+ * read the inline sync just brought current — read as second-hand data.
  */
-export const USE_LIVE_DATA_PROPERTY = {
-  type: 'boolean' as const,
-  description:
-    "Read directly from OneNote instead of this server's local copy. The local copy is " +
-    'refreshed every few minutes, so pass true only when you need an edit made in the ' +
-    'last few minutes. It is slower and spends the OneNote request budget.',
-};
+export type MirrorSource = 'onenote' | 'mirror';
+
+/** Which store produced the data, which is what decides its shape. */
+export type ReadOrigin = 'mirror' | 'graph';
 
 /**
- * An answer, and where it came from. Every covered tool puts both in its JSON.
+ * An answer, where it came from, and what to say about it.
  *
- * A discriminated union over two type parameters rather than one, because the two sides
+ * A discriminated union over two type parameters rather than one, because the two stores
  * do not always answer with the same shape: `search_pages` from Graph reports
  * `sectionsSearched` and `stoppedEarly` about a walk, and from the mirror reports
- * `notebooksSearched` and `scanTruncated` about a scan. Narrowing on `source` is what
+ * `notebooksSearched` and `scanTruncated` about a scan. Narrowing on `origin` is what
  * lets a handler read the right one without a cast — and a cast is exactly how a field
  * that means nothing on one path ends up in the other path's result.
+ *
+ * `origin` and `source` are separate fields because they answer different questions and
+ * a mirror read can carry either label. Only `source` reaches the caller.
  *
  * Most tools use it with M and G the same, and infer both.
  */
 export type Sourced<M, G = M> =
-  | { readonly source: 'mirror'; readonly data: M; readonly mirroredAt?: string }
-  | { readonly source: 'graph'; readonly data: G; readonly mirroredAt?: undefined };
+  | {
+      readonly origin: 'mirror';
+      readonly source: MirrorSource;
+      readonly data: M;
+      readonly mirroredAt?: string;
+    }
+  | {
+      readonly origin: 'graph';
+      readonly source: 'onenote';
+      readonly data: G;
+      readonly mirroredAt?: undefined;
+    };
 
 /** Why a read fell through to Graph. A fixed set; these reach a log line. */
-export type FallbackReason = 'forced' | 'miss' | 'stale' | 'oversize' | 'unavailable';
+export type FallbackReason = 'miss' | 'stale' | 'oversize' | 'unavailable';
 
 /** The slice of MirrorStore the read path uses. MirrorStore satisfies it. */
 export interface MirrorReadStore {
@@ -437,46 +454,81 @@ export function mirrorLookupStructure(reader: MirrorReader): {
   };
 }
 
-/**
- * Try the mirror, fall back to Graph, and say which answered.
- *
- * The one place the branch is written. Every failure mode ends in the same fallback:
- * a caller that asked for live data, a miss, and a Firestore outage all reach Graph, and
- * only the reason in the log line distinguishes them. Refusing a tool call because a
- * cache is down would be strictly worse than the behaviour before the mirror existed.
- */
-export async function readSourced<M, G = M>(
-  mirror: MirrorReader | undefined,
-  tool: string,
-  forceGraph: boolean,
-  fromMirror: (reader: MirrorReader) => Promise<M | null>,
-  fromGraph: () => Promise<G>,
-  mirroredAt?: (reader: MirrorReader) => Promise<string | null>,
-): Promise<Sourced<M, G>> {
-  if (mirror === undefined) return { data: await fromGraph(), source: 'graph' };
+/** What one covered tool hands `readSourced`. */
+export interface SourcedRead<M, G> {
+  /** The tool's own name, for the fallback log line. Never user content. */
+  readonly tool: string;
+  /** Absent turns the whole feature off: every read goes to Graph. */
+  readonly mirror: MirrorReader | undefined;
+  /** Absent means no refresh is attempted, so a mirror hit can only be `mirror`. */
+  readonly sync: ReadSync | undefined;
+  /**
+   * Does the mirror track this thing's staleness per document?
+   *
+   * True for `get_page_content` and nothing else. A page document carries a
+   * `contentState`, every write marks its page stale before it touches OneNote, and
+   * `MirrorReader.getPageContent` answers null for anything but `present` — so a hit is
+   * a page no write has superseded, and that is enough to report it as OneNote's content
+   * whether or not the account-wide refresh finished. A listing has no equivalent: a
+   * page created in a section this process never wrote to leaves every stored document
+   * in that section untouched and still correct-looking.
+   */
+  readonly staleTracked?: boolean;
+  fromMirror(reader: MirrorReader): Promise<M | null>;
+  fromGraph(): Promise<G>;
+  mirroredAt?(reader: MirrorReader): Promise<string | null>;
+}
 
-  if (forceGraph) {
-    logEvent('mirror-read-fallback', { tool, reason: 'forced' });
-    return { data: await fromGraph(), source: 'graph' };
-  }
+/**
+ * Refresh, read the mirror, fall back to Graph, and say what the answer is worth.
+ *
+ * The one place the branch is written, and the order is the contract:
+ *
+ * 1. **Refresh.** The inline incremental sync runs, subject to its own interval rule —
+ *    see ./read-sync.ts. Whether it finished is the difference between the two labels.
+ * 2. **Read the mirror.** A hit is the common case and costs no Graph request.
+ * 3. **Report.** A hit is `onenote` when the refresh finished, or when the mirror tracks
+ *    this thing's staleness itself and did not mark it stale. Otherwise `mirror`, with
+ *    `mirroredAt` saying how old the copy is.
+ *
+ * A miss falls through to Graph, which is `onenote` by definition. Every failure mode
+ * ends there: a page the mirror does not hold, a mirror holding no structure at all, and
+ * a Firestore outage, distinguished only by the reason in the log line. Refusing a tool
+ * call because a cache is down would be strictly worse than the behaviour before the
+ * mirror existed, which is the bar.
+ */
+export async function readSourced<M, G = M>(read: SourcedRead<M, G>): Promise<Sourced<M, G>> {
+  const { mirror, tool } = read;
+  if (mirror === undefined) return { data: await read.fromGraph(), origin: 'graph', source: 'onenote' };
+
+  // Before the read, not after: a refresh that lands afterwards would have answered the
+  // question the caller already asked with data it never saw.
+  const freshness = read.sync === undefined ? 'behind' : await read.sync.refresh();
 
   let hit: M | null = null;
   try {
-    hit = await fromMirror(mirror);
+    hit = await read.fromMirror(mirror);
   } catch (err) {
     // Firestore unreachable, or the mirror holds no structure at all. Both are the same
     // answer: Graph is the ground truth and the mirror is an optimisation.
     logEvent('mirror-read-fallback', { tool, reason: reasonOf(err) });
-    return { data: await fromGraph(), source: 'graph' };
+    return { data: await read.fromGraph(), origin: 'graph', source: 'onenote' };
   }
 
   if (hit === null) {
     logEvent('mirror-read-fallback', { tool, reason: 'miss' });
-    return { data: await fromGraph(), source: 'graph' };
+    return { data: await read.fromGraph(), origin: 'graph', source: 'onenote' };
   }
 
-  const stamp = mirroredAt === undefined ? null : await mirroredAt(mirror).catch(() => null);
-  return { data: hit, source: 'mirror', ...(stamp === null ? {} : { mirroredAt: stamp }) };
+  const stamp =
+    read.mirroredAt === undefined ? null : await read.mirroredAt(mirror).catch(() => null);
+
+  return {
+    data: hit,
+    origin: 'mirror',
+    source: freshness === 'current' || read.staleTracked === true ? 'onenote' : 'mirror',
+    ...(stamp === null ? {} : { mirroredAt: stamp }),
+  };
 }
 
 function reasonOf(err: unknown): FallbackReason {

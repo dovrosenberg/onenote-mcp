@@ -156,6 +156,70 @@ the alignment is arithmetic, not guesswork.
   styling noise. Worth stripping to something readable rather than passing
   raw markup through.
 
+### Reading through the mirror
+
+Seven tools read: the six browsing tools above and `get_page_content`. With
+`MIRROR_READ_ENABLED=true` each of them runs the same three steps in this
+order, and the order is the contract.
+
+1. **Refresh the mirror.** The tool runs an incremental sync itself — the same
+   `runIncremental` the scheduled `POST /sync` runs, with budgets sized for a
+   tool call rather than a scheduled job: 12 Graph requests and 15 seconds
+   against the scheduler's 120 and 240.
+2. **Read the mirror.** A hit costs no Graph request. A miss falls through to
+   Graph unchanged, which is what keeps a notebook outside the mirrored
+   selection readable.
+3. **Report the source.** One field, `source`, with two values.
+
+**The `source` rule.** `onenote` is a claim that the answer equals what OneNote
+holds. `mirror` is the weaker claim — a stored copy that may be behind, with
+`mirroredAt` beside it saying when it was taken.
+
+| Situation | `source` |
+|---|---|
+| The read fell through to Graph | `onenote` |
+| A mirror hit, and the refresh in step 1 finished | `onenote` |
+| A mirror hit on a single page nothing has marked stale | `onenote` |
+| A mirror hit, and the refresh did not finish | `mirror` |
+
+- **"Finished" is four conditions, not one.** The run's outcome is `complete`,
+  it did not stop on the request or time budget, it read the expanded tree, and
+  no page content fetch failed. A failed tree read is deliberately *not* fatal
+  to a sync — it carries on against the structure already in Firestore — so a
+  notebook created since the last good tree read is absent from a run that
+  otherwise looks complete. A failed page fetch leaves that page's stored copy
+  where it was. Either one makes `onenote` a claim the server cannot support.
+- **`get_page_content` is the one tool that can say `onenote` without a
+  finished refresh.** Staleness for a page is tracked on the page document:
+  every write marks its page stale before it touches OneNote, and a mirror read
+  answers a miss for anything but `present`. So a hit there is a page nothing
+  has superseded, which is a fact about that page rather than about the
+  account-wide refresh. The other six answer from *listings*, and a page
+  created in a section this process never wrote to leaves every stored document
+  in that section untouched and still correct-looking.
+- **A refresh is rate-limited, and that bound is what keeps the design
+  affordable.** A finished refresh holds for 30 seconds; one that did not
+  finish holds for 5 minutes, because none of the reasons it did not finish get
+  better in 30 seconds. Worst case against OneNote's 400 requests an hour: about
+  120/hour from a continuously busy conversation on a quiet account, where a
+  refresh is the single tree request, and 144/hour while the mirror is behind
+  and every refresh spends its full 12. Two callers arriving together share one
+  run rather than starting two.
+- **A refresh never fails a read.** Graph refusing it, Firestore being
+  unreachable, and the scheduler holding the sync lease all end the same way:
+  the refresh answers "behind", the read carries on, and the answer is labelled
+  `mirror` rather than refused.
+- **There is no per-call argument to force a live read.** An earlier version
+  had one, `useLiveData`. It is gone: a read that refreshes first and then
+  reports whether the refresh finished answers the same question without a
+  schema field the calling model has to reason about. The escape hatch for a
+  notebook outside the mirrored selection is `sectionId` on `search_pages`,
+  which misses in the mirror and walks that section in OneNote.
+- **`MIRROR_READ_ENABLED=false` remains a complete rollback.** No mirror means
+  no refresh either, so a tool call spends no Graph request on a sync whose
+  result it has no use for, and every answer reports `source: "onenote"`
+  because Graph is the only thing it read.
+
 ### Writing
 
 | Tool | Purpose |
@@ -222,10 +286,12 @@ the alignment is arithmetic, not guesswork.
   marks the page stale. If the process *stops* — Cloud Run cutting the
   request at 300 seconds, or the instance being reclaimed — nothing catches
   anything, and the mirror keeps serving superseded data as current, with
-  `source: "mirror"` and a recent `mirroredAt` beside it, until the next
-  scheduled sync notices. Invalidating first makes the whole window
-  pessimistic instead: a death anywhere in it leaves a miss, and a miss goes
-  to Graph.
+  `source: "onenote"` and a recent `mirroredAt` beside it, until the next
+  sync notices. That label is the damage: a page marked `present` reads as
+  OneNote's content whether or not the account-wide refresh finished — see
+  **Reading through the mirror** — so nothing in the answer says it is a
+  write behind. Invalidating first makes the whole window pessimistic
+  instead: a death anywhere in it leaves a miss, and a miss goes to Graph.
 - **There are two things a write can invalidate, and each tool marks the
   ones it can make wrong.**
 

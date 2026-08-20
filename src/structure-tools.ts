@@ -55,20 +55,19 @@ import {
 } from './page-search.ts';
 import {
   ToolInputError,
-  optionalBoolean,
   optionalInteger,
   requiredString,
   optionalString,
   type ToolDefinition,
 } from './mcp-tools.ts';
 import {
-  USE_LIVE_DATA_PROPERTY,
   mirrorLookupStructure,
   readSourced,
   type MirroredSearch,
   type MirrorReader,
   type Sourced,
 } from './mirror-reader.ts';
+import type { ReadSync } from './read-sync.ts';
 
 /** Bounds on `list_pages`'s `top`. Graph decides its own page size regardless. */
 const TOP_RANGE = { min: 1, max: 100 };
@@ -119,6 +118,7 @@ export function createStructureTools(
   structure: StructureClient,
   searchOptions: SearchOptions = {},
   mirror?: MirrorReader,
+  sync?: ReadSync,
 ): ToolDefinition[] {
   // The description quotes the bounds a caller will actually get, so a shrunk bound in a
   // test cannot leave the tool advertising the production numbers.
@@ -137,30 +137,30 @@ export function createStructureTools(
         "containerType 'notebook' to see what is inside it.",
       inputSchema: {
         type: 'object',
-        properties: { useLiveData: USE_LIVE_DATA_PROPERTY },
+        properties: {},
         additionalProperties: false,
       },
       annotations: READ_ONLY,
-      handle: async (args) => {
+      handle: async () => {
         // The mirror stores every notebook in the account, not only the ones whose pages
         // are mirrored, precisely so this tool cannot answer partially. `pagesMirrored`
         // says which are which.
-        const answer = await readSourced(
+        const answer = await readSourced({
+          tool: 'list_notebooks',
           mirror,
-          'list_notebooks',
-          optionalBoolean(args, 'useLiveData') ?? false,
-          (reader) => reader.listNotebooks(),
-          async () =>
+          sync,
+          fromMirror: (reader) => reader.listNotebooks(),
+          fromGraph: async () =>
             (await structure.listNotebooks()).map((notebook) => ({
               id: notebook.id,
               displayName: notebook.displayName,
               pagesMirrored: false,
             })),
-        );
+        });
 
         return jsonResult({
           notebooks: answer.data.map((notebook) =>
-            answer.source === 'mirror'
+            answer.origin === 'mirror'
               ? notebook
               : { id: notebook.id, displayName: notebook.displayName },
           ),
@@ -193,7 +193,6 @@ export function createStructureTools(
             type: 'string',
             description: 'A notebook id from list_notebooks, or a section group id from list_sections.',
           },
-          useLiveData: USE_LIVE_DATA_PROPERTY,
         },
         required: ['containerType', 'containerId'],
         additionalProperties: false,
@@ -207,13 +206,13 @@ export function createStructureTools(
         }
         const containerId = requiredString(args, 'containerId');
 
-        const answer = await readSourced(
+        const answer = await readSourced({
+          tool: 'list_sections',
           mirror,
-          'list_sections',
-          optionalBoolean(args, 'useLiveData') ?? false,
-          (reader) => reader.listContainerChildren(kind, containerId),
-          () => structure.listContainerChildren(kind, containerId),
-        );
+          sync,
+          fromMirror: (reader) => reader.listContainerChildren(kind, containerId),
+          fromGraph: () => structure.listContainerChildren(kind, containerId),
+        });
         const children = answer.data;
 
         return jsonResult({
@@ -259,7 +258,6 @@ export function createStructureTools(
             maximum: TOP_RANGE.max,
             description: `How many pages to return. Defaults to ${DEFAULT_TOP}.`,
           },
-          useLiveData: USE_LIVE_DATA_PROPERTY,
         },
         required: ['sectionId'],
         additionalProperties: false,
@@ -269,22 +267,22 @@ export function createStructureTools(
         const sectionId = requiredString(args, 'sectionId');
         const top = optionalInteger(args, 'top', TOP_RANGE) ?? DEFAULT_TOP;
 
-        const answer = await readSourced(
+        const answer = await readSourced({
+          tool: 'list_pages',
           mirror,
-          'list_pages',
-          optionalBoolean(args, 'useLiveData') ?? false,
-          (reader) => reader.listPagesInSection(sectionId, top),
-          () => structure.listPagesInSection(sectionId, top),
-        );
+          sync,
+          fromMirror: (reader) => reader.listPagesInSection(sectionId, top),
+          fromGraph: () => structure.listPagesInSection(sectionId, top),
+        });
 
         // The two paths mean different things by "more available", and collapsing them
         // into one number gets one of them wrong. Graph was asked for `top` and can
         // never return more, so exactly `top` back means "at least one more" — a
         // heuristic that says maybe on a section holding exactly `top`. The mirror asked
         // for one extra and counted, so its answer is a fact.
-        const pages = answer.source === 'mirror' ? answer.data.pages : answer.data;
+        const pages = answer.origin === 'mirror' ? answer.data.pages : answer.data;
         const moreAvailable =
-          answer.source === 'mirror' ? answer.data.total > top : answer.data.length >= top;
+          answer.origin === 'mirror' ? answer.data.total > top : answer.data.length >= top;
 
         return jsonResult({
           sectionId,
@@ -326,7 +324,6 @@ export function createStructureTools(
             description:
               'Restrict the search to one section. Strongly preferred when answering from OneNote directly; omitting it walks the account.',
           },
-          useLiveData: USE_LIVE_DATA_PROPERTY,
         },
         required: ['query'],
         additionalProperties: false,
@@ -336,20 +333,20 @@ export function createStructureTools(
         const query = requiredString(args, 'query');
         const sectionId = optionalString(args, 'sectionId');
 
-        const answer = await readSourced(
+        const answer = await readSourced({
+          tool: 'search_pages',
           mirror,
-          'search_pages',
-          optionalBoolean(args, 'useLiveData') ?? false,
-          (reader) =>
+          sync,
+          fromMirror: (reader) =>
             reader.searchTitles(
               (title) => titleMatches(title, query),
               sectionId === undefined ? {} : { sectionId },
             ),
-          () =>
+          fromGraph: () =>
             sectionId === undefined
               ? searchAllSections(structure, query, searchOptions)
               : searchOneSection(structure, sectionId, query, searchOptions),
-        );
+        });
 
         const common = {
           query,
@@ -358,7 +355,7 @@ export function createStructureTools(
           ...sourcePayload(answer),
         };
 
-        if (answer.source === 'graph') {
+        if (answer.origin === 'graph') {
           const result = answer.data;
           return jsonResult({
             ...common,
@@ -414,7 +411,6 @@ export function createStructureTools(
             type: 'string',
             description: 'The page title, matched in full and case-insensitively.',
           },
-          useLiveData: USE_LIVE_DATA_PROPERTY,
         },
         required: ['notebookName', 'sectionName', 'pageTitle'],
         additionalProperties: false,
@@ -426,9 +422,9 @@ export function createStructureTools(
 
         const answer = await resolveAndList(
           mirror,
+          sync,
           structure,
           'find_page_by_name',
-          optionalBoolean(args, 'useLiveData') ?? false,
           path,
           // Graph does the title comparison, case-insensitively, so no bound on how many
           // pages the section holds can hide a match. The mirror applies the same rule
@@ -476,7 +472,6 @@ export function createStructureTools(
             maximum: TOP_RANGE.max,
             description: `How many pages to return. Defaults to ${DEFAULT_TOP}.`,
           },
-          useLiveData: USE_LIVE_DATA_PROPERTY,
         },
         required: ['notebookName', 'sectionName'],
         additionalProperties: false,
@@ -488,9 +483,9 @@ export function createStructureTools(
 
         const answer = await resolveAndList(
           mirror,
+          sync,
           structure,
           'list_pages_by_name',
-          optionalBoolean(args, 'useLiveData') ?? false,
           path,
           (sectionId) => structure.listPagesInSection(sectionId, top),
           (reader, sectionId) =>
@@ -607,8 +602,8 @@ function mirrorSearchNote(found: MirroredSearch, returned: number): string {
     const unsearched = found.notebooksInAccount - found.notebooksSearched;
     parts.push(
       `Only ${found.notebooksSearched} of ${found.notebooksInAccount} notebooks have their ` +
-        `pages held locally, so pages in the other ${unsearched} were not searched. Pass ` +
-        'useLiveData true to search OneNote directly.',
+        `pages held locally, so pages in the other ${unsearched} were not searched. Give ` +
+        'sectionId to search one of them directly in OneNote.',
     );
   } else {
     parts.push('Every notebook in the account was searched.');
@@ -652,9 +647,9 @@ function sourcePayload(answer: Sourced<unknown, unknown>): Record<string, unknow
  */
 async function resolveAndList(
   mirror: MirrorReader | undefined,
+  sync: ReadSync | undefined,
   structure: StructureClient,
   tool: string,
-  forceGraph: boolean,
   path: NamePath,
   listFromGraph: (sectionId: string) => Promise<PageSummary[]>,
   listFromMirror: (reader: MirrorReader, sectionId: string) => Promise<PageSummary[] | null>,
@@ -664,19 +659,19 @@ async function resolveAndList(
     return { resolved, pages: await listFromGraph(resolved.section.id) };
   };
 
-  const sourced = await readSourced(
-    mirror,
+  const sourced = await readSourced({
     tool,
-    forceGraph,
-    async (reader) => {
+    mirror,
+    sync,
+    fromMirror: async (reader) => {
       // A NameLookupError propagates out of readSourced's try, which turns it into a
       // fallback rather than an answer. That is the retry.
       const resolved = await resolveSection(mirrorLookupStructure(reader), path);
       const pages = await listFromMirror(reader, resolved.section.id);
       return pages === null ? null : { resolved, pages };
     },
-    viaGraph,
-  );
+    fromGraph: viaGraph,
+  });
 
   return { resolved: sourced.data.resolved, pages: sourced.data.pages, sourced };
 }

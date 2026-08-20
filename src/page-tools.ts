@@ -18,6 +18,13 @@
 // A page with no ink yields no image block. That is the normal answer for a typed page
 // and is not an error; the JSON says `inkImage: null` so the model is not left guessing
 // whether an image was meant to arrive.
+//
+// **This is the one covered tool that never reports `source: "mirror"`.** A page document
+// carries its own `contentState`, every write marks its page stale before it touches
+// OneNote, and `MirrorReader.getPageContent` answers null for anything but `present` — so
+// a mirror hit here is a page nothing has superseded, and it is reported as OneNote's
+// content whether or not the account-wide refresh finished. `mirroredAt` still says when
+// the copy was taken.
 
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 
@@ -29,13 +36,9 @@ import {
   type InkImage,
 } from './ink.ts';
 import type { PageContent } from './page-content.ts';
-import { optionalBoolean, requiredString, type ToolDefinition } from './mcp-tools.ts';
-import {
-  USE_LIVE_DATA_PROPERTY,
-  readSourced,
-  type MirrorReader,
-  type MirrorSource,
-} from './mirror-reader.ts';
+import { requiredString, type ToolDefinition } from './mcp-tools.ts';
+import { readSourced, type MirrorReader, type MirrorSource } from './mirror-reader.ts';
+import type { ReadSync } from './read-sync.ts';
 
 /** This tool reads; it does not write. */
 const READ_ONLY: Tool['annotations'] = { readOnlyHint: true, openWorldHint: true };
@@ -65,6 +68,7 @@ export function createPageTools(
   content: PageContentClient,
   maxBytes: number = MAX_INK_PNG_BYTES,
   mirror?: MirrorReader,
+  sync?: ReadSync,
 ): ToolDefinition[] {
   return [
     {
@@ -86,7 +90,6 @@ export function createPageTools(
             type: 'string',
             description: 'A page id from list_pages or search_pages.',
           },
-          useLiveData: USE_LIVE_DATA_PROPERTY,
         },
         required: ['pageId'],
         additionalProperties: false,
@@ -99,14 +102,20 @@ export function createPageTools(
         // hit costs no Graph request. A page it does not hold, one a write has marked
         // stale, and one whose stored content went missing are all misses and go to
         // Graph — see MirrorReader.getPageContent.
-        const answer = await readSourced(
+        //
+        // `staleTracked` is set here and on no other tool. A page carries its own
+        // `contentState`, every write marks its page stale before it touches OneNote, and
+        // a hit is by construction a page nothing has superseded — so this answer is
+        // OneNote's content whether or not the account-wide refresh finished.
+        const answer = await readSourced({
+          tool: 'get_page_content',
           mirror,
-          'get_page_content',
-          optionalBoolean(args, 'useLiveData') ?? false,
-          (reader) => reader.getPageContent(pageId),
-          () => content.fetchContent(pageId),
-          (reader) => reader.syncedAt(pageId),
-        );
+          sync,
+          staleTracked: true,
+          fromMirror: (reader) => reader.getPageContent(pageId),
+          fromGraph: () => content.fetchContent(pageId),
+          mirroredAt: (reader) => reader.syncedAt(pageId),
+        });
 
         const page = answer.data;
         const ink = page.ink === null ? null : fitInkToByteBudget(page.ink, maxBytes);
@@ -121,7 +130,7 @@ export function pageResult(
   pageId: string,
   html: string | null,
   ink: InkImage | null,
-  source: MirrorSource = 'graph',
+  source: MirrorSource = 'onenote',
   mirroredAt?: string,
 ): CallToolResult {
   const summary = ink === null ? null : summarise(ink);
@@ -136,7 +145,7 @@ export function pageResult(
           inkImage: summary,
           source,
           ...(mirroredAt === undefined ? {} : { mirroredAt }),
-          note: note(html, summary, source, mirroredAt),
+          note: note(html, summary, mirroredAt),
         },
         null,
         2,
@@ -178,19 +187,16 @@ function summarise(ink: InkImage): InkImageSummary {
 function note(
   html: string | null,
   ink: InkImageSummary | null,
-  source: MirrorSource,
   mirroredAt: string | undefined,
 ): string {
   const parts: string[] = [];
 
   // Said in prose as well as in a field, so a model that ignores keys it does not
-  // recognise still learns the answer may be minutes old.
-  if (source === 'mirror') {
-    parts.push(
-      "Answered from this server's local copy" +
-        (mirroredAt === undefined ? '' : `, last synced ${mirroredAt}`) +
-        '. Pass useLiveData true for a direct read from OneNote.',
-    );
+  // recognise still learns the page was read from a stored copy and when it was taken.
+  // There is no warning to attach to it: see the note at the top of this file about why
+  // this tool never reports `source: "mirror"`.
+  if (mirroredAt !== undefined) {
+    parts.push(`Served from this server's local copy of the page, last synced ${mirroredAt}.`);
   }
 
   if (html === null) {

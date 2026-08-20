@@ -655,6 +655,13 @@ one per page, so a notebook set holding a few thousand pages is ten hours or mor
 slices. Start on `*/20`, and move to `*/15` once `sync/state.backfillComplete` is true and
 runs are answering `outcome: complete` in a couple of requests.
 
+**With `MIRROR_READ_ENABLED=true` the read tools add a third term to that product.** Each
+one refreshes the mirror before it reads — see **Reading from it** below — at up to 12
+requests per refresh and no more than one refresh per 30 seconds, so a continuously busy
+conversation adds roughly 120 requests an hour on a quiet account and up to 144 while the
+mirror is behind. Leave headroom for it: during a backfill that means `*/20` with a budget
+of 100, not `*/15` with 120.
+
 ### Setting it up
 
 ```bash
@@ -755,17 +762,49 @@ shared request gate, which is the failure that gets the whole account throttled.
 
 `MIRROR_READ_ENABLED` is the switch. With it `false` — the default — every tool answers
 from Microsoft Graph exactly as it did before the mirror existed. With it `true`, seven
-tools try the local copy first and fall back to Graph on anything they do not hold:
-`list_notebooks`, `list_sections`, `list_pages`, `list_pages_by_name`,
-`find_page_by_name`, `get_page_content` and `search_pages`.
+tools go through the local copy: `list_notebooks`, `list_sections`, `list_pages`,
+`list_pages_by_name`, `find_page_by_name`, `get_page_content` and `search_pages`.
 
-Every one of them reports `source` as `mirror` or `graph`, and a mirrored answer carries
-`mirroredAt`. Every one also takes `useLiveData: true`, which skips the local copy for
-that call — the argument to pass when you need an edit made in the last few minutes.
+**Each of those reads is three steps, in this order.**
+
+1. **Refresh.** The tool runs an incremental sync itself — the same `runIncremental` the
+   scheduled `POST /sync` runs, with smaller budgets: 12 OneNote requests and 15 seconds.
+2. **Read the local copy.** A hit costs no OneNote request. A miss falls through to
+   Microsoft Graph, exactly as before.
+3. **Report the source.** `source` is `onenote` when the answer equals what OneNote holds,
+   and `mirror` when it may be behind.
+
+The `source` rule in full:
+
+| Situation | `source` |
+|---|---|
+| The read fell through to Microsoft Graph | `onenote` |
+| A local hit, and the refresh in step 1 finished | `onenote` |
+| A local hit of a single page that no write has marked stale | `onenote` |
+| A local hit, and the refresh did not finish | `mirror` |
+
+A refresh "finished" means it read the notebook tree, visited every section it needed,
+fetched every page it needed, and ran out of neither budget. Anything else — the request
+or time budget ran out, the tree read 500'd, a page fetch failed, the scheduler held the
+sync lease, Firestore did not answer — is `mirror`, and the answer carries `mirroredAt`
+saying when the copy was taken. `get_page_content` is the exception in the table: a page
+document carries its own staleness flag and every write marks its page stale before it
+touches OneNote, so a hit there is a page nothing has superseded.
+
+**A refresh does not run on every call.** A finished one holds for 30 seconds and an
+unfinished one for 5 minutes, so a burst of tool calls pays for one refresh rather than
+thirty. The worst case is about 120 extra OneNote requests an hour from a continuously
+busy conversation on a quiet account, against the limit of 400 — and a refresh on a quiet
+account is a single request, the notebook tree.
+
+There is no per-call argument to force a live read. There used to be (`useLiveData`); it
+is gone, because a read that refreshes first and then says whether the refresh finished
+answers the same question without a schema field the calling model has to reason about.
 
 Turning it off is a complete rollback: set the variable to `false`, redeploy, and the
-tools are byte-identical to their pre-mirror behaviour. No data migration, and the mirror
-keeps filling in the background.
+tools are byte-identical to their pre-mirror behaviour. No refresh runs, no tool call
+spends a request on a sync, and every answer says `source: "onenote"`. No data migration,
+and the mirror keeps filling in the background.
 
 **Writes resync their page immediately.** All five writing tools re-read the page from
 OneNote after a successful write and store it, so a `get_page_content` straight after an
@@ -787,7 +826,9 @@ walks sections and stops at 60 of them or 25 seconds, so it reports `sectionsSea
 `sectionsFound` and `stoppedEarly`. Answered from the mirror there is no walk and no
 bound — but page content is held only for the notebooks in your selection, so it reports
 `notebooksSearched` against `notebooksInAccount` instead, and says so in its note when
-they differ. A model reading "no matches" needs to know which of those it got.
+they differ. A model reading "no matches" needs to know which of those it got. To search a
+notebook outside the selection, pass `sectionId`: that misses in the local copy and walks
+the one section in OneNote.
 
 ### When a run overruns
 
@@ -975,7 +1016,7 @@ missing, rather than deploying half-configured.
 | `MCP_TOKEN_SIGNING_KEY` | **secret** | Access-token signing key, at least 32 characters |
 | `MCP_KEEPALIVE_SECRET` | **secret** | Optional; unset means `POST /keepalive` is not mounted |
 | `MIRROR_BUCKET` | variable | Optional; the page mirror's Cloud Storage bucket. `scripts/gcp-bootstrap.sh` prints the name it created |
-| `MIRROR_READ_ENABLED` | variable | Optional; defaults to `false`. The switch that makes read tools use the mirror |
+| `MIRROR_READ_ENABLED` | variable | Optional; defaults to `false`. The switch that makes read tools refresh and use the mirror |
 | `MIRROR_ROOT_DOC` | variable | Optional; defaults to `onenoteMirror/default` |
 | `MIRROR_SYNC_REQUEST_BUDGET` | variable | Optional; defaults to `120` |
 | `MIRROR_SYNC_SECRET` | **secret** | Optional; unset means `POST /sync` is not mounted |
@@ -1038,7 +1079,7 @@ and the process exits 1 without a stack trace.
 | `MIRROR_ROOT_DOC` | no | `onenoteMirror/default` | Firestore document holding the hand-edited list of notebook ids to mirror. Its subcollections are the mirror. Document path, even segment count, same rule as `FIRESTORE_CACHE_DOC`. |
 | `MIRROR_SYNC_SECRET` | no | — | At least 32 characters. Set it and `POST /sync` is mounted; leave it unset and the path 404s. |
 | `MIRROR_BUCKET` | conditionally | — | Cloud Storage bucket for rendered ink and oversized page HTML. Required once `MIRROR_SYNC_SECRET` or `MIRROR_READ_ENABLED` is set; see below. |
-| `MIRROR_READ_ENABLED` | no | `false` | `true` or `false`, nothing else. When true the read tools answer from the mirror and fall back to Graph on a miss. |
+| `MIRROR_READ_ENABLED` | no | `false` | `true` or `false`, nothing else. When true the read tools refresh the mirror, answer from it, and fall back to Graph on a miss. |
 | `MIRROR_SYNC_REQUEST_BUDGET` | no | `120` | Graph requests one sync run may spend before it stops and reports more outstanding. 10–350, against an hourly limit of 400. |
 
 The five `MIRROR_*` variables configure the Firestore page mirror. All are optional, so a
