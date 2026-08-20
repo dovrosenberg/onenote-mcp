@@ -476,20 +476,19 @@ function harness(
 
   // A harness starts in the steady state: the stored structure already matches the
   // account, so `reconcileStructure` reads the tree and writes nothing. Deleting this
-  // block fails ten tests, for three separate reasons, and the first is the one it is
-  // here for:
+  // block fails several tests, for two reasons:
   //
-  // 1. `mayFilterByTimestamp` is `treeRead && !rewritten`, so a run that writes the
-  //    structure has the timestamp filter switched off — and every test about which
-  //    sections are candidates would then pass with the thing it tests disabled.
-  // 2. A structure write happening at all is visible: it counts `structures`, patches
+  // 1. A structure write happening at all is visible: it counts `structures`, patches
   //    `structureHash`, and a test asserting a quiet run wrote nothing sees it.
-  // 3. A seeded document the incoming tree does not name is deleted. Merging protects the
+  // 2. A seeded document the incoming tree does not name is deleted. Merging protects the
   //    sync-owned fields of a document the tree still holds; it does nothing for one the
   //    tree has dropped, and `treeFrom` describes `NB` alone.
   //
-  // A test that wants a structure rewrite says so by seeding a `structureHash` that does
-  // not match.
+  // What it seeds is the hash of the tree under **this** test's selection, which is the
+  // state a run leaves behind, not the state one starts from when the selection has just
+  // been edited. A test about a selection change has to seed the hash the *previous*
+  // selection left, or it asserts against a state the running system cannot be in — the
+  // structure write and the selection record happen one line apart in the same pass.
   if (data.state.structureHash === null && typeof tree !== 'function') {
     data.state = {
       ...data.state,
@@ -1541,7 +1540,15 @@ test('adding one notebook to the selection widens that notebook and lists no oth
     {
       selection: sel([NB, NB2]),
       sections: staleSections(),
-      state: seenState({ mirroredNotebookIdsSeen: [NB], activeNotebookIdsSeen: null }),
+      state: seenState({
+        mirroredNotebookIdsSeen: [NB],
+        activeNotebookIdsSeen: null,
+        // The hash the *previous* selection left behind. The harness would otherwise seed
+        // the hash of the new one, which says the structure was already written under a
+        // selection the last run had not seen — two writes one line apart in the same
+        // pass, so that state exists only if the process died between them.
+        structureHash: structureHashOf(buildStructure(TWO_NOTEBOOKS, sel([NB]))),
+      }),
     },
   );
 
@@ -1584,7 +1591,11 @@ test('removing a notebook from either list widens nothing', async () => {
     {
       selection: sel([NB]),
       sections: staleSections(),
-      state: seenState({ mirroredNotebookIdsSeen: [NB, NB2], activeNotebookIdsSeen: null }),
+      state: seenState({
+        mirroredNotebookIdsSeen: [NB, NB2],
+        activeNotebookIdsSeen: null,
+        structureHash: structureHashOf(buildStructure(TWO_NOTEBOOKS, sel([NB, NB2]))),
+      }),
     },
   );
   await runIncremental(dropped.deps, BUDGET);
@@ -1652,6 +1663,88 @@ test('a budget-stopped run keeps the wide-scan set; a completed one clears it', 
     ),
     true,
     'and a run that visited every candidate does clear it',
+  );
+});
+
+test('a run that read no tree records no selection, so the next one still widens', async () => {
+  // `mirroredNotebookIds` is empty when the tree read did not happen, so an
+  // `activeNotebookIds` of `null` would resolve to "nothing is active", widen nothing, and
+  // still record `activeNotebookIdsSeen: null`. The next healthy run would then diff null
+  // against null and the unfrozen notebook would stay below the cutoff for ever.
+  const seeded = {
+    selection: sel([NB, NB2]),
+    sections: staleSections(),
+    state: seenState({ mirroredNotebookIdsSeen: [NB, NB2], activeNotebookIdsSeen: [NB] }),
+  };
+
+  // Entry point one: the budget runs out before the tree read.
+  const broke = harness({ tree: TWO_NOTEBOOKS }, structuredClone(seeded));
+  await runIncremental(broke.deps, { requestBudget: 0 });
+  assert.equal(
+    broke.storeCalls.patches.some((p) => p.selectionSeen !== undefined),
+    false,
+    'nothing was recorded',
+  );
+  await runIncremental(broke.deps, BUDGET);
+  assert.deepEqual(broke.graphCalls.changedSince, ['sec-other'], 'so the next run widens');
+
+  // Entry point two: `getExpandedTree` answers the 500 measured on 2026-08-19.
+  let failed = true;
+  const flaky = harness(
+    {
+      tree: () => {
+        if (failed) throw graphError(500);
+        return TWO_NOTEBOOKS;
+      },
+    },
+    structuredClone(seeded),
+  );
+  // A thunked tree skips the harness's steady-state seeding, so the hash the previous
+  // selection left has to be seeded by hand.
+  flaky.data.state = {
+    ...flaky.data.state,
+    structureHash: structureHashOf(buildStructure(TWO_NOTEBOOKS, sel([NB, NB2]))),
+  };
+
+  await runIncremental(flaky.deps, BUDGET);
+  assert.equal(
+    flaky.storeCalls.patches.some((p) => p.selectionSeen !== undefined),
+    false,
+  );
+  // A failed tree read leaves the stored timestamps stale, so that run visited every
+  // section — which is the existing rule and not the widening. Only the second run's calls
+  // say anything about this test.
+  flaky.graphCalls.changedSince.length = 0;
+
+  failed = false;
+  await runIncremental(flaky.deps, BUDGET);
+  assert.deepEqual(flaky.graphCalls.changedSince, ['sec-other']);
+});
+
+test('a scoped sweep visits a widened notebook, and does not clear the set', async () => {
+  // The sweep is what reconciles page ids, so a widened notebook it skipped would leave
+  // pages deleted while it was frozen in the mirror with nothing to notice them. It reads
+  // the set and never clears it: only a completed incremental run has visited what the
+  // widening is for.
+  const h = harness(
+    { tree: TWO_NOTEBOOKS, ids: { 'sec-other': [], 'sec-1': [] } },
+    {
+      selection: sel([NB, NB2], [NB, NB2]),
+      sections: staleSections(),
+      state: seenState({
+        mirroredNotebookIdsSeen: [NB, NB2],
+        activeNotebookIdsSeen: [NB, NB2],
+        wideScanNotebookIds: [NB2],
+      }),
+    },
+  );
+
+  await runSweep(h.deps, BUDGET);
+
+  assert.deepEqual(h.graphCalls.pageIds, ['sec-other']);
+  assert.equal(
+    h.storeCalls.patches.some((p) => p.wideScanNotebookIds !== undefined),
+    false,
   );
 });
 

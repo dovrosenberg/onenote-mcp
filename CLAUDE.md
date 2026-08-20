@@ -1056,6 +1056,19 @@ which is one global value: activating one notebook made every mirrored active se
 candidate, about 70 listing requests on this account against an hourly budget of 400 for a
 change that concerned one notebook. Nothing here touches `sectionsScannedThrough` any more.
 
+**`mayFilterByTimestamp` is `treeRead` alone, and the `!rewritten` it used to carry was the
+same bug through a second door.** `notebookIdentity` carries `mirrored`, so editing
+`notebookIds` moves the structure hash — and `pickCandidates` returned every observed
+section on a moved hash, before the wide-scan clause was evaluated. Each reason a structure
+change used to need a wide pass now has a narrower rule: a section the tree just gained is
+created with `pagesSyncedThrough: null`, a renamed or moved one keeps a watermark no
+structure write touches and its pages did not change, and a section whose notebook just
+became mirrored or active is the wide-scan set's job. One case is knowingly uncovered and
+the docstring on `pickCandidates` names it — a section moved into a mirrored notebook out
+of one that *used* to be mirrored keeps a stale watermark that nothing widens. Covering it
+exactly means `putStructure` returning the ids of the documents whose identity moved, so
+the widening is per section rather than per notebook.
+
 Only *candidacy* is widened. Each named notebook's sections still list against their own
 `pagesSyncedThrough`, which no part of this touches, so a widened section costs one
 `listPagesChangedSince` and re-fetches only the pages that actually changed. The set is
@@ -1064,7 +1077,11 @@ budget-bounded and may stop with sections outstanding; it is cleared in the same
 advances `sectionsScannedThrough` and on exactly that condition, because a run stopped by
 its budget has not visited what it was widened for. `sweepPass` reads the set and never
 clears it — a sweep reconciles page ids rather than resuming a watermark, so it is not what
-the widening is waiting for.
+the widening is waiting for. A run that read no tree records nothing at all:
+`mirroredNotebookIds` is empty there, so an `activeNotebookIds` of `null` would resolve to
+"nothing is active", widen nothing, and still record `activeNotebookIdsSeen: null` — and
+the next healthy run would diff `null` against `null` and never widen the notebook the
+operator just unfroze.
 
 Removal widens nothing and is still recorded, and those are two separate rules.
 `notebooksNeedingWideScan` returns `[]` for a notebook dropped from either list, because

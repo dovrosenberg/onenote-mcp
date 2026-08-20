@@ -549,7 +549,7 @@ async function incrementalPass(ctx: PassContext): Promise<void> {
 
   const candidates = pickCandidates(eligible, structure.liveMtimes, {
     state: ctx.state,
-    mayFilterByTimestamp: ctx.tally.treeRead && !structure.rewritten,
+    mayFilterByTimestamp: ctx.tally.treeRead,
     wideScanNotebookIds,
   });
 
@@ -587,14 +587,6 @@ export type SectionMtimes = ReadonlyMap<string, string | null>;
  * failed.
  */
 interface StructureResult {
-  /**
-   * True when the tree hash moved and `putStructure` ran.
-   *
-   * Not "documents were written": the hash covers the whole account and the plan may still
-   * write nothing, because whether any single document changes is decided per document by
-   * its `identity`. The consumer wants the hash-moved meaning — see `pickCandidates`.
-   */
-  readonly rewritten: boolean;
   readonly liveMtimes: SectionMtimes;
   /**
    * The selected notebooks the tree returned, which is not `selection.notebookIds`: an id
@@ -614,7 +606,6 @@ interface StructureResult {
  */
 async function reconcileStructure(ctx: PassContext): Promise<StructureResult> {
   const none: StructureResult = {
-    rewritten: false,
     liveMtimes: new Map(),
     mirroredNotebookIds: [],
   };
@@ -661,12 +652,12 @@ async function reconcileStructure(ctx: PassContext): Promise<StructureResult> {
 
   const hash = structureHashOf(built);
   if (hash === ctx.state.structureHash) {
-    return { rewritten: false, liveMtimes, mirroredNotebookIds };
+    return { liveMtimes, mirroredNotebookIds };
   }
 
   await ctx.deps.store.putStructure(built);
   await ctx.deps.store.patchSyncState({ structureHash: hash });
-  return { rewritten: true, liveMtimes, mirroredNotebookIds };
+  return { liveMtimes, mirroredNotebookIds };
 }
 
 /**
@@ -693,12 +684,27 @@ async function reconcileStructure(ctx: PassContext): Promise<StructureResult> {
  * `selectionSeen` false is a state document written before these fields existed rather
  * than a change to the lists. Recording them is the whole job there; widening instead
  * would make the first run after the deploy a full-width scan.
+ *
+ * A run that read no tree records nothing, and that is not tidiness. `mirroredNotebookIds`
+ * is empty on such a run — the budget ran out before the read, or `getExpandedTree`
+ * answered the 500 measured on 2026-08-19 — so the `activeNotebookIds === null` case would
+ * resolve "every mirrored notebook is active" to the empty set, find nothing newly active,
+ * and still write `activeNotebookIdsSeen: null`. The next healthy run would then diff
+ * `null` against `null`, find nothing, and the notebook the operator just unfroze would
+ * stay below the cutoff for ever. Recording is never urgent; the next run with a tree
+ * diffs correctly.
  */
 async function reconcileSelection(
   ctx: PassContext,
   mirroredNotebookIds: readonly string[],
 ): Promise<ReadonlySet<string>> {
   const carried = new Set(ctx.state.wideScanNotebookIds);
+  if (!ctx.tally.treeRead) return carried;
+
+  // Recorded from the selection document verbatim, while the `null` active list resolves
+  // through the tree. The two domains differ: an id naming no notebook is in the first and
+  // not the second, so a diff against it can only ever under-report, never widen something
+  // that does not exist.
   const recorded = {
     selectionSeen: true,
     mirroredNotebookIdsSeen: [...ctx.selection.notebookIds],
@@ -808,11 +814,10 @@ export function withLiveMtimes(
  * The three decisions `pickCandidates` makes its filter from, named at the call site.
  *
  * An options object rather than three more positional parameters. A `ReadonlySet<string>`
- * beside a `boolean` and a state object has no self-evident order, and both call sites
- * pass a computed expression for `mayFilterByTimestamp` — `treeRead && !rewritten` in one
- * and `treeRead` in the other — which is only legible next to the name it is answering.
- * `sections` and `live` stay positional because they are the data being filtered and the
- * overlay applied to it, and their types say which is which.
+ * beside a `boolean` and a state object has no self-evident order, and a bare `true` at a
+ * call site says nothing about which question it answers. `sections` and `live` stay
+ * positional because they are the data being filtered and the overlay applied to it, and
+ * their types say which is which.
  */
 export interface CandidateOptions {
   readonly state: MirrorSyncState;
@@ -829,19 +834,33 @@ export interface CandidateOptions {
  * overlay would filter on stored values that only move when the structure is rewritten,
  * and the sync would go blind an hour after the last rewrite with nothing to say so.
  *
- * `mayFilterByTimestamp` is not "the timestamps are fresh": they are fresh whenever a tree
- * read succeeded, rewrite or not. It means the filter may be applied at all, which needs a
- * tree read **and** an unchanged tree shape. A rewrite disables it because the filter is a
- * comparison against `sectionsScannedThrough`, and a changed tree may hold sections that
- * cutoff never covered — one created or moved into the selection since the last run, whose
- * timestamp is older than a cutoff that was never applied to it. One pass ignoring the
- * filter settles every such section without anything having to work out which they are.
- * Watermarks are not the reason: a created section gets `pagesSyncedThrough: null` from
- * `NEW_SECTION_DEFAULTS` and is a candidate whatever the clock says, and a renamed or
- * moved one keeps a watermark that no structure write touches.
- * The incremental pass therefore passes `treeRead && !rewritten`; the sweep passes
- * `treeRead` alone, because a sweep reconciles page ids against what the tree just said
- * rather than resuming a watermark.
+ * `mayFilterByTimestamp` means the timestamps compared are this run's rather than a stored
+ * copy that has frozen, so both call sites pass `ctx.tally.treeRead` and nothing else.
+ *
+ * It used to be `treeRead && !structure.rewritten` in the incremental pass, and that was
+ * the bug this replaced: `notebookIdentity` carries `mirrored`, so editing `notebookIds`
+ * moves the structure hash, and a moved hash returned every observed section here — before
+ * the wide-scan clause was reached at all. One notebook added to the selection therefore
+ * listed every mirrored active section in the account, which is what the per-notebook set
+ * exists to stop.
+ *
+ * Each reason a structure change used to need a wide pass is now covered by a narrower
+ * rule. A section the tree just gained is created with `pagesSyncedThrough: null` from
+ * `NEW_SECTION_DEFAULTS`, so the null-watermark clause below takes it. A renamed or moved
+ * section keeps a watermark no structure write touches, and its pages did not change. A
+ * section whose notebook just became mirrored or active is the wide-scan set's job. A
+ * section moved out of a notebook that was never mirrored has never been synced, so its
+ * watermark is null.
+ *
+ * One case is knowingly not covered: a section moved into a mirrored notebook out of one
+ * that *used* to be mirrored keeps a stale non-null watermark, and the notebook it landed
+ * in is not newly mirrored, so nothing widens it. It needs an operator to drop a notebook
+ * from the selection and then move a section out of it in the OneNote client. Page creates
+ * and deletes there are repaired by the weekly `sweep-full`, which applies no timestamp
+ * filter; a page *edited* in that window waits until something next moves the section's
+ * timestamp. Covering it exactly means `putStructure` returning the ids of the section
+ * documents whose identity moved, so the widening is per section rather than per notebook.
+ * That is a change to `SyncStore` and to a module with no test, and it is not this one.
  *
  * Two sections are always candidates whatever the clock says: one never synced
  * (`pagesSyncedThrough === null`), and one Graph reports no timestamp for — "the field is
