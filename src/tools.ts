@@ -17,8 +17,15 @@ import type { ToolDefinition } from './mcp-tools.ts';
 import { createMirrorBlobStore } from './mirror-blobs.ts';
 import { MirrorReader } from './mirror-reader.ts';
 import { createMirrorStore } from './mirror-store.ts';
-import type { MirrorInvalidator } from './write-tools.ts';
-import { runFullSweep, runIncremental, runSweep, type SyncDeps } from './mirror-sync.ts';
+import type { MirrorWriteSync } from './write-tools.ts';
+import {
+  resyncPage,
+  runFullSweep,
+  runIncremental,
+  runSweep,
+  type SyncContent,
+  type SyncDeps,
+} from './mirror-sync.ts';
 import { createGraphPageContent } from './page-content.ts';
 import { createPageTools } from './page-tools.ts';
 import { createGraphPageWrite } from './page-write.ts';
@@ -82,26 +89,44 @@ export function createMirrorReaderFor(config: Config): MirrorReader | undefined 
 }
 
 /**
- * The invalidator the write tools call after a successful write.
+ * What the write tools call after a successful write.
  *
  * Bound whenever a mirror exists at all, not only when reads are enabled: a mirror being
- * filled by the sync while `MIRROR_READ_ENABLED` is false still holds copies that a write
- * supersedes, and marking them stale then is what makes turning reads on later safe
+ * filled by the sync while `MIRROR_READ_ENABLED` is false still holds copies a write
+ * supersedes, and keeping them current then is what makes turning reads on later safe
  * rather than a race with whatever was written in between.
+ *
+ * It shares the Graph content client with the read tools, so a resync runs through the
+ * same process-wide request gate every other Graph call does — a write burst cannot
+ * outrun the per-user rate limit by going through this path.
  */
-export function createMirrorInvalidatorFor(config: Config): MirrorInvalidator | undefined {
+export function createMirrorWriteSyncFor(
+  config: Config,
+  auth: GraphAuth,
+  content: SyncContent,
+): MirrorWriteSync | undefined {
   const mirror = config.mirror;
   const firestore = config.firestore;
   if (mirror === undefined || firestore === undefined) return undefined;
   if (mirror.syncSecret === undefined && !mirror.readEnabled) return undefined;
+  if (mirror.bucket === undefined) return undefined;
 
-  return createMirrorStore(firestoreFor(firestore), mirror.rootDocumentPath);
+  const store = createMirrorStore(firestoreFor(firestore), mirror.rootDocumentPath);
+  const blobs = createMirrorBlobStore(mirror.bucket, firestore.projectId);
+  const deps = { store, blobs, content };
+
+  return {
+    resyncPage: async (pageId, hint) => {
+      await resyncPage(deps, pageId, hint);
+    },
+    markPageStale: (pageId) => store.markPageStale(pageId),
+  };
 }
 
 export function createTools(
   auth: GraphAuth,
   mirror?: MirrorReader,
-  invalidator?: MirrorInvalidator,
+  writeSync?: MirrorWriteSync,
 ): ToolDefinition[] {
   // One page-content client serves both the reading tool and `append_to_page`, which
   // reads a page's layout before it writes so its content does not land on handwriting.
@@ -117,10 +142,10 @@ export function createTools(
     // stays the source of truth; the mirror is a copy that the sync refreshes.
     ...createStructureTools(structure, {}, mirror),
     ...createPageTools(content, undefined, mirror),
-    // The mirror reaches the write tools only as an invalidator: a successful write
-    // marks its page stale so the next read goes to Graph rather than serving the copy
-    // the write just superseded.
-    ...createWriteTools(createGraphPageWrite(auth), content, structure, invalidator),
+    // The mirror reaches the write tools only as a write-sync: a successful write
+    // re-reads its page from Graph and stores it, so the next read answers with what was
+    // just written rather than falling through until the next scheduled run.
+    ...createWriteTools(createGraphPageWrite(auth), content, structure, writeSync),
   ];
 }
 

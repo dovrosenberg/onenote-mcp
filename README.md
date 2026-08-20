@@ -766,6 +766,13 @@ Turning it off is a complete rollback: set the variable to `false`, redeploy, an
 tools are byte-identical to their pre-mirror behaviour. No data migration, and the mirror
 keeps filling in the background.
 
+**Writes resync their page immediately.** All five writing tools re-read the page from
+OneNote after a successful write and store it, so a `get_page_content` straight after an
+`append_to_page` answers from the local copy with the text that was just added. That
+costs one extra OneNote request per write. If the resync fails the page is marked stale
+instead, which sends the next read to OneNote — slower, but never wrong — and the next
+scheduled sync repairs it either way. A failed resync never fails the write.
+
 Two things to check before turning it on:
 
 - **All four composite indexes read `READY`.** A query against one still `CREATING` fails

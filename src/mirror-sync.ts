@@ -679,10 +679,62 @@ async function storePage(
   summary: PageSummary,
   raw: RawPageContent,
 ): Promise<boolean> {
+  const written = await writePageFromRaw(
+    { store: ctx.deps.store, blobs: ctx.deps.blobs },
+    placementOf(section),
+    summary,
+    raw,
+    () => {
+      ctx.tally.pagesFailed += 1;
+    },
+  );
+  return written;
+}
+
+/** Where a page sits, denormalised onto its document so no query needs a join. */
+export interface PagePlacement {
+  readonly sectionId: string;
+  readonly notebookId: string;
+  readonly sectionPath: string;
+}
+
+function placementOf(section: MirrorSection): PagePlacement {
+  return {
+    sectionId: section.id,
+    notebookId: section.notebookId,
+    sectionPath: section.path,
+  };
+}
+
+/** The narrow slice both the sync and a post-write resync write through. */
+export interface PageWriteDeps {
+  readonly store: Pick<SyncStore, 'getPage' | 'putPage'>;
+  readonly blobs: MirrorBlobWriter;
+}
+
+/**
+ * Store one page from a raw content response. The one place a page document is built.
+ *
+ * Shared by the sync and by the resync a write tool triggers, deliberately: a second copy
+ * that skipped the ink render, or spilled at a different threshold, would produce mirror
+ * documents that differ depending on which path last touched them — and the difference
+ * would only show up as a wrong answer to a model days later.
+ *
+ * `onInkFailure` exists because the sync counts a failed render into its report and a
+ * resync has no report to count into. Neither treats it as fatal: most pages are typed,
+ * and a page with unrenderable ink is still worth mirroring for its text.
+ */
+export async function writePageFromRaw(
+  deps: PageWriteDeps,
+  placement: PagePlacement,
+  summary: PageSummary,
+  raw: RawPageContent,
+  onInkFailure: () => void = () => {},
+): Promise<boolean> {
   const html = pageHtml(raw) ?? '';
   const hash = createHash('sha256').update(html).digest('hex');
 
-  const stored = await ctx.deps.store.getPage(summary.id);
+  const stored = await deps.store.getPage(summary.id);
   if (stored !== null && stored.contentHash === hash && stored.contentState === 'present') {
     // The page's timestamp moved but its content did not — an ink stroke edited and
     // undone, a title change, or the watermark overlap re-reading a page already held.
@@ -690,27 +742,27 @@ async function storePage(
     return false;
   }
 
-  const ink = renderInkFor(ctx, summary.id, raw);
+  const ink = renderInkOrNull(summary.id, raw, onInkFailure);
   const bytes = utf8Bytes(html);
   const location = htmlPlacement(bytes);
 
   if (location === 'gcs') {
     logEvent('mirror-html-spilled', { pageId: summary.id, bytes });
-    await ctx.deps.blobs.putHtml(summary.id, html);
+    await deps.blobs.putHtml(summary.id, html);
   }
 
   if (ink !== null) {
-    await ctx.deps.blobs.putInk(summary.id, ink.image.png);
-    await ctx.deps.blobs.putInkml(summary.id, ink.inkml);
+    await deps.blobs.putInk(summary.id, ink.image.png);
+    await deps.blobs.putInkml(summary.id, ink.inkml);
   }
 
   const page: MirrorPage = {
     id: summary.id,
     title: summary.title,
     titleLower: summary.title.toLowerCase(),
-    sectionId: section.id,
-    notebookId: section.notebookId,
-    sectionPath: section.path,
+    sectionId: placement.sectionId,
+    notebookId: placement.notebookId,
+    sectionPath: placement.sectionPath,
     lastModifiedDateTime: summary.lastModifiedDateTime,
     contentState: 'present',
     contentHash: hash,
@@ -733,7 +785,7 @@ async function storePage(
   const content: MirrorPageContent | null =
     location === 'firestore' ? { pageId: summary.id, html, bytes, contentHash: hash } : null;
 
-  await ctx.deps.store.putPage(page, content);
+  await deps.store.putPage(page, content);
   return true;
 }
 
@@ -745,10 +797,10 @@ async function storePage(
  * for its text, and the alternative — failing the page — would mean the mirror silently
  * never holds it.
  */
-function renderInkFor(
-  ctx: PassContext,
+function renderInkOrNull(
   pageId: string,
   raw: RawPageContent,
+  onFailure: () => void,
 ): { image: ReturnType<typeof fitInkToByteBudget>; inkml: string } | null {
   try {
     const rendered = renderPageInkWithSource(raw);
@@ -756,7 +808,7 @@ function renderInkFor(
     return { image: fitInkToByteBudget(rendered.image), inkml: rendered.inkml };
   } catch (err) {
     logEvent('mirror-ink-failed', { pageId, reason: reasonOf(err) });
-    ctx.tally.pagesFailed += 1;
+    onFailure();
     return null;
   }
 }
@@ -902,4 +954,94 @@ function reasonOf(err: unknown): string {
   if (err instanceof GraphRequestError) return `graph-${err.status}`;
   if (err instanceof MirrorLeaseHeldError) return 'lease-held';
   return err instanceof Error ? err.name : 'unknown';
+}
+
+// ---------------------------------------------------------------------------
+// Resync after a write
+// ---------------------------------------------------------------------------
+
+/** What a write tool knows about the page it just changed, without re-reading metadata. */
+export interface ResyncHint {
+  /** Set by create_page and update_page_title; absent on an append, which cannot change it. */
+  readonly title?: string;
+  /** Set by the tools that name a section. Absent means "use the placement already stored". */
+  readonly sectionId?: string;
+}
+
+export interface ResyncDeps extends PageWriteDeps {
+  readonly content: SyncContent;
+  readonly store: Pick<SyncStore, 'getPage' | 'putPage' | 'deletePage'> & {
+    getSection(sectionId: string): Promise<MirrorSection | null>;
+  };
+  readonly now?: () => number;
+}
+
+export type ResyncOutcome = 'updated' | 'unchanged' | 'not-mirrored' | 'deleted';
+
+/**
+ * Re-read one page from Graph and store it, right after a write changed it.
+ *
+ * One Graph request, on top of the write itself. What it buys is that a read immediately
+ * after a write answers from the mirror with the new content, instead of falling through
+ * to Graph until the next sync run — which on a fifteen-minute schedule is a long window
+ * in the middle of a conversation.
+ *
+ * **It re-reads content and nothing else.** Measured 2026-08-19 and recorded in
+ * `api-overview.md`: a PATCH is visible to the next content read, at 3.7 seconds
+ * including both round trips — but page *metadata* is weaker, and
+ * `GET /pages/{id}?$select=title` returned `""` for pages created seconds earlier. So the
+ * title comes from the caller, which just set it or knows it did not change, and
+ * `lastModifiedDateTime` is stamped locally. Reading either back from Graph here would
+ * trade a correct value for an unreliable one.
+ *
+ * A page in a notebook the mirror does not hold is `not-mirrored` and costs no request:
+ * the write tools reach the whole account, and only the selection is mirrored.
+ */
+export async function resyncPage(
+  deps: ResyncDeps,
+  pageId: string,
+  hint: ResyncHint = {},
+): Promise<ResyncOutcome> {
+  const stored = await deps.store.getPage(pageId);
+
+  const sectionId = hint.sectionId ?? stored?.sectionId;
+  if (sectionId === undefined) return 'not-mirrored';
+
+  const section = await deps.store.getSection(sectionId);
+  if (section === null || !section.mirrored) return 'not-mirrored';
+
+  let raw: RawPageContent;
+  try {
+    raw = await deps.content.fetchRaw(pageId);
+  } catch (err) {
+    if (err instanceof GraphRequestError && err.status === 404) {
+      // Written and then deleted, or the id was wrong. Either way the mirror must not
+      // keep a copy of a page that is gone.
+      await deps.blobs.deleteForPage(pageId);
+      await deps.store.deletePage({
+        id: pageId,
+        sectionId: section.id,
+        notebookId: section.notebookId,
+        reason: 'not-found',
+      });
+      return 'deleted';
+    }
+    throw err;
+  }
+
+  const now = deps.now ?? Date.now;
+  const written = await writePageFromRaw(
+    deps,
+    placementOf(section),
+    {
+      id: pageId,
+      title: hint.title ?? stored?.title ?? '',
+      // Stamped locally rather than read back, for the reason above. It is within a
+      // second or two of what Graph recorded, and the next sync corrects it either way.
+      lastModifiedDateTime: new Date(now()).toISOString(),
+    },
+    raw,
+  );
+
+  return written ? 'updated' : 'unchanged';
 }

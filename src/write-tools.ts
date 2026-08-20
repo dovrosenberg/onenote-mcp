@@ -121,24 +121,29 @@ const NAME_PATH_PROPERTIES = {
 } as const;
 
 /**
- * Build the writing tools over a write client, the reader the appends use, and the
- * structure client the two `_by_name` tools resolve names through.
- */
-/**
  * What a successful write tells the mirror.
  *
- * One method, taking a page id. `MirrorStore` satisfies it; an absent invalidator means
- * no mirror is configured and there is nothing to invalidate.
+ * `resyncPage` re-reads the page from Graph and stores it, so the very next read answers
+ * from the mirror with what was just written rather than falling through to Graph until
+ * the next sync run. `markPageStale` is the fallback for when that fails: a stale marker
+ * makes the next read a miss, which is correct but slower.
+ *
+ * An absent object means no mirror is configured and there is nothing to tell.
  */
-export interface MirrorInvalidator {
+export interface MirrorWriteSync {
+  resyncPage(pageId: string, hint: { title?: string; sectionId?: string }): Promise<void>;
   markPageStale(pageId: string): Promise<void>;
 }
 
+/**
+ * Build the writing tools over a write client, the reader the appends use, and the
+ * structure client the two `_by_name` tools resolve names through.
+ */
 export function createWriteTools(
   write: PageWriteClient,
   layout: PageLayoutReader,
   lookup: WriteLookupStructure,
-  mirror?: MirrorInvalidator,
+  mirror?: MirrorWriteSync,
 ): ToolDefinition[] {
   return [
     {
@@ -276,6 +281,10 @@ export function createWriteTools(
         const htmlFragment = fragmentArgument(args, 'htmlFragment');
 
         const page = await write.createPage(sectionId, title, htmlFragment);
+        // sectionId is passed because the page is not in the mirror yet, so there is no
+        // stored placement to read it from. The title comes from the create response,
+        // which carries the right one — a metadata read here would not.
+        await resync(mirror, page.id, { title: page.title === '' ? title : page.title, sectionId });
 
         return jsonResult({
           pageId: page.id,
@@ -336,6 +345,10 @@ export function createWriteTools(
 
         const resolved = await resolveSection(lookup, path);
         const page = await write.createPage(resolved.section.id, title, htmlFragment);
+        await resync(mirror, page.id, {
+          title: page.title === '' ? title : page.title,
+          sectionId: resolved.section.id,
+        });
 
         return jsonResult({
           ...resolvedPayload(resolved),
@@ -389,7 +402,9 @@ export function createWriteTools(
         const newTitle = titleArgument(args, 'newTitle');
 
         await write.updatePageTitle(pageId, newTitle);
-        await invalidate(mirror, pageId);
+        // The title comes from here rather than from a read-back: measured 2026-08-19,
+        // page metadata read immediately after a write can come back empty.
+        await resync(mirror, pageId, { title: newTitle });
 
         return jsonResult({
           pageId,
@@ -415,13 +430,14 @@ async function append(
   layout: PageLayoutReader,
   pageId: string,
   htmlFragment: string,
-  mirror?: MirrorInvalidator,
+  mirror?: MirrorWriteSync,
 ): Promise<Record<string, unknown>> {
   const clearance = await inkClearance(layout, pageId);
   const content = clearance === null ? htmlFragment : clearanceHtml(clearance, htmlFragment);
 
   await write.appendToPage(pageId, content);
-  await invalidate(mirror, pageId);
+  // No title hint: an append cannot change one.
+  await resync(mirror, pageId, {});
 
   return {
     pageId,
@@ -567,25 +583,37 @@ function jsonResult(payload: unknown): CallToolResult {
 }
 
 /**
- * Tell the mirror its copy of this page is superseded.
+ * Bring the mirror's copy of this page up to date, right now.
  *
  * Called after a successful write and never before one: a page whose write failed still
- * matches what the mirror holds. `create_page` deliberately does not call this — the page
- * is not in the mirror, so a read is already a miss and already goes to Graph.
+ * matches what the mirror holds.
  *
- * **A failure here never fails the write.** The write is the thing that mattered and it
- * has already happened; turning a successful append into a reported error would send the
- * caller to retry a change that is already made. The damage from a lost invalidation is
- * bounded and self-healing: reads serve pre-write content until the next sync, and the
- * write moved the page's `lastModifiedDateTime`, so the next incremental run picks it up
- * whatever happens here.
+ * The resync costs one Graph request. What it buys is that a `get_page_content` straight
+ * after an `append_to_page` answers from the mirror with the appended text — without it,
+ * the page is marked stale and every read falls through to Graph until the next sync run,
+ * which on a fifteen-minute schedule is a long window in the middle of a conversation.
  *
- * No re-fetch from Graph either. That would cost a request on every write — on top of the
- * one `append_to_page` already pays for ink clearance — and `api-overview.md` records
- * that page metadata read immediately after a write can come back wrong.
+ * **Two failure levels, and neither fails the write.** A resync that throws falls back to
+ * marking the page stale, which makes the next read a miss — correct, just slower. If
+ * that fails too, the event is logged and nothing else happens. The write is the thing
+ * that mattered and it has already happened; turning a successful append into a reported
+ * error would send the caller to retry a change that is already made. It is also
+ * self-healing: the write moved the page's `lastModifiedDateTime`, so the next
+ * incremental run repairs whatever this could not.
  */
-async function invalidate(mirror: MirrorInvalidator | undefined, pageId: string): Promise<void> {
+async function resync(
+  mirror: MirrorWriteSync | undefined,
+  pageId: string,
+  hint: { title?: string; sectionId?: string },
+): Promise<void> {
   if (mirror === undefined) return;
+
+  try {
+    await mirror.resyncPage(pageId, hint);
+    return;
+  } catch (err) {
+    logEvent('mirror-resync-failed', { pageId, reason: reasonOf(err) });
+  }
 
   try {
     await mirror.markPageStale(pageId);

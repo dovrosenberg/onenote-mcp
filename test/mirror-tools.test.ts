@@ -40,7 +40,7 @@ import { createPageTools, type PageContentClient } from '../src/page-tools.ts';
 import { createStructureTools, type StructureClient } from '../src/structure-tools.ts';
 import {
   createWriteTools,
-  type MirrorInvalidator,
+  type MirrorWriteSync,
   type PageLayoutReader,
   type PageWriteClient,
   type WriteLookupStructure,
@@ -500,19 +500,41 @@ test('useLiveData must be a boolean', async () => {
 // that until the next sync run.
 // ---------------------------------------------------------------------------
 
-test('a successful write marks its page stale, and create_page does not', async () => {
-  const staled: string[] = [];
-  const invalidator: MirrorInvalidator = {
+interface SyncCalls {
+  resynced: { pageId: string; hint: { title?: string; sectionId?: string } }[];
+  staled: string[];
+}
+
+function fakeWriteSync(
+  calls: SyncCalls,
+  options: { resyncFails?: boolean; staleFails?: boolean } = {},
+): MirrorWriteSync {
+  return {
+    resyncPage: (pageId, hint) => {
+      calls.resynced.push({ pageId, hint });
+      return options.resyncFails === true
+        ? Promise.reject(new Error('graph down'))
+        : Promise.resolve();
+    },
     markPageStale: (pageId) => {
-      staled.push(pageId);
-      return Promise.resolve();
+      calls.staled.push(pageId);
+      return options.staleFails === true
+        ? Promise.reject(new Error('firestore down'))
+        : Promise.resolve();
     },
   };
+}
+
+test('every write resyncs its page, including create_page', async () => {
+  // The point of resyncing rather than marking stale: a get_page_content straight after
+  // an append answers from the mirror with the appended text, instead of falling through
+  // to Graph until the next scheduled run.
+  const calls: SyncCalls = { resynced: [], staled: [] };
   const writeTools = createWriteTools(
     fakeWriteClient(),
     fakeLayoutReader(),
     fakeWriteLookup(),
-    invalidator,
+    fakeWriteSync(calls),
   );
 
   await byName(writeTools, 'append_to_page').handle({
@@ -523,27 +545,79 @@ test('a successful write marks its page stale, and create_page does not', async 
     pageId: 'p-held',
     newTitle: 'Renamed',
   });
-
-  assert.deepEqual(staled, ['p-held', 'p-held']);
-
-  // A page the mirror has never seen is already a miss, so there is nothing to
-  // invalidate and no Firestore write to pay for.
-  staled.length = 0;
   await byName(writeTools, 'create_page').handle({
     sectionId: 'sec-daily',
     title: 'Fresh',
     htmlFragment: '<p>new</p>',
   });
-  assert.deepEqual(staled, []);
+
+  assert.deepEqual(calls.resynced.map((r) => r.pageId), ['p-held', 'p-held', 'p-new']);
+  assert.deepEqual(calls.staled, [], 'the fallback is not used when the resync worked');
 });
 
-test('a failed invalidation does not fail the write', async () => {
-  // The write is the thing that mattered and it has already happened. Reporting an error
-  // would send the caller to retry a change that is already made. The damage is bounded:
-  // the write moved the page's lastModifiedDateTime, so the next sync picks it up.
-  const writeTools = createWriteTools(fakeWriteClient(), fakeLayoutReader(), fakeWriteLookup(), {
-    markPageStale: () => Promise.reject(new Error('firestore down')),
+test('the hints carry what a metadata read cannot be trusted for', async () => {
+  // Measured 2026-08-19: GET /pages/{id}?$select=title returned "" for pages created
+  // seconds earlier. So the title travels from the caller, which just set it.
+  const calls: SyncCalls = { resynced: [], staled: [] };
+  const writeTools = createWriteTools(
+    fakeWriteClient(),
+    fakeLayoutReader(),
+    fakeWriteLookup(),
+    fakeWriteSync(calls),
+  );
+
+  await byName(writeTools, 'append_to_page').handle({
+    pageId: 'p-held',
+    htmlFragment: '<p>added</p>',
   });
+  await byName(writeTools, 'update_page_title').handle({
+    pageId: 'p-held',
+    newTitle: 'Renamed',
+  });
+  await byName(writeTools, 'create_page').handle({
+    sectionId: 'sec-daily',
+    title: 'Fresh',
+    htmlFragment: '<p>new</p>',
+  });
+
+  // An append cannot change a title, so it sends none and the stored one stands.
+  assert.deepEqual(calls.resynced[0]?.hint, {});
+  assert.equal(calls.resynced[1]?.hint.title, 'Renamed');
+  // A created page has no stored placement to read a section from, so it must be told.
+  assert.equal(calls.resynced[2]?.hint.title, 'Fresh');
+  assert.equal(calls.resynced[2]?.hint.sectionId, 'sec-daily');
+});
+
+test('a failed resync falls back to marking the page stale', async () => {
+  const calls: SyncCalls = { resynced: [], staled: [] };
+  const writeTools = createWriteTools(
+    fakeWriteClient(),
+    fakeLayoutReader(),
+    fakeWriteLookup(),
+    fakeWriteSync(calls, { resyncFails: true }),
+  );
+
+  const result = await byName(writeTools, 'append_to_page').handle({
+    pageId: 'p-held',
+    htmlFragment: '<p>added</p>',
+  });
+
+  // Stale is correct, just slower: the next read is a miss and goes to Graph.
+  assert.deepEqual(calls.staled, ['p-held']);
+  assert.equal(payload(result)['appended'], true);
+});
+
+test('neither a failed resync nor a failed fallback fails the write', async () => {
+  // The write is the thing that mattered and it has already happened. Reporting an error
+  // would send the caller to retry a change that is already made. It is self-healing:
+  // the write moved the page's lastModifiedDateTime, so the next sync repairs it.
+  const calls: SyncCalls = { resynced: [], staled: [] };
+  const writeTools = createWriteTools(
+    fakeWriteClient(),
+    fakeLayoutReader(),
+    fakeWriteLookup(),
+    fakeWriteSync(calls, { resyncFails: true, staleFails: true }),
+  );
 
   const result = await byName(writeTools, 'append_to_page').handle({
     pageId: 'p-held',

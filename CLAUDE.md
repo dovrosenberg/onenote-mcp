@@ -906,21 +906,42 @@ such section". Both `_by_name` reading tools retry the whole resolve-and-list ag
 Graph before reporting. The retry costs one request and only on a failure, and a name that
 exists nowhere still raises.
 
-**A write invalidates the mirrored page, and a failed invalidation never fails the
-write.** `append_to_page`, `append_to_page_by_name` and `update_page_title` call
-`markPageStale` after a successful PATCH; `create_page` does not, because a page the
-mirror has never seen is already a miss. The write has already happened by then, so
-turning a lost invalidation into a reported error would send the caller to retry a change
-that is already made — and the damage is self-healing, because the write moved the page's
-`lastModifiedDateTime` and the next incremental run picks it up. There is deliberately no
-re-fetch from Graph in the write path: it would cost a request on every write, on top of
-the one `append_to_page` already pays for ink clearance, and `api-overview.md` records
-that page metadata read immediately after a write can come back wrong.
+**Every write resyncs its page immediately, and that costs one Graph request.** All five
+writing tools call `resyncPage` after a successful write — including `create_page`, whose
+page the mirror has never seen and which would otherwise be a miss until the next
+scheduled run. The alternative, marking the page stale and letting the next sync repair
+it, leaves every read falling through to Graph for up to a whole poll interval, which in
+the middle of a conversation is the window that matters most.
 
-**The invalidator is bound whenever a mirror exists, not only when reads are enabled.** A
+**A resync re-reads content and nothing else, and this is the measured reason.**
+`api-overview.md` records that a PATCH *is* visible to the next content read — 3.7 seconds
+including both round trips — while page *metadata* is weaker: `GET /pages/{id}?$select=title`
+returned `""` for pages created seconds earlier. So the title travels in a hint from the
+caller, which either just set it (`update_page_title`, `create_page`) or knows an append
+cannot change it, and `lastModifiedDateTime` is stamped locally. Reading either back from
+Graph here would trade a correct value for an unreliable one. Do not "improve" this by
+fetching page metadata.
+
+**There is one page writer, `writePageFromRaw`, shared by the sync and the resync.** A
+second copy that skipped the ink render, or spilled to GCS at a different threshold, would
+make a page's stored form depend on which path last touched it — and the difference would
+only surface as a wrong answer to a model days later. `test/mirror-sync.test.ts` asserts
+both paths build the same document from the same response.
+
+**Two failure levels below a write, and neither fails the write.** A resync that throws
+falls back to `markPageStale`, which makes the next read a miss — correct, just slower. If
+that fails too, the event is logged and nothing else happens. The write has already
+happened by then, so turning either into a reported error would send the caller to retry a
+change that is already made. It is self-healing regardless: the write moved the page's
+`lastModifiedDateTime`, so the next incremental run repairs whatever this could not.
+
+**The write-sync is bound whenever a mirror exists, not only when reads are enabled.** A
 mirror being filled by the sync while `MIRROR_READ_ENABLED` is false still holds copies a
-write supersedes, and marking them stale then is what makes turning reads on later safe
-rather than a race with whatever was written in between.
+write supersedes, and keeping them current then is what makes turning reads on later safe
+rather than a race with whatever was written in between. It shares the Graph content
+client with the read tools, so a resync passes through the same process-wide request gate
+as everything else — a burst of writes cannot outrun the per-user rate limit through this
+path.
 
 **`POST /sync` is the page mirror's way in, on the same terms as `/keepalive` and for the
 same reason.** Its own secret rather than the keepalive one, because the two reach

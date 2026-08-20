@@ -52,7 +52,9 @@ import {
   runFullSweep,
   runIncremental,
   runSweep,
+  resyncPage,
   structureHashOf,
+  type ResyncDeps,
   type SyncDeps,
   type SyncStore,
 } from '../src/mirror-sync.ts';
@@ -836,4 +838,169 @@ test('the sweep learns the nested section groups $expand could not reach', async
 
   assert.deepEqual(h.graphCalls.children, ['grp-1']);
   assert.deepEqual(h.storeCalls.childGroupsKnown, ['grp-1']);
+});
+
+// ---------------------------------------------------------------------------
+// Resync after a write
+//
+// One Graph request, triggered by a write tool, so a read immediately after a write
+// answers from the mirror instead of falling through until the next scheduled run.
+//
+// It re-reads content and nothing else. Measured 2026-08-19 (api-overview.md): a PATCH
+// is visible to the next content read at 3.7 seconds including both round trips, but
+// page metadata is weaker — GET /pages/{id}?$select=title returned "" for pages created
+// seconds earlier. So the title comes from the caller and the timestamp is stamped
+// locally, and the tests below are what stop either being read back from Graph.
+// ---------------------------------------------------------------------------
+
+function resyncDeps(
+  storeInit: Partial<StoreState> = {},
+  content?: SyncDeps['content'],
+): {
+  deps: ResyncDeps;
+  storeCalls: StoreCalls;
+  blobCalls: BlobCalls;
+  data: StoreState;
+} {
+  const { store, calls: storeCalls, data } = fakeStore(storeInit);
+  const { blobs, calls: blobCalls } = fakeBlobs();
+
+  return {
+    storeCalls,
+    blobCalls,
+    data,
+    deps: {
+      store: {
+        getPage: store.getPage,
+        putPage: store.putPage,
+        deletePage: store.deletePage,
+        getSection: (sectionId) =>
+          Promise.resolve(data.sections.find((s) => s.id === sectionId) ?? null),
+      },
+      blobs,
+      now: () => NOW,
+      content: content ?? { fetchRaw: () => Promise.resolve(rawHtml('<p>after the write</p>')) },
+    },
+  };
+}
+
+test('a resync stores the page and stamps the time locally', async () => {
+  const h = resyncDeps();
+
+  const outcome = await resyncPage(h.deps, 'p-1', { title: 'Renamed', sectionId: 'sec-1' });
+
+  assert.equal(outcome, 'updated');
+  const put = h.storeCalls.puts[0];
+  assert.equal(put?.page.id, 'p-1');
+  assert.equal(put?.page.title, 'Renamed');
+  assert.equal(put?.page.contentState, 'present');
+  // Stamped locally rather than read back, because a metadata read here is unreliable.
+  assert.equal(put?.page.lastModifiedDateTime, NOW_ISO);
+});
+
+test('an append sends no title, and the stored one survives', async () => {
+  // An append cannot change a title. Sending an empty one would blank it in the mirror
+  // until the next sync corrected it, and a title search would miss the page meanwhile.
+  const stored: MirrorPage = {
+    id: 'p-1',
+    title: 'Monday',
+    titleLower: 'monday',
+    sectionId: 'sec-1',
+    notebookId: NB,
+    sectionPath: '2026 / Daily',
+    lastModifiedDateTime: '2026-08-19T10:00:00Z',
+    contentState: 'present',
+    contentHash: 'old',
+    htmlLocation: 'firestore',
+    htmlObject: null,
+    htmlBytes: 5,
+    ink: null,
+  };
+  const h = resyncDeps({ pages: new Map([['p-1', stored]]) });
+
+  await resyncPage(h.deps, 'p-1', {});
+
+  assert.equal(h.storeCalls.puts[0]?.page.title, 'Monday');
+});
+
+test('a page in a notebook the mirror does not hold costs no Graph request', async () => {
+  // The write tools reach the whole account; only the selection is mirrored.
+  let fetched = 0;
+  const h = resyncDeps(
+    { sections: [section({ mirrored: false })] },
+    {
+      fetchRaw: () => {
+        fetched += 1;
+        return Promise.resolve(rawHtml('<p>x</p>'));
+      },
+    },
+  );
+
+  assert.equal(await resyncPage(h.deps, 'p-1', { sectionId: 'sec-1' }), 'not-mirrored');
+  assert.equal(fetched, 0);
+  assert.deepEqual(h.storeCalls.puts, []);
+});
+
+test('a page with no hint and no stored placement is not mirrored', async () => {
+  // Nothing says where it belongs, so there is nothing to write and nothing to read.
+  const h = resyncDeps();
+  assert.equal(await resyncPage(h.deps, 'p-unknown', {}), 'not-mirrored');
+});
+
+test('a resync whose page has already gone deletes the mirrored copy', async () => {
+  const h = resyncDeps({}, { fetchRaw: () => Promise.reject(graphError(404)) });
+
+  assert.equal(await resyncPage(h.deps, 'p-1', { sectionId: 'sec-1' }), 'deleted');
+  assert.deepEqual(h.storeCalls.deletes, [
+    { id: 'p-1', sectionId: 'sec-1', notebookId: NB, reason: 'not-found' },
+  ]);
+  assert.deepEqual(h.blobCalls.deleted, ['p-1']);
+});
+
+test('any other Graph failure propagates, for the caller to fall back on', async () => {
+  // write-tools catches this and marks the page stale instead, which is correct and just
+  // slower. Swallowing it here would leave the mirror holding pre-write content with
+  // nothing recording that it is wrong.
+  const h = resyncDeps({}, { fetchRaw: () => Promise.reject(graphError(500)) });
+
+  await assert.rejects(() => resyncPage(h.deps, 'p-1', { sectionId: 'sec-1' }), GraphRequestError);
+});
+
+test('a resync of unchanged content writes nothing', async () => {
+  // An append that produced identical HTML, or a rename, which does not touch content.
+  const first = resyncDeps();
+  await resyncPage(first.deps, 'p-1', { sectionId: 'sec-1', title: 'Monday' });
+  const stored = first.data.pages.get('p-1');
+  assert.ok(stored);
+
+  const second = resyncDeps({ pages: new Map([['p-1', stored]]) });
+  assert.equal(
+    await resyncPage(second.deps, 'p-1', { sectionId: 'sec-1', title: 'Monday' }),
+    'unchanged',
+  );
+  assert.deepEqual(second.storeCalls.puts, []);
+});
+
+test('the resync and the sync build the same document from the same response', async () => {
+  // One writer, deliberately. A second copy that skipped the ink render or spilled at a
+  // different threshold would make a page's stored form depend on which path last touched
+  // it, and the difference would surface as a wrong answer to a model days later.
+  const raw = rawHtml('<p>identical</p>');
+
+  const viaSync = harness({ tree: TREE, changed: { 'sec-1': [summary('p-1')] } }, {}, {
+    fetchRaw: () => Promise.resolve(raw),
+  });
+  await runIncremental(viaSync.deps, BUDGET);
+
+  const viaWrite = resyncDeps({}, { fetchRaw: () => Promise.resolve(raw) });
+  await resyncPage(viaWrite.deps, 'p-1', { sectionId: 'sec-1', title: summary('p-1').title });
+
+  const a = viaSync.storeCalls.puts[0]?.page;
+  const b = viaWrite.storeCalls.puts[0]?.page;
+  assert.ok(a && b);
+  assert.equal(a.contentHash, b.contentHash);
+  assert.equal(a.htmlLocation, b.htmlLocation);
+  assert.equal(a.htmlBytes, b.htmlBytes);
+  assert.equal(a.sectionPath, b.sectionPath);
+  assert.equal(a.notebookId, b.notebookId);
 });

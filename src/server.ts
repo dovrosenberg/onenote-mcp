@@ -4,13 +4,14 @@ import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middlew
 import type { Config } from './config.ts';
 import { KEEPALIVE_PATH, keepaliveRouter } from './keepalive.ts';
 import { requestLogger } from './logging.ts';
+import { createGraphPageContent } from './page-content.ts';
 import { MCP_PATH, mcpRouter } from './mcp-server.ts';
 import { createOAuthProvider } from './oauth-provider.ts';
 import { oauthRouter, protectedResourceMetadataUrl } from './oauth-router.ts';
 import { SYNC_PATH, syncRouter } from './sync-route.ts';
 import {
   createGraphAuthFor,
-  createMirrorInvalidatorFor,
+  createMirrorWriteSyncFor,
   createMirrorReaderFor,
   createSyncTargetFor,
   createTools,
@@ -121,7 +122,13 @@ export function createApp(config: Config): Application {
       verifier: provider,
       resourceMetadataUrl: protectedResourceMetadataUrl(config.oauth),
     }),
-    mcpRouter(createTools(auth, createMirrorReaderFor(config), createMirrorInvalidatorFor(config))),
+    mcpRouter(
+      createTools(
+        auth,
+        createMirrorReaderFor(config),
+        createMirrorWriteSyncFor(config, auth, createGraphPageContent(auth)),
+      ),
+    ),
   );
 
   return app;
