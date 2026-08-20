@@ -1202,6 +1202,28 @@ burns quota to fail again. 429 and 503 are worth retrying after a wait; 400 with
 `src/graph-throttle.ts` is the one place that decides, and every client runs through
 `PRODUCTION_GATE`, so nothing here retries on its own.
 
+**Every real Graph call carries a 60-second timeout, and the reason is the gate rather
+than politeness.** Node's `fetch` is undici, whose `headersTimeout` and `bodyTimeout` both
+default to 300 seconds — the same as Cloud Run's request timeout and longer than the
+mirror sync's whole 240-second budget. A call that connects and never answers therefore
+holds one of the gate's four slots for longer than the run that started it is allowed to
+live, and four of them wedge the gate completely: every later request queues and every
+caller is cut at 300 seconds having done nothing. Neither budget prevents it, because both
+are checked *before* an operation starts and the operation is the thing hanging.
+`withRequestTimeout` is applied by the three `create*` factories to the real `fetch` only,
+so a test injecting a fake is unaffected — what it bounds is a socket, and a fake has
+none. A timed-out request rejects with a `TimeoutError`, which carries no `status`, so
+`retryWait` declines it: a service that has stopped answering is not helped by being asked
+again inside the same run.
+
+**The gate's concurrency cap is sound, and the microtask ordering is why.** `release()`
+decrements `inFlight` and then wakes a waiter whose continuation is a microtask, which
+looks like it should let a caller arriving in between take the slot and push concurrency
+past the cap. It cannot: microtasks are FIFO, so the woken waiter's increment always runs
+before any later caller's `acquire`, and `release()` is itself always inside a microtask
+rather than synchronous with a gate-open. This was probed rather than assumed. Do not
+"fix" it by incrementing in `release`.
+
 **A retry longer than `MAX_RETRY_WAIT_MS` is declined, not shortened.** Graph decides how
 long a 429 lasts and OneNote's answer can be minutes — the `Graph request budget` section
 below records five retries spanning three minutes all refused after one burst. Shortening

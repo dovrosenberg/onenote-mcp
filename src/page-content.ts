@@ -18,6 +18,7 @@ import {
   PRODUCTION_GATE,
   type FetchLike,
   type TokenSource,
+  withRequestTimeout,
 } from './graph-structure.ts';
 import { UNGATED, parseRetryAfter, type RequestGate } from './graph-throttle.ts';
 import { renderInk, DEFAULT_RENDER_WIDTH, type InkImage } from './ink.ts';
@@ -225,7 +226,7 @@ export function pageHtml(content: RawPageContent): string | null {
 
 /** Build the client from the server's Graph auth, sharing the process-wide gate. */
 export function createGraphPageContent(tokens: TokenSource): GraphPageContent {
-  return new GraphPageContent(tokens, globalThis.fetch, PRODUCTION_GATE);
+  return new GraphPageContent(tokens, withRequestTimeout(globalThis.fetch), PRODUCTION_GATE);
 }
 
 /** An unreadable body must not mask the status that is about to be thrown. */

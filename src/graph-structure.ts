@@ -188,8 +188,51 @@ export interface TokenSource {
  */
 export type FetchLike = (
   url: string,
-  init: { headers: Record<string, string>; method?: string; body?: string },
+  init: {
+    headers: Record<string, string>;
+    method?: string;
+    body?: string;
+    signal?: AbortSignal;
+  },
 ) => Promise<Response>;
+
+/**
+ * How long one Graph request may take before it is abandoned.
+ *
+ * Node's `fetch` is undici, whose `headersTimeout` and `bodyTimeout` both default to 300
+ * seconds. That is the same as Cloud Run's request timeout and longer than the mirror
+ * sync's entire 240-second budget, so a Graph call that connects and then never answers
+ * holds one of the gate's four slots for longer than the run that started it is allowed
+ * to live. Four of them wedge the gate completely: every later request queues, and every
+ * caller is cut at 300 seconds having done nothing.
+ *
+ * Neither budget can prevent it. Both are checked *before* an operation starts, and the
+ * operation is the thing hanging.
+ *
+ * 60 seconds is far above anything measured here — the expanded tree is about 3 seconds
+ * for 111 KB — and far below both the sync budget and the request timeout, which is the
+ * property that matters.
+ */
+export const GRAPH_REQUEST_TIMEOUT_MS = 60_000;
+
+/**
+ * A `fetch` that gives up rather than hanging.
+ *
+ * Applied by the three `create*` factories to the real `fetch` only. A test injecting its
+ * own fake is unaffected, which is deliberate: what this bounds is a real socket, and a
+ * fake has none.
+ *
+ * A timed-out request rejects with a `TimeoutError`, which carries no `status`, so
+ * `retryWait` does not retry it — a service that has stopped answering is not helped by
+ * being asked again inside the same run. The sync logs the section or page as failed,
+ * leaves its watermark alone, and the next scheduled run tries again.
+ */
+export function withRequestTimeout(
+  fetchImpl: FetchLike,
+  timeoutMs: number = GRAPH_REQUEST_TIMEOUT_MS,
+): FetchLike {
+  return (url, init) => fetchImpl(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+}
 
 /** `notebooks` and `sectionGroups` expose the same two child relationships. */
 export type ContainerKind = 'notebooks' | 'sectionGroups';
@@ -685,5 +728,5 @@ export const PRODUCTION_GATE: RequestGate = createGate();
 
 /** Build the client from the server's Graph auth, sharing the process-wide gate. */
 export function createGraphStructure(auth: GraphAuth): GraphStructure {
-  return new GraphStructure(auth, globalThis.fetch, PRODUCTION_GATE);
+  return new GraphStructure(auth, withRequestTimeout(globalThis.fetch), PRODUCTION_GATE);
 }

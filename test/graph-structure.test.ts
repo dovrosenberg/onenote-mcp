@@ -4,7 +4,9 @@ import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 
 import {
+  GRAPH_REQUEST_TIMEOUT_MS,
   GRAPH_ROOT,
+  withRequestTimeout,
   GraphRequestError,
   GraphResponseError,
   GraphStructure,
@@ -794,4 +796,63 @@ test('listPageIds rejects an item with no usable id rather than dropping it', as
     () => new GraphStructure(tokens, fetchImpl).listPageIds('s-1'),
     GraphResponseError,
   );
+});
+
+test('the real fetch is given a timeout, so a hung call cannot hold a gate slot', async () => {
+  // Node's fetch is undici, whose headersTimeout and bodyTimeout both default to 300
+  // seconds — the same as Cloud Run's request timeout, and longer than the mirror sync's
+  // entire 240-second budget. Four hung calls would hold every slot the gate has, and
+  // neither budget can help: both are checked before an operation starts, and the
+  // operation is the thing hanging.
+  let seen: AbortSignal | undefined;
+  const timed = withRequestTimeout(
+    (_url, init) => {
+      seen = init.signal;
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    },
+    50,
+  );
+
+  await timed('https://graph.microsoft.com/v1.0/x', { headers: {} });
+
+  assert.ok(seen instanceof AbortSignal);
+  assert.equal(seen.aborted, false);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(seen.aborted, true, 'the signal fires on its own, without the caller');
+});
+
+test('the timeout aborts a call that never answers, and it is not retried', async () => {
+  // A service that has stopped answering is not helped by being asked again inside the
+  // same run. The sync logs the page or section as failed, leaves its watermark alone,
+  // and the next scheduled run tries it.
+  const hangs = withRequestTimeout(
+    (_url, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => {
+          reject(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+        });
+      }),
+    20,
+  );
+
+  const gate = createGate({ maxConcurrent: 2, minIntervalMs: 0, maxRetries: 3 });
+  let attempts = 0;
+
+  await assert.rejects(
+    () =>
+      gate.run(() => {
+        attempts += 1;
+        return hangs('https://graph.microsoft.com/v1.0/x', { headers: {} });
+      }),
+    (err: unknown) => err instanceof DOMException && err.name === 'TimeoutError',
+  );
+
+  assert.equal(attempts, 1, 'a timeout carries no status, so retryWait declines it');
+});
+
+test('the timeout is far below both budgets it exists to protect', () => {
+  // The property, not the number: 60s against a 240s sync budget and a 300s Cloud Run
+  // request timeout. Raising it past either would put the wedge back.
+  assert.ok(GRAPH_REQUEST_TIMEOUT_MS < 240_000);
+  assert.ok(GRAPH_REQUEST_TIMEOUT_MS * 4 < 300_000, 'four hung calls still clear inside a request');
 });

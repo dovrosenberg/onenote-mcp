@@ -38,6 +38,7 @@ import {
   PRODUCTION_GATE,
   type FetchLike,
   type TokenSource,
+  withRequestTimeout,
 } from './graph-structure.ts';
 import { UNGATED, parseRetryAfter, type RequestGate } from './graph-throttle.ts';
 import type { GraphAuth } from './graph-auth.ts';
@@ -237,7 +238,7 @@ export class GraphPageWrite {
 
 /** Build the client from the server's Graph auth, sharing the process-wide gate. */
 export function createGraphPageWrite(auth: GraphAuth): GraphPageWrite {
-  return new GraphPageWrite(auth, globalThis.fetch, PRODUCTION_GATE);
+  return new GraphPageWrite(auth, withRequestTimeout(globalThis.fetch), PRODUCTION_GATE);
 }
 
 /**
