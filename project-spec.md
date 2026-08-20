@@ -215,6 +215,44 @@ the alignment is arithmetic, not guesswork.
   it. Setting the attribute would give sibling outlines like a
   client-authored page and put every append in the first one. The two page
   shapes cannot both behave well; this picks the one this server creates.
+- **Every write runs the same three steps, in this order: invalidate the
+  mirror, write to OneNote, resync the mirror.** The invalidation comes
+  first because the window between the OneNote write and the resync is not
+  always survivable. If the process merely errors, the resync's `catch`
+  marks the page stale. If the process *stops* — Cloud Run cutting the
+  request at 300 seconds, or the instance being reclaimed — nothing catches
+  anything, and the mirror keeps serving superseded data as current, with
+  `source: "mirror"` and a recent `mirroredAt` beside it, until the next
+  scheduled sync notices. Invalidating first makes the whole window
+  pessimistic instead: a death anywhere in it leaves a miss, and a miss goes
+  to Graph.
+- **There are two things a write can invalidate, and each tool marks the
+  ones it can make wrong.**
+
+  | | page content (`contentState: 'stale'`) | section page listing (`pendingWrites`) |
+  |---|---|---|
+  | `append_to_page`, `append_to_page_by_name` | yes | no |
+  | `update_page_title` | yes | yes |
+  | `create_page`, `create_page_by_name` | n/a — no page document yet | yes |
+
+  The page marker covers `get_page_content`. The listing hold covers
+  `list_pages`, `list_pages_by_name`, `find_page_by_name` and
+  `search_pages`, all of which answer from stored page documents. A create
+  has no page to mark and the listing is the thing it makes wrong: without
+  the hold, a create whose resync never ran leaves `list_pages` reporting a
+  section that does not contain the page, which reads to a model as "the
+  page was not created". A rename holds the listing because the title is
+  what every listing and by-name lookup matches on. An append holds
+  nothing extra: it changes content, which the page marker covers, and
+  `lastModifiedDateTime`, which only reorders a listing.
+- **The listing hold is a count, and it expires on age.** A count because
+  two writes against one section can overlap and the first to finish must
+  not clear the second's hold. It expires because the release runs in a
+  `finally` and so does not run at all if the process stops between the
+  write and the resync — and a hold nothing can lower would send every
+  listing for that section to Graph forever, at one request for a
+  `list_pages` and up to 61 for an unscoped `search_pages`. Ten minutes,
+  against Cloud Run's 300-second request ceiling.
 
 ---
 

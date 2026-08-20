@@ -28,6 +28,8 @@ import {
   inkObjectName,
   inkmlObjectName,
   leaseIsHeld,
+  listingIsHeld,
+  LISTING_HOLD_EXPIRY_MS,
   overlapFrom,
   readSelection,
   readSyncState,
@@ -282,6 +284,40 @@ test('a lease is held only while it is younger than the expiry', () => {
   assert.equal(leaseIsHeld(state, started), true);
   assert.equal(leaseIsHeld(state, started + LEASE_EXPIRY_MS - 1), true);
   assert.equal(leaseIsHeld(state, started + LEASE_EXPIRY_MS), false);
+});
+
+test('a section listing is held while a write against it is unfinished', () => {
+  const since = '2026-08-19T12:00:00.000Z';
+  const at = Date.parse(since);
+
+  assert.equal(listingIsHeld({ pendingWrites: 1, pendingWritesSince: since }, at), true);
+  assert.equal(listingIsHeld({ pendingWrites: 2, pendingWritesSince: since }, at), true);
+  // A count rather than a flag: two writes against one section can overlap, and the
+  // first to finish must not clear the second's hold.
+  assert.equal(listingIsHeld({ pendingWrites: 0, pendingWritesSince: since }, at), false);
+  assert.equal(listingIsHeld({}, at), false, 'a section nothing is writing to');
+});
+
+test('a listing hold expires on age, so a dead process cannot wedge a section', () => {
+  const since = '2026-08-19T12:00:00.000Z';
+  const at = Date.parse(since);
+  const held = { pendingWrites: 1, pendingWritesSince: since };
+
+  assert.equal(listingIsHeld(held, at + LISTING_HOLD_EXPIRY_MS - 1), true);
+  assert.equal(listingIsHeld(held, at + LISTING_HOLD_EXPIRY_MS), false);
+  // Longer than any request may live: Cloud Run cuts one at 300 seconds, so a hold older
+  // than this belongs to a process that is gone.
+  assert.ok(LISTING_HOLD_EXPIRY_MS > 300_000);
+});
+
+test('a hold with no timestamp reads as expired, not as held forever', () => {
+  // Both fields go in one write, so this is not a document this code produces. The
+  // direction matters: reading it as held would leave a section nothing could ever clear,
+  // sending every listing for it to Graph permanently.
+  const at = Date.parse('2026-08-19T12:00:00.000Z');
+
+  assert.equal(listingIsHeld({ pendingWrites: 1 }, at), false);
+  assert.equal(listingIsHeld({ pendingWrites: 1, pendingWritesSince: 'not a date' }, at), false);
 });
 
 test('the lease expiry outlasts any run, so it cannot fire on one still working', () => {

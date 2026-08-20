@@ -118,6 +118,14 @@ export function createMirrorWriteSyncFor(
   return {
     resyncPage: (pageId, hint) => resyncPage(deps, pageId, hint),
     markPageStale: (pageId) => store.markPageStale(pageId),
+    sectionOfPage: async (pageId) => (await store.getPage(pageId))?.sectionId ?? null,
+    // The hold's timestamp is stamped here rather than with a server timestamp, for the
+    // reason the sync lease stamps `runningSince` here: the value is compared against
+    // `Date.now()` in the read path, and mixing a Firestore `Timestamp` into that
+    // comparison would mean decoding one on every page listing.
+    holdSectionListing: (sectionId) =>
+      store.holdSectionListing(sectionId, new Date().toISOString()),
+    releaseSectionListing: (sectionId) => store.releaseSectionListing(sectionId),
   };
 }
 

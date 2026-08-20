@@ -187,6 +187,7 @@ function fakeMirror(
       count(MIRROR_SECTIONS.filter((s) => s.parentId === parentId)),
     listSectionGroupsUnder: () => count(groups),
     listAllSections: () => count(options.empty === true ? [] : MIRROR_SECTIONS),
+    listHeldSections: () => count(MIRROR_SECTIONS.filter((s) => (s.pendingWrites ?? 0) > 0)),
     listAllSectionGroups: () => count(groups),
     getNotebook: (id) => count(MIRROR_NOTEBOOKS.find((n) => n.id === id) ?? null),
     getSection: (id) => count(MIRROR_SECTIONS.find((s) => s.id === id) ?? null),
@@ -225,6 +226,12 @@ function fakeWriteClient(order: string[] = []): PageWriteClient {
       return Promise.resolve({ id: 'p-new', title: 'Fresh', webUrl: null, clientUrl: null });
     },
   };
+}
+
+/** A write client whose every call fails, for the release-on-failure path. */
+function failingWriteClient(): PageWriteClient {
+  const fail = (): Promise<never> => Promise.reject(new Error('graph rejected the write'));
+  return { appendToPage: fail, updatePageTitle: fail, createPage: fail };
 }
 
 function fakeLayoutReader(): PageLayoutReader {
@@ -512,6 +519,8 @@ test('useLiveData must be a boolean', async () => {
 interface SyncCalls {
   resynced: { pageId: string; hint: { title?: string; sectionId?: string } }[];
   staled: string[];
+  held: string[];
+  released: string[];
 }
 
 function fakeWriteSync(
@@ -519,8 +528,10 @@ function fakeWriteSync(
   options: {
     resyncFails?: boolean;
     staleFails?: boolean;
+    holdFails?: boolean;
     outcome?: ResyncOutcome;
     order?: string[];
+    sectionOf?: Record<string, string>;
   } = {},
 ): MirrorWriteSync {
   return {
@@ -538,6 +549,24 @@ function fakeWriteSync(
         ? Promise.reject(new Error('firestore down'))
         : Promise.resolve();
     },
+    sectionOfPage: (pageId) =>
+      Promise.resolve(
+        options.sectionOf?.[pageId] ??
+          MIRROR_PAGES.find((page) => page.id === pageId)?.sectionId ??
+          null,
+      ),
+    holdSectionListing: (sectionId) => {
+      options.order?.push('hold');
+      calls.held.push(sectionId);
+      return options.holdFails === true
+        ? Promise.reject(new Error('firestore down'))
+        : Promise.resolve();
+    },
+    releaseSectionListing: (sectionId) => {
+      options.order?.push('release');
+      calls.released.push(sectionId);
+      return Promise.resolve();
+    },
   };
 }
 
@@ -545,7 +574,7 @@ test('every write resyncs its page, including create_page', async () => {
   // The point of resyncing rather than marking stale: a get_page_content straight after
   // an append answers from the mirror with the appended text, instead of falling through
   // to Graph until the next scheduled run.
-  const calls: SyncCalls = { resynced: [], staled: [] };
+  const calls: SyncCalls = { resynced: [], staled: [], held: [], released: [] };
   const order: string[] = [];
   const writeTools = createWriteTools(
     fakeWriteClient(order),
@@ -569,20 +598,23 @@ test('every write resyncs its page, including create_page', async () => {
   });
 
   assert.deepEqual(calls.resynced.map((r) => r.pageId), ['p-held', 'p-held', 'p-new']);
-  // The whole sequence, rather than counts: an append and a rename each pre-mark, write,
-  // then resync; create_page skips the pre-mark because its page is not in the mirror;
-  // and no resync is followed by a fallback, because all three succeeded.
+  // The whole sequence, rather than counts. Every one of the three invalidates first,
+  // then writes to OneNote, then resyncs — and no resync is followed by a fallback,
+  // because all three succeeded. What each one invalidates differs: an append marks the
+  // page's content stale, a rename does that *and* holds the section's page listing
+  // because the title is what a listing shows, and a create holds only the listing
+  // because it has no page document to mark.
   assert.deepEqual(order, [
     'mark-stale', 'graph-write', 'resync',
-    'mark-stale', 'graph-write', 'resync',
-    'graph-write', 'resync',
+    'mark-stale', 'hold', 'graph-write', 'resync', 'release',
+    'hold', 'graph-write', 'resync', 'release',
   ]);
 });
 
 test('the hints carry what a metadata read cannot be trusted for', async () => {
   // Measured 2026-08-19: GET /pages/{id}?$select=title returned "" for pages created
   // seconds earlier. So the title travels from the caller, which just set it.
-  const calls: SyncCalls = { resynced: [], staled: [] };
+  const calls: SyncCalls = { resynced: [], staled: [], held: [], released: [] };
   const writeTools = createWriteTools(
     fakeWriteClient(),
     fakeLayoutReader(),
@@ -613,7 +645,7 @@ test('the hints carry what a metadata read cannot be trusted for', async () => {
 });
 
 test('a failed resync falls back to marking the page stale', async () => {
-  const calls: SyncCalls = { resynced: [], staled: [] };
+  const calls: SyncCalls = { resynced: [], staled: [], held: [], released: [] };
   const order: string[] = [];
   const writeTools = createWriteTools(
     fakeWriteClient(order),
@@ -636,7 +668,7 @@ test('neither a failed resync nor a failed fallback fails the write', async () =
   // The write is the thing that mattered and it has already happened. Reporting an error
   // would send the caller to retry a change that is already made. It is self-healing:
   // the write moved the page's lastModifiedDateTime, so the next sync repairs it.
-  const calls: SyncCalls = { resynced: [], staled: [] };
+  const calls: SyncCalls = { resynced: [], staled: [], held: [], released: [] };
   const writeTools = createWriteTools(
     fakeWriteClient(),
     fakeLayoutReader(),
@@ -669,7 +701,7 @@ test('an append that resynced to "unchanged" is marked stale, not left as curren
   // read did not see the write. Leaving the page `present` would serve pre-write content
   // as current, with nothing saying so. Marking it stale sends the next read to Graph,
   // which cannot be wrong.
-  const calls: SyncCalls = { resynced: [], staled: [] };
+  const calls: SyncCalls = { resynced: [], staled: [], held: [], released: [] };
   const order: string[] = [];
   const writeTools = createWriteTools(
     fakeWriteClient(order),
@@ -691,7 +723,7 @@ test('an append that resynced to "unchanged" is marked stale, not left as curren
   // Each write's resync reported nothing to store, so each is followed by a fallback.
   assert.deepEqual(order, [
     'mark-stale', 'graph-write', 'resync', 'mark-stale',
-    'graph-write', 'resync', 'mark-stale',
+    'hold', 'graph-write', 'resync', 'mark-stale', 'release',
   ]);
 });
 
@@ -699,7 +731,7 @@ test('a rename that resynced to "unchanged" is left alone', async () => {
   // A rename changes no content by design, so `unchanged` is not evidence of a lost
   // write here — and the title comparison in writePageFromRaw is what makes a real
   // rename come back `updated` anyway.
-  const calls: SyncCalls = { resynced: [], staled: [] };
+  const calls: SyncCalls = { resynced: [], staled: [], held: [], released: [] };
   const order: string[] = [];
   const writeTools = createWriteTools(
     fakeWriteClient(order),
@@ -713,12 +745,12 @@ test('a rename that resynced to "unchanged" is left alone', async () => {
     newTitle: 'Renamed',
   });
 
-  assert.deepEqual(order, ['mark-stale', 'graph-write', 'resync']);
+  assert.deepEqual(order, ['mark-stale', 'hold', 'graph-write', 'resync', 'release']);
 });
 
 test('a page outside the mirrored set needs no stale marker', async () => {
   // `not-mirrored` means there is no copy to be wrong.
-  const calls: SyncCalls = { resynced: [], staled: [] };
+  const calls: SyncCalls = { resynced: [], staled: [], held: [], released: [] };
   const order: string[] = [];
   const writeTools = createWriteTools(
     fakeWriteClient(order),
@@ -753,7 +785,7 @@ test('the page is marked stale BEFORE the Graph write, not only after it', async
     ['update_page_title', { pageId: 'p-held', newTitle: 'Renamed' }],
   ] as const) {
     const order: string[] = [];
-    const calls: SyncCalls = { resynced: [], staled: [] };
+    const calls: SyncCalls = { resynced: [], staled: [], held: [], released: [] };
     const writeTools = createWriteTools(
       fakeWriteClient(order),
       fakeLayoutReader(),
@@ -763,15 +795,20 @@ test('the page is marked stale BEFORE the Graph write, not only after it', async
 
     await byName(writeTools, name).handle(args);
 
-    assert.deepEqual(order, ['mark-stale', 'graph-write', 'resync'], name);
+    assert.equal(order.indexOf('mark-stale') < order.indexOf('graph-write'), true, name);
+    assert.equal(order.indexOf('graph-write') < order.indexOf('resync'), true, name);
   }
 });
 
-test('create_page does not pre-mark, because its page is not in the mirror', async () => {
-  // A page the mirror has never seen is already a miss. A stale marker for it would be a
-  // Firestore write for nothing.
+test('create_page marks no page stale, and holds its section listing instead', async () => {
+  // A page the mirror has never seen is already a miss, so a stale marker for it would be
+  // a Firestore write for nothing — and there is no document to write it to. What a
+  // create *does* make wrong is the section's page listing: `list_pages`,
+  // `list_pages_by_name`, `find_page_by_name` and `search_pages` all answer from stored
+  // page documents, so between the create and its resync the mirror reports a section
+  // that does not contain the page. To a model that reads as "the page was not created".
   const order: string[] = [];
-  const calls: SyncCalls = { resynced: [], staled: [] };
+  const calls: SyncCalls = { resynced: [], staled: [], held: [], released: [] };
   const writeTools = createWriteTools(
     fakeWriteClient(order),
     fakeLayoutReader(),
@@ -785,12 +822,60 @@ test('create_page does not pre-mark, because its page is not in the mirror', asy
     htmlFragment: '<p>new</p>',
   });
 
-  assert.deepEqual(order, ['graph-write', 'resync']);
+  assert.deepEqual(order, ['hold', 'graph-write', 'resync', 'release']);
+  assert.deepEqual(calls.staled, []);
+  assert.deepEqual(calls.held, ['sec-daily']);
+  assert.deepEqual(calls.released, ['sec-daily']);
+});
+
+test('a Graph write that failed still releases the listing hold', async () => {
+  // The hold is released in a `finally`. A write that never happened left the listing
+  // correct, and a hold nothing lowers costs every later listing for that section a Graph
+  // request until it expires on age.
+  for (const [name, args] of [
+    ['create_page', { sectionId: 'sec-daily', title: 'Fresh', htmlFragment: '<p>new</p>' }],
+    ['update_page_title', { pageId: 'p-held', newTitle: 'Renamed' }],
+  ] as const) {
+    const calls: SyncCalls = { resynced: [], staled: [], held: [], released: [] };
+    const writeTools = createWriteTools(
+      failingWriteClient(),
+      fakeLayoutReader(),
+      fakeWriteLookup(),
+      fakeWriteSync(calls, {}),
+    );
+
+    await assert.rejects(() => byName(writeTools, name).handle(args));
+
+    assert.deepEqual(calls.held, ['sec-daily'], name);
+    assert.deepEqual(calls.released, ['sec-daily'], name);
+    assert.deepEqual(calls.resynced, [], name);
+  }
+});
+
+test('a failed listing hold does not stop the write', async () => {
+  // Same rule as the stale marker: it narrows an existing window rather than being a
+  // precondition for writing.
+  const calls: SyncCalls = { resynced: [], staled: [], held: [], released: [] };
+  const writeTools = createWriteTools(
+    fakeWriteClient(),
+    fakeLayoutReader(),
+    fakeWriteLookup(),
+    fakeWriteSync(calls, { holdFails: true }),
+  );
+
+  const result = await byName(writeTools, 'create_page').handle({
+    sectionId: 'sec-daily',
+    title: 'Fresh',
+    htmlFragment: '<p>new</p>',
+  });
+
+  assert.equal(payload(result)['pageId'], 'p-new');
+  assert.deepEqual(calls.resynced.map((r) => r.pageId), ['p-new']);
 });
 
 test('a failed pre-mark does not stop the write', async () => {
   // It narrows an existing window; it is not a precondition for writing.
-  const calls: SyncCalls = { resynced: [], staled: [] };
+  const calls: SyncCalls = { resynced: [], staled: [], held: [], released: [] };
   const writeTools = createWriteTools(
     fakeWriteClient(),
     fakeLayoutReader(),

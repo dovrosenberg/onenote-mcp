@@ -296,6 +296,40 @@ export class MirrorStore {
     );
   }
 
+  /** Every section whose page listing is currently held. Normally none. */
+  async listHeldSections(): Promise<MirrorSection[]> {
+    // A single-field range filter, so Firestore's automatic index serves it and
+    // scripts/gcp-bootstrap.sh needs no composite index for it.
+    return this.#query(
+      'listing sections with writes in flight',
+      this.#sections().where('pendingWrites', '>', 0),
+    );
+  }
+
+  /**
+   * Raise this section's page-listing hold, before a write Graph has not seen yet.
+   *
+   * `update`, not `set({merge:true})`, for the reason `markPageStale` gives and with a
+   * worse failure if it were ignored: a merging set would *create* the section document,
+   * and the write tools reach the whole account while only the selection is mirrored — so
+   * a create in an unmirrored section would leave a section stub carrying nothing but a
+   * counter, which `listAllSections` then feeds to `expandedTree` as a section with no
+   * name. NOT_FOUND means there is no listing to hold back.
+   */
+  async holdSectionListing(sectionId: string, sinceIso: string): Promise<void> {
+    await this.#updateSection('holding a section page listing', sectionId, {
+      pendingWrites: FieldValue.increment(1),
+      pendingWritesSince: sinceIso,
+    });
+  }
+
+  /** Lower it again, after the write's resync has landed. */
+  async releaseSectionListing(sectionId: string): Promise<void> {
+    await this.#updateSection('releasing a section page listing', sectionId, {
+      pendingWrites: FieldValue.increment(-1),
+    });
+  }
+
   async setChildGroupsKnown(groupId: string, known: boolean): Promise<void> {
     await this.#run('recording nested section groups', () =>
       this.#sectionGroups()
@@ -477,6 +511,21 @@ export class MirrorStore {
 
   #tombstones(): CollectionReference {
     return this.#root.collection(TOMBSTONES_COLLECTION);
+  }
+
+  async #updateSection(
+    operation: string,
+    sectionId: string,
+    fields: Record<string, unknown>,
+  ): Promise<void> {
+    await this.#run(operation, async () => {
+      try {
+        await this.#sections().doc(encodeMirrorId(sectionId)).update(fields);
+      } catch (err) {
+        if (isNotFound(err)) return;
+        throw err;
+      }
+    });
   }
 
   #firestoreOf(ref: DocumentReference): Firestore {
