@@ -23,6 +23,7 @@ import {
   runFullSweep,
   runIncremental,
   runSweep,
+  runSweepAll,
   type SyncContent,
   type SyncDeps,
 } from './mirror-sync.ts';
@@ -244,5 +245,6 @@ export function createSyncTargetFor(config: Config, auth: GraphAuth): SyncTarget
     runIncremental: () => runIncremental(deps, options),
     runSweep: () => runSweep(deps, options),
     runFullSweep: () => runFullSweep(deps, options),
+    runSweepAll: () => runSweepAll(deps, options),
   };
 }

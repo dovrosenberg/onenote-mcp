@@ -42,6 +42,7 @@ import { fitInkToByteBudget, type InkImage } from './ink.ts';
 import { logEvent } from './logging.ts';
 import type { MirrorBlobReader } from './mirror-blobs.ts';
 import {
+  isActive,
   listingIsHeld,
   timestampToIso,
   type MirrorNotebook,
@@ -49,6 +50,7 @@ import {
   type MirrorPageContent,
   type MirrorSection,
   type MirrorSectionGroup,
+  type NotebookSelection,
 } from './mirror-schema.ts';
 import type { ScanResult } from './mirror-store.ts';
 import { trimPageHtml } from './page-html.ts';
@@ -59,15 +61,46 @@ import type { ReadSync } from './read-sync.ts';
  * What a tool tells the calling model about its answer.
  *
  * `onenote` is a claim that the answer equals what OneNote holds: either it came from
- * OneNote directly, or it came from the mirror after a refresh that finished. `mirror`
- * is the weaker claim — a stored copy that may be behind, with `mirroredAt` saying how
- * far.
+ * OneNote directly, or it came from the mirror after a refresh that finished, or it came
+ * from a page document no write has marked stale. `mirror` is the weaker claim — a stored
+ * copy that may be behind, with `mirroredAt` saying how far.
+ *
+ * `best-available` sits between them and exists because of one failure it prevents.
+ * Without it an unscoped `search_pages` would report `mirror` from the moment a single
+ * notebook was marked inactive, for ever after. `mirror` is the label for a *degraded*
+ * answer — the refresh failed, or ran out of budget, or the scheduler held the lease —
+ * and an answer that skipped an inactive notebook on purpose is not degraded. Reporting
+ * the two the same way would train a model to ignore the one that matters.
  *
  * Deliberately **not** the same axis as which store answered. A model has no use for
  * "Firestore or Graph", and reporting the store would make the common case — a mirror
  * read the inline sync just brought current — read as second-hand data.
  */
-export type MirrorSource = 'onenote' | 'mirror';
+export type MirrorSource = 'onenote' | 'best-available' | 'mirror';
+
+/**
+ * How much of one answer comes from notebooks the operator marked inactive.
+ *
+ * `none` and `all` are the two a covered tool normally produces, because a listing tool
+ * answers about one section and a page tool about one page. `some` is the unscoped
+ * search, and it is also the pessimistic value used when the mirror cannot say which
+ * notebook a document belongs to: a container the mirror cannot identify must not produce
+ * a claim stronger than the data supports.
+ */
+export type InactiveCoverage = 'none' | 'some' | 'all';
+
+/**
+ * What `source` means, appended to every covered tool's description.
+ *
+ * Nothing documented `source` to the calling model before, so `best-available` would
+ * arrive as an unexplained string. One exported constant rather than a sentence copied
+ * into eight descriptions, because eight copies drift.
+ */
+export const SOURCE_NOTE =
+  " The result's source field says what the answer is worth: 'onenote' means it is " +
+  "confirmed current with OneNote, 'best-available' means part of it comes from a " +
+  'notebook the operator has frozen and is the best there is, and ' +
+  "'mirror' means a local copy that may be behind, with mirroredAt saying how far.";
 
 /** Which store produced the data, which is what decides its shape. */
 export type ReadOrigin = 'mirror' | 'graph';
@@ -106,6 +139,7 @@ export type FallbackReason = 'miss' | 'stale' | 'oversize' | 'unavailable';
 
 /** The slice of MirrorStore the read path uses. MirrorStore satisfies it. */
 export interface MirrorReadStore {
+  getSelection(): Promise<NotebookSelection>;
   listNotebooks(): Promise<MirrorNotebook[]>;
   listSectionsUnder(parentId: string): Promise<MirrorSection[]>;
   listSectionGroupsUnder(parentId: string): Promise<MirrorSectionGroup[]>;
@@ -125,6 +159,14 @@ export interface MirrorReadStore {
 export interface MirroredNotebook extends Notebook {
   /** Is this notebook's page content mirrored, or only its name? */
   readonly pagesMirrored: boolean;
+  /**
+   * Is it re-checked, or frozen at whatever the backfill stored?
+   *
+   * Worth reporting because a model choosing where to look benefits from knowing which
+   * notebooks are kept current. False here does not mean the copy is wrong — it means
+   * nothing but a write through this server updates it.
+   */
+  readonly pagesActive: boolean;
 }
 
 /** Pages in a section, with the exact total rather than a `>= top` heuristic. */
@@ -150,17 +192,40 @@ export interface MirroredSearch {
   readonly scanTruncated: boolean;
   readonly notebooksSearched: number;
   readonly notebooksInAccount: number;
+  /** How many of the searched notebooks are frozen. `best-available` says a skip happened; this says how large it was. */
+  readonly inactiveNotebooks: number;
 }
+
+/**
+ * How long the selection document is held before it is read again.
+ *
+ * The same 30 seconds as `INLINE_SYNC_MIN_INTERVAL_MS`, and for a related reason: every
+ * covered tool call asks about activity, and without a memo each would add a Firestore
+ * document read to a request a person is waiting on. The worst consequence is a `source`
+ * label 30 seconds behind an operator's edit to the selection.
+ *
+ * Not imported from ./read-sync.ts: that constant paces Graph requests against an hourly
+ * budget and this one paces a Firestore read. They agree today by coincidence of scale.
+ */
+export const ACTIVITY_MEMO_MS = 30_000;
 
 export class MirrorReader {
   readonly #store: MirrorReadStore;
   readonly #blobs: MirrorBlobReader;
   readonly #maxInkBytes: number | undefined;
+  readonly #now: () => number;
+  #activity: { at: number; snapshot: Promise<ActivitySnapshot> } | null = null;
 
-  constructor(store: MirrorReadStore, blobs: MirrorBlobReader, maxInkBytes?: number) {
+  constructor(
+    store: MirrorReadStore,
+    blobs: MirrorBlobReader,
+    maxInkBytes?: number,
+    now: () => number = Date.now,
+  ) {
     this.#store = store;
     this.#blobs = blobs;
     this.#maxInkBytes = maxInkBytes;
+    this.#now = now;
   }
 
   /**
@@ -173,11 +238,86 @@ export class MirrorReader {
     const notebooks = await this.#store.listNotebooks();
     if (notebooks.length === 0) return null;
 
+    const { selection } = await this.#activitySnapshot();
+
     return notebooks.map((notebook) => ({
       id: notebook.id,
       displayName: notebook.displayName,
       pagesMirrored: notebook.mirrored,
+      pagesActive: notebook.mirrored && isActive(selection, notebook.id),
     }));
+  }
+
+  /**
+   * The selection and the mirrored notebooks, read once per `ACTIVITY_MEMO_MS`.
+   *
+   * The promise is memoised rather than its result, so two calls arriving together share
+   * one pair of reads. A failure is not cached: the entry is dropped so the next call
+   * tries again, because a Firestore blip must not pin every later answer to the
+   * pessimistic label for 30 seconds.
+   */
+  async #activitySnapshot(): Promise<ActivitySnapshot> {
+    const now = this.#now();
+    const held = this.#activity;
+    if (held !== null && now - held.at < ACTIVITY_MEMO_MS) return held.snapshot;
+
+    const snapshot = (async () => {
+      const [selection, notebooks] = await Promise.all([
+        this.#store.getSelection(),
+        this.#store.listNotebooks(),
+      ]);
+      return { selection, notebooks };
+    })();
+
+    this.#activity = { at: now, snapshot };
+    snapshot.catch(() => {
+      if (this.#activity?.snapshot === snapshot) this.#activity = null;
+    });
+
+    return snapshot;
+  }
+
+  /**
+   * Is this section's notebook frozen?
+   *
+   * `'some'` when the mirror holds no document for the section — it cannot say which
+   * notebook the answer came from, and a claim it cannot support must not be the stronger
+   * one. `MirrorSection` carries `notebookId`, so this costs no join.
+   */
+  async coverageOfSection(sectionId: string): Promise<InactiveCoverage> {
+    const section = await this.#store.getSection(sectionId);
+    if (section === null) return 'some';
+    return this.#coverageOfNotebook(section.notebookId);
+  }
+
+  /** The same question about a page. `MirrorPage` carries `notebookId` too. */
+  async coverageOfPage(pageId: string): Promise<InactiveCoverage> {
+    const page = await this.#store.getPage(pageId);
+    if (page === null) return 'some';
+    return this.#coverageOfNotebook(page.notebookId);
+  }
+
+  /**
+   * Activity across everything an unscoped read covers.
+   *
+   * Measured against the *mirrored* notebooks, not every notebook in the account: a
+   * notebook whose pages were never mirrored is not something this answer skipped, it is
+   * something the answer never claimed to cover — `notebooksSearched` against
+   * `notebooksInAccount` already says that.
+   */
+  async accountActivity(): Promise<InactiveCoverage> {
+    const { selection, notebooks } = await this.#activitySnapshot();
+    const mirrored = notebooks.filter((notebook) => notebook.mirrored);
+    if (mirrored.length === 0) return 'none';
+
+    const inactive = mirrored.filter((notebook) => !isActive(selection, notebook.id)).length;
+    if (inactive === 0) return 'none';
+    return inactive === mirrored.length ? 'all' : 'some';
+  }
+
+  async #coverageOfNotebook(notebookId: string): Promise<InactiveCoverage> {
+    const { selection } = await this.#activitySnapshot();
+    return isActive(selection, notebookId) ? 'none' : 'all';
   }
 
   /**
@@ -297,19 +437,21 @@ export class MirrorReader {
       if (listingIsHeld(section, Date.now())) return null;
     } else if (await this.#heldInScope(scope.notebookId)) return null;
 
-    const notebooks = await this.#store.listNotebooks();
+    const { selection, notebooks } = await this.#activitySnapshot();
     if (notebooks.length === 0) return null;
 
     const scan = await this.#store.scanPages(scope);
     const matches = scan.pages.filter((page) => matcher(page.title)).map(toMatch);
+    const mirrored = notebooks.filter((notebook) => notebook.mirrored);
 
     return {
       matches,
       totalMatches: matches.length,
       pagesScanned: scan.pages.length,
       scanTruncated: scan.truncated,
-      notebooksSearched: notebooks.filter((notebook) => notebook.mirrored).length,
+      notebooksSearched: mirrored.length,
       notebooksInAccount: notebooks.length,
+      inactiveNotebooks: mirrored.filter((notebook) => !isActive(selection, notebook.id)).length,
     };
   }
 
@@ -477,6 +619,24 @@ export interface SourcedRead<M, G> {
   fromMirror(reader: MirrorReader): Promise<M | null>;
   fromGraph(): Promise<G>;
   mirroredAt?(reader: MirrorReader): Promise<string | null>;
+  /**
+   * How much of this answer comes from notebooks the operator marked inactive.
+   *
+   * Evaluated only on a mirror hit, after `fromMirror` has answered, and handed that
+   * answer — the two `_by_name` reading tools resolve a section id inside `fromMirror`
+   * and that id is the only thing saying which notebook the answer came from. Every other
+   * tool ignores the parameter and uses the id its handler already holds.
+   *
+   * Absent means `'none'`: a tool that does not set it reports exactly what it did before
+   * this existed.
+   */
+  inactiveCoverage?(reader: MirrorReader, data: M): Promise<InactiveCoverage>;
+}
+
+/** The selection and the notebook list, read together and memoised together. */
+interface ActivitySnapshot {
+  readonly selection: NotebookSelection;
+  readonly notebooks: MirrorNotebook[];
 }
 
 /**
@@ -489,7 +649,8 @@ export interface SourcedRead<M, G> {
  * 2. **Read the mirror.** A hit is the common case and costs no Graph request.
  * 3. **Report.** A hit is `onenote` when the refresh finished, or when the mirror tracks
  *    this thing's staleness itself and did not mark it stale. Otherwise `mirror`, with
- *    `mirroredAt` saying how old the copy is.
+ *    `mirroredAt` saying how old the copy is. An answer drawn from a notebook the
+ *    operator marked inactive is `best-available` instead — see `sourceFor`.
  *
  * A miss falls through to Graph, which is `onenote` by definition. Every failure mode
  * ends there: a page the mirror does not hold, a mirror holding no structure at all, and
@@ -523,12 +684,40 @@ export async function readSourced<M, G = M>(read: SourcedRead<M, G>): Promise<So
   const stamp =
     read.mirroredAt === undefined ? null : await read.mirroredAt(mirror).catch(() => null);
 
+  // Pessimistic on failure: `'some'` cannot produce `onenote`, and cannot produce
+  // `mirror` on an answer whose refresh was fine. A selection this cannot read must not
+  // turn into a stronger claim than the data supports, and must not fail the read.
+  const coverage =
+    read.inactiveCoverage === undefined
+      ? 'none'
+      : await read.inactiveCoverage(mirror, hit).catch(() => 'some' as const);
+
+  const confirmed = freshness === 'current' || read.staleTracked === true;
+
   return {
     data: hit,
     origin: 'mirror',
-    source: freshness === 'current' || read.staleTracked === true ? 'onenote' : 'mirror',
+    source: sourceFor(coverage, confirmed),
     ...(stamp === null ? {} : { mirroredAt: stamp }),
   };
+}
+
+/**
+ * The whole source truth table, in one place.
+ *
+ * The `'all'` row is the one that looks wrong and is not. A `list_pages` on a section in
+ * an inactive notebook reports `best-available` even when the inline refresh failed
+ * outright, because that refresh was never going to check that notebook — the label would
+ * be reporting a failure that could not have changed the answer. The claim rests on two
+ * things instead, neither involving the refresh: the operator's assertion that the
+ * notebook is not edited, and the fact that a write through this server marks its page
+ * stale or holds its section listing, and a held listing is a mirror miss which goes to
+ * Graph.
+ */
+function sourceFor(coverage: InactiveCoverage, confirmed: boolean): MirrorSource {
+  if (coverage === 'all') return 'best-available';
+  if (coverage === 'none') return confirmed ? 'onenote' : 'mirror';
+  return confirmed ? 'best-available' : 'mirror';
 }
 
 function reasonOf(err: unknown): FallbackReason {

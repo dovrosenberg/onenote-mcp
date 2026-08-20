@@ -31,6 +31,7 @@ import {
   listingIsHeld,
   LISTING_HOLD_EXPIRY_MS,
   overlapFrom,
+  isActive,
   readSelection,
   readSyncState,
   utf8Bytes,
@@ -97,7 +98,7 @@ test('the three object names are distinct and keyed by the encoded page id', () 
 test('a well-formed selection reads back in order, deduplicated', () => {
   assert.deepEqual(
     readSelection({ notebookIds: ['nb-1', 'nb-2', 'nb-1'] }),
-    { notebookIds: ['nb-1', 'nb-2'] },
+    { notebookIds: ['nb-1', 'nb-2'], activeNotebookIds: null },
   );
 });
 
@@ -117,6 +118,7 @@ test('anything a person could leave in the selection document means "mirror noth
   ]) {
     assert.deepEqual(readSelection(data as Record<string, unknown> | undefined), {
       notebookIds: [],
+      activeNotebookIds: null,
     });
   }
 });
@@ -124,14 +126,68 @@ test('anything a person could leave in the selection document means "mirror noth
 test('one bad entry does not discard the good ones beside it', () => {
   assert.deepEqual(
     readSelection({ notebookIds: ['nb-1', 42, null, '', '   ', { id: 'nb-x' }, 'nb-2'] }),
-    { notebookIds: ['nb-1', 'nb-2'] },
+    { notebookIds: ['nb-1', 'nb-2'], activeNotebookIds: null },
   );
 });
 
 test('selection entries are trimmed, because a console paste carries whitespace', () => {
   assert.deepEqual(readSelection({ notebookIds: ['  nb-1  ', 'nb-1'] }), {
     notebookIds: ['nb-1'],
+    activeNotebookIds: null,
   });
+});
+
+test('an absent or malformed active list means every selected notebook is active', () => {
+  // Null rather than []: the two mean opposite things, and failing open is the safe
+  // direction. A malformed value that read as "none active" would freeze the mirror with
+  // nothing saying so; reading it as "all active" only costs Graph requests.
+  for (const data of [
+    { notebookIds: ['nb-1'] },
+    { notebookIds: ['nb-1'], activeNotebookIds: null },
+    { notebookIds: ['nb-1'], activeNotebookIds: 'nb-1' },
+    { notebookIds: ['nb-1'], activeNotebookIds: 42 },
+    { notebookIds: ['nb-1'], activeNotebookIds: {} },
+  ]) {
+    assert.equal(readSelection(data as Record<string, unknown>).activeNotebookIds, null);
+  }
+});
+
+test('an empty active list is a deliberate edit, not a missing one', () => {
+  // "Freeze everything" is a state an operator may legitimately want, and it has to be
+  // distinguishable from a document that has never heard of the field.
+  assert.deepEqual(readSelection({ notebookIds: ['nb-1'], activeNotebookIds: [] }), {
+    notebookIds: ['nb-1'],
+    activeNotebookIds: [],
+  });
+});
+
+test('the active list is read by the same rules as the selection', () => {
+  assert.deepEqual(
+    readSelection({
+      notebookIds: ['nb-1', 'nb-2'],
+      activeNotebookIds: ['  nb-2  ', 'nb-2', 42, '', null, 'nb-1'],
+    }),
+    { notebookIds: ['nb-1', 'nb-2'], activeNotebookIds: ['nb-2', 'nb-1'] },
+  );
+});
+
+test('isActive is true for everything when no active set was named', () => {
+  const selection = readSelection({ notebookIds: ['nb-1', 'nb-2'] });
+  assert.equal(isActive(selection, 'nb-1'), true);
+  // It does not consult notebookIds: a notebook that is not mirrored never reaches a
+  // code path that asks, and adding the check would make the answer depend on two fields.
+  assert.equal(isActive(selection, 'nb-nowhere'), true);
+});
+
+test('isActive is true only for the listed notebooks when a set was named', () => {
+  const selection = readSelection({
+    notebookIds: ['nb-1', 'nb-2'],
+    activeNotebookIds: ['nb-2'],
+  });
+  assert.equal(isActive(selection, 'nb-2'), true);
+  assert.equal(isActive(selection, 'nb-1'), false);
+
+  assert.equal(isActive(readSelection({ notebookIds: ['nb-1'], activeNotebookIds: [] }), 'nb-1'), false);
 });
 
 // ---------------------------------------------------------------------------
@@ -256,6 +312,8 @@ test('a well-formed sync-state document reads back verbatim', () => {
     runningMode: 'sweep',
     runningSince: '2026-08-19T12:05:00Z',
     unknownNotebookIds: 1,
+    activeSelectionHash: 'def456',
+    unknownActiveNotebookIds: 2,
   };
 
   assert.deepEqual(readSyncState(stored), stored);

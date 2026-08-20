@@ -61,8 +61,10 @@ import {
   type ToolDefinition,
 } from './mcp-tools.ts';
 import {
+  SOURCE_NOTE,
   mirrorLookupStructure,
   readSourced,
+  type InactiveCoverage,
   type MirroredSearch,
   type MirrorReader,
   type Sourced,
@@ -134,7 +136,10 @@ export function createStructureTools(
         'List every OneNote notebook the signed-in account can see. Start here when you ' +
         'do not already hold a notebook, section group, or section id. Each notebook ' +
         'comes back with an id and a display name; pass the id to list_sections with ' +
-        "containerType 'notebook' to see what is inside it.",
+        "containerType 'notebook' to see what is inside it. pagesMirrored says whether " +
+        'this server holds a local copy of the pages in this notebook, and pagesActive ' +
+        'whether it keeps that copy up to date.' +
+        SOURCE_NOTE,
       inputSchema: {
         type: 'object',
         properties: {},
@@ -155,6 +160,7 @@ export function createStructureTools(
               id: notebook.id,
               displayName: notebook.displayName,
               pagesMirrored: false,
+              pagesActive: false,
             })),
         });
 
@@ -180,7 +186,7 @@ export function createStructureTools(
         "can be passed straight back in with containerType 'sectionGroup' to descend a " +
         'level. Only a section holds pages — take an item of type \'section\' to ' +
         'list_pages. This account is organised as a notebook per year with a section ' +
-        'group per month, so expect to descend at least once.',
+        'group per month, so expect to descend at least once.' + SOURCE_NOTE,
       inputSchema: {
         type: 'object',
         properties: {
@@ -247,7 +253,8 @@ export function createStructureTools(
         "an id of type 'section' from list_sections; a section group id will fail. top " +
         `bounds how many pages come back (${TOP_RANGE.min}-${TOP_RANGE.max}, default ` +
         `${DEFAULT_TOP}); when exactly top pages are returned, moreAvailable is true and ` +
-        'older pages exist beyond them. Pass a page id to get_page_content to read one.',
+        'older pages exist beyond them. Pass a page id to get_page_content to read one.' +
+        SOURCE_NOTE,
       inputSchema: {
         type: 'object',
         properties: {
@@ -273,6 +280,7 @@ export function createStructureTools(
           sync,
           fromMirror: (reader) => reader.listPagesInSection(sectionId, top),
           fromGraph: () => structure.listPagesInSection(sectionId, top),
+          inactiveCoverage: (reader) => reader.coverageOfSection(sectionId),
         });
 
         // The two paths mean different things by "more available", and collapsing them
@@ -311,7 +319,7 @@ export function createStructureTools(
         `${budgetSeconds} seconds. The result ` +
         'always reports sectionsSearched, sectionsFound, and stoppedEarly: when ' +
         'stoppedEarly is true, no match found is not the same as no such page, and the ' +
-        'search should be narrowed with sectionId rather than repeated.',
+        'search should be narrowed with sectionId rather than repeated.' + SOURCE_NOTE,
       inputSchema: {
         type: 'object',
         properties: {
@@ -346,6 +354,12 @@ export function createStructureTools(
             sectionId === undefined
               ? searchAllSections(structure, query, searchOptions)
               : searchOneSection(structure, sectionId, query, searchOptions),
+          // Scoped, this is one section's notebook. Unscoped, the answer covers every
+          // mirrored notebook, so the question is how many of them are frozen.
+          inactiveCoverage: (reader) =>
+            sectionId === undefined
+              ? reader.accountActivity()
+              : reader.coverageOfSection(sectionId),
         });
 
         const common = {
@@ -381,6 +395,7 @@ export function createStructureTools(
           scanTruncated: found.scanTruncated,
           notebooksSearched: found.notebooksSearched,
           notebooksInAccount: found.notebooksInAccount,
+          inactiveNotebooks: found.inactiveNotebooks,
           note: mirrorSearchNote(found, matches.length),
         });
       },
@@ -402,7 +417,7 @@ export function createStructureTools(
         'sectionGroupName when the section sits directly in the notebook; it is not a ' +
         'wildcard. A name that matches nothing, or matches more than one thing, comes ' +
         'back as an error listing the candidates. Returns the page id to pass to ' +
-        'get_page_content.',
+        'get_page_content.' + SOURCE_NOTE,
       inputSchema: {
         type: 'object',
         properties: {
@@ -461,7 +476,7 @@ export function createStructureTools(
         "finds '062 - February'), then as a substring. This is list_pages without the " +
         'two calls it would take to turn those names into a section id. top ' +
         `bounds the result (${TOP_RANGE.min}-${TOP_RANGE.max}, default ${DEFAULT_TOP}) ` +
-        'and moreAvailable reports whether older pages exist beyond it.',
+        'and moreAvailable reports whether older pages exist beyond it.' + SOURCE_NOTE,
       inputSchema: {
         type: 'object',
         properties: {
@@ -609,6 +624,13 @@ function mirrorSearchNote(found: MirroredSearch, returned: number): string {
     parts.push('Every notebook in the account was searched.');
   }
 
+  if (found.inactiveNotebooks > 0) {
+    parts.push(
+      `${found.inactiveNotebooks} of the notebooks searched are not re-checked against ` +
+        'OneNote, so an edit made there in the OneNote client may not be reflected.',
+    );
+  }
+
   if (found.scanTruncated) {
     parts.push(
       `The scan stopped after ${found.pagesScanned} pages, so no match found is not the ` +
@@ -671,6 +693,9 @@ async function resolveAndList(
       return pages === null ? null : { resolved, pages };
     },
     fromGraph: viaGraph,
+    // The section id only exists inside the mirror answer: these two tools resolve a
+    // name rather than being handed an id, so this is the one place `data` is needed.
+    inactiveCoverage: (reader, data) => reader.coverageOfSection(data.resolved.section.id),
   });
 
   return { resolved: sourced.data.resolved, pages: sourced.data.pages, sourced };

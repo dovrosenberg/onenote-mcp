@@ -230,6 +230,16 @@ watermark overlap nearly free. What no test there covers is whether Graph's time
 behave as the algorithm assumes — that a page create, edit and delete each move the
 section's `lastModifiedDateTime` is measured in `api-overview.md`, not checked here.
 
+The activity tests in `test/mirror-sync.test.ts` are all about something that does **not**
+happen, because a filter that silently stopped filtering costs Graph requests against a
+400-per-hour budget and nothing in a run report would look wrong. The one easiest to lose is
+the `sectionRollUpTrusted: false` case: `pickCandidates` returns early there, so a filter
+folded into it would have to be applied on both sides of that branch, and missing the second
+side means visiting every archived section every run. `test/mirror-reader.test.ts` asserts
+all nine `sourceFor` combinations rather than a sample, because each one is a claim a model
+acts on, and the `all` row reports `best-available` even with a failed refresh — which reads
+as a bug until you notice the refresh was never going to check that notebook.
+
 `test/sync-route.test.ts` is `test/keepalive.test.ts`'s shape: its own router with a fake
 target for everything the route decides, plus `createApp` for the two facts a fake router
 cannot show. It asserts that each of the three paths reaches its own mode and no other,
@@ -916,6 +926,33 @@ the structure already in Firestore returns `complete` while missing every notebo
 since the last good tree read; and a failed page fetch leaves that page's stored copy
 exactly where it was.
 
+**There is a third `source`, `best-available`, and it exists for one failure.** Without it
+an unscoped `search_pages` would report `mirror` from the moment a single notebook was
+marked inactive, for ever after. `mirror` is the label for a *degraded* answer — the
+refresh failed, ran out of budget, or the scheduler held the lease — and an answer that
+skipped a frozen notebook on purpose is not degraded. Reporting the two the same way would
+train a model to ignore the one that matters. The whole table is `sourceFor` in
+`src/mirror-reader.ts`: coverage `all` is `best-available` **whether or not the refresh
+finished**, because that refresh was never going to check that notebook, so reporting its
+failure would describe something that could not have changed the answer.
+
+**A tool says how much of its answer is frozen through `inactiveCoverage`, and absent
+means `none`.** It is evaluated only on a mirror hit, only after `fromMirror` answered,
+and it is handed that answer — the two `_by_name` reading tools resolve a section id inside
+`fromMirror`, and that id is the only thing saying which notebook the answer came from.
+An error thrown by it is caught and treated as `some`, the pessimistic value: it cannot
+produce `onenote`, and it cannot produce `mirror` on an answer whose refresh was fine.
+`list_notebooks` and `list_sections` set it on neither, because structure is stored for the
+whole account on every run whatever the active set says — weakening their label would
+report a staleness they do not have.
+
+**The activity snapshot is memoised for `ACTIVITY_MEMO_MS`, and a failure is not cached.**
+Every covered tool call asks about activity, so without the memo each would add a Firestore
+document read to a request a person is waiting on. The promise is memoised rather than its
+result, so two calls arriving together share one pair of reads; a rejection drops the entry,
+because a cached rejection would pin every later answer to the pessimistic label for the
+whole window over one Firestore blip.
+
 **`staleTracked` is set on `get_page_content` and must not be set on anything else.** It
 is what lets a page hit report `onenote` without a finished refresh, and the licence comes
 from the page document rather than from the sync: every write calls `markPageStale` before
@@ -987,6 +1024,45 @@ run that did not finish leaves it open — and `resolveSection` would turn that 
 such section". Both `_by_name` reading tools retry the whole resolve-and-list against
 Graph before reporting. The retry costs one request and only on a failure, and a name that
 exists nowhere still raises.
+
+**An inactive notebook is backfilled once and then never re-listed.** `activeNotebookIds`
+in the selection document names which mirrored notebooks a sync still re-checks; absent or
+malformed means all of them, and `[]` means none — which is why `NotebookSelection` holds
+`readonly string[] | null` rather than an array that happened to be empty. `splitByActivity`
+in `src/mirror-sync.ts` is the one place the filter is written, and `includeBackfill` is
+what makes the backfill run exactly once: a section with `pagesSyncedThrough === null` is
+eligible whatever its notebook's activity. A sweep passes false, because a sweep reconciles
+page ids against a section that is already filled. `sweep-all` skips the filter entirely and
+is the only thing that reaches a frozen notebook, which is what it is for.
+
+**`active` stays out of `structureHashOf` and off the section documents, and that is not
+tidiness.** `putStructure` replaces documents wholesale — `#replaceCollection` calls
+`batch.set` with no merge — and `buildStructure` emits `pagesSyncedThrough: null`, so
+anything entering the structure hash resets every section's watermark when it changes.
+Putting `active` there would make an activation edit trigger a full re-backfill of the whole
+selection, which is hours of the request budget. It gets its own `activeSelectionHash`
+instead.
+
+**Changing the active set clears `sectionsScannedThrough`, and a null stored hash does
+not.** Tier 1 of `pickCandidates` skips a section whose `graphLastModifiedDateTime` is older
+than `overlapFrom(state.sectionsScannedThrough)`, and that cutoff advances on every completed
+run — so a notebook re-activated after three months would have every section older than the
+cutoff and would never be re-checked at all. Clearing it costs one wide run: each section
+still lists only its own changes against its own per-section watermark, which is untouched.
+A **null** stored hash is a state document written before the field existed rather than a
+change to the active set, so it records the hash and widens nothing; treating it as a change
+would make the first run after every deploy a full-width scan. `reconcileActivity` also
+returns whether it reset, because `ctx.state` is a snapshot taken before the patch and tier 1
+would otherwise still compare against the old cutoff on the very run the reset exists to
+widen.
+
+**Activity never touches the write path.** `resyncPage` consults `section.mirrored` and
+nothing else, so a write to a frozen notebook still marks the page stale, still reaches
+OneNote, and still updates the mirror. Adding a symmetrical activity check there for tidiness
+would leave every write to a frozen notebook serving pre-write content until a `sweep-all`
+ran, which may be never. The consequence worth stating: a frozen notebook's mirror copy is
+correct for every edit made through this server and stale for every edit made in the OneNote
+client, and that is the trade the operator makes by freezing it.
 
 **Every write resyncs its page immediately, and that costs one Graph request.** All five
 writing tools call `resyncPage` after a successful write — including `create_page`, whose
@@ -1139,8 +1215,8 @@ different things and a credential should reach one of them. Unmounted when
 `MIRROR_SYNC_SECRET` is unset, so the path 404s and an operator learns the service is
 unconfigured rather than that they mistyped a secret.
 
-**The sync's mode is the path — `/sync`, `/sync/sweep`, `/sync/sweep/full` — not a body
-field or a query parameter.** `src/logging.ts` records the method, the path and the
+**The sync's mode is the path — `/sync`, `/sync/sweep`, `/sync/sweep/full`,
+`/sync/sweep/all` — not a body field or a query parameter.** `src/logging.ts` records the method, the path and the
 status, and deliberately records no query string and no body. A mode carried in either
 would appear in no log line, and "which job ran, and did it answer?" is the first
 question when the mirror looks wrong. A body would also need a JSON parser on a route

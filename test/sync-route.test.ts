@@ -44,6 +44,8 @@ function report(overrides: Partial<SyncReport> = {}): SyncReport {
     pagesDeleted: 0,
     pagesFailed: 0,
     unknownNotebookIds: 0,
+    unknownActiveNotebookIds: 0,
+    sectionsSkippedInactive: 0,
     treeRead: true,
     durationMs: 1234,
     ...overrides,
@@ -65,6 +67,7 @@ function recording(recorder: Recorder, fail?: () => Error): SyncTarget {
     runIncremental: make('runIncremental'),
     runSweep: make('runSweep'),
     runFullSweep: make('runFullSweep'),
+    runSweepAll: make('runSweepAll'),
   };
 }
 
@@ -100,6 +103,7 @@ test('each path reaches its own mode and no other', async () => {
     ['', 'runIncremental'],
     ['/sweep', 'runSweep'],
     ['/sweep/full', 'runFullSweep'],
+    ['/sweep/all', 'runSweepAll'],
   ] as const) {
     recorder.calls.length = 0;
     const res = await target.send('POST', path, auth);
@@ -135,6 +139,7 @@ test('a budget-exhausted run is 200, not 503', async () => {
       Promise.resolve(report({ outcome: 'budget-exhausted', done: false, graphRequests: 120 })),
     runSweep: () => Promise.resolve(report()),
     runFullSweep: () => Promise.resolve(report()),
+    runSweepAll: () => Promise.resolve(report()),
   };
   const target = serve(syncRouter(SECRET, exhausted));
   after(() => target.close());
@@ -160,7 +165,7 @@ test('a wrong or missing secret is 401 on every path and costs no run', async ()
     ['empty', { headers: { [SYNC_HEADER]: '' } }],
   ];
 
-  for (const path of ['', '/sweep', '/sweep/full']) {
+  for (const path of ['', '/sweep', '/sweep/full', '/sweep/all']) {
     for (const [label, init] of cases) {
       const res = await target.send('POST', path, init);
       assert.equal(res.status, 401, `${path} ${label}`);
@@ -233,7 +238,7 @@ test('only POST is answered; everything else is 405 with Allow', async () => {
   const target = serve(syncRouter(SECRET, recording(recorder)));
   after(() => target.close());
 
-  for (const path of ['', '/sweep', '/sweep/full']) {
+  for (const path of ['', '/sweep', '/sweep/full', '/sweep/all']) {
     for (const method of ['GET', 'PUT', 'DELETE', 'PATCH']) {
       const res = await target.send(method, path, auth);
       assert.equal(res.status, 405, `${method} ${path}`);
@@ -283,7 +288,12 @@ test('with no sync secret configured, every sync path is a 404', async () => {
   const app = serveApp(BASE_CONFIG);
   after(() => app.close());
 
-  for (const path of [SYNC_PATH, `${SYNC_PATH}/sweep`, `${SYNC_PATH}/sweep/full`]) {
+  for (const path of [
+    SYNC_PATH,
+    `${SYNC_PATH}/sweep`,
+    `${SYNC_PATH}/sweep/full`,
+    `${SYNC_PATH}/sweep/all`,
+  ]) {
     const res = await app.send('POST', path);
     assert.equal(res.status, 404, path);
   }

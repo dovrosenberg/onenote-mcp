@@ -55,6 +55,7 @@ import {
   htmlPlacement,
   htmlObjectName,
   inkObjectName,
+  isActive,
   inkmlObjectName,
   overlapFrom,
   utf8Bytes,
@@ -148,6 +149,10 @@ export interface SyncReport {
   readonly pagesFailed: number;
   /** Selected notebook ids matching no notebook. A mistyped id is silent otherwise. */
   readonly unknownNotebookIds: number;
+  /** Active notebook ids matching no notebook. */
+  readonly unknownActiveNotebookIds: number;
+  /** Sections this run declined to visit because their notebook is not active. */
+  readonly sectionsSkippedInactive: number;
   /** False when the expanded-tree read failed and stored structure was used instead. */
   readonly treeRead: boolean;
   readonly durationMs: number;
@@ -196,6 +201,14 @@ export interface BuiltStructure {
   readonly sections: MirrorSection[];
   /** Selected notebook ids that matched no notebook in the tree. */
   readonly unknownNotebookIds: string[];
+  /**
+   * Active notebook ids that name no *mirrored* notebook.
+   *
+   * Two ways to get there and both are silent otherwise: a typo, which matches nothing in
+   * the tree, and a real notebook id that was never added to `notebookIds`, whose pages
+   * are not mirrored so marking it active reaches nothing.
+   */
+  readonly unknownActiveNotebookIds: string[];
 }
 
 /**
@@ -283,11 +296,16 @@ export function buildStructure(
     }
   }
 
+  const mirroredIds = new Set(notebooks.filter((n) => n.mirrored).map((n) => n.id));
+
   return {
     notebooks,
     sectionGroups,
     sections,
     unknownNotebookIds: selection.notebookIds.filter((id) => !seen.has(id)),
+    unknownActiveNotebookIds: (selection.activeNotebookIds ?? []).filter(
+      (id) => !mirroredIds.has(id),
+    ),
   };
 }
 
@@ -326,11 +344,22 @@ export async function runIncremental(
 }
 
 export async function runSweep(deps: SyncDeps, options: SyncOptions): Promise<SyncReport> {
-  return runMode('sweep', deps, options, (ctx) => sweepPass(ctx, false));
+  return runMode('sweep', deps, options, (ctx) => sweepPass(ctx, false, true));
 }
 
 export async function runFullSweep(deps: SyncDeps, options: SyncOptions): Promise<SyncReport> {
-  return runMode('sweep-full', deps, options, (ctx) => sweepPass(ctx, true));
+  return runMode('sweep-full', deps, options, (ctx) => sweepPass(ctx, true, true));
+}
+
+/**
+ * Every section of every mirrored notebook, active or not.
+ *
+ * The one mode with no activity filter. An inactive notebook is not re-checked by any
+ * other pass, so this is the only thing that notices a page deleted in the OneNote client
+ * from a notebook the operator froze. Run it by hand, or rarely.
+ */
+export async function runSweepAll(deps: SyncDeps, options: SyncOptions): Promise<SyncReport> {
+  return runMode('sweep-all', deps, options, (ctx) => sweepPass(ctx, true, false));
 }
 
 interface PassContext {
@@ -358,6 +387,8 @@ interface Tally {
   pagesDeleted: number;
   pagesFailed: number;
   unknownNotebookIds: number;
+  unknownActiveNotebookIds: number;
+  sectionsSkippedInactive: number;
   treeRead: boolean;
   done: boolean;
 }
@@ -388,6 +419,8 @@ async function runMode(
     pagesDeleted: 0,
     pagesFailed: 0,
     unknownNotebookIds: 0,
+    unknownActiveNotebookIds: 0,
+    sectionsSkippedInactive: 0,
     treeRead: false,
     done: true,
   };
@@ -426,6 +459,8 @@ async function runMode(
     pagesDeleted: tally.pagesDeleted,
     pagesFailed: tally.pagesFailed,
     unknownNotebookIds: tally.unknownNotebookIds,
+    unknownActiveNotebookIds: tally.unknownActiveNotebookIds,
+    sectionsSkippedInactive: tally.sectionsSkippedInactive,
     treeRead: tally.treeRead,
     durationMs: now() - startedAt,
   };
@@ -436,6 +471,7 @@ async function runMode(
     lastRunPagesUpdated: report.pagesUpdated,
     lastRunPagesDeleted: report.pagesDeleted,
     unknownNotebookIds: report.unknownNotebookIds,
+    unknownActiveNotebookIds: report.unknownActiveNotebookIds,
   });
 
   logEvent('sync-completed', {
@@ -446,6 +482,7 @@ async function runMode(
     pagesUpdated: report.pagesUpdated,
     pagesDeleted: report.pagesDeleted,
     pagesFailed: report.pagesFailed,
+    sectionsSkippedInactive: report.sectionsSkippedInactive,
     durationMs: report.durationMs,
   });
 
@@ -460,9 +497,17 @@ async function incrementalPass(ctx: PassContext): Promise<void> {
   }
 
   const structureChanged = await reconcileStructure(ctx);
+  const reactivated = await reconcileActivity(ctx);
 
   const sections = await ctx.deps.store.listSectionsToSync();
-  const candidates = pickCandidates(sections, ctx.state, ctx.tally.treeRead && !structureChanged);
+  const { eligible, skippedInactive } = splitByActivity(sections, ctx.selection, true);
+  ctx.tally.sectionsSkippedInactive = skippedInactive;
+
+  // `reactivated` nulled `sectionsScannedThrough` in the store, but `ctx.state` is a
+  // snapshot taken before that write, so tier 1 would still compare against the old
+  // cutoff on this very run — the run the reset exists to widen.
+  const state = reactivated ? { ...ctx.state, sectionsScannedThrough: null } : ctx.state;
+  const candidates = pickCandidates(eligible, state, ctx.tally.treeRead && !structureChanged);
 
   for (const section of candidates) {
     if (ctx.budget.exhausted) {
@@ -519,11 +564,52 @@ async function reconcileStructure(ctx: PassContext): Promise<boolean> {
     logEvent('mirror-selection-unknown', { count: built.unknownNotebookIds.length });
   }
 
+  ctx.tally.unknownActiveNotebookIds = built.unknownActiveNotebookIds.length;
+  if (built.unknownActiveNotebookIds.length > 0) {
+    logEvent('mirror-selection-unknown-active', { count: built.unknownActiveNotebookIds.length });
+  }
+
   const hash = structureHashOf(built);
   if (hash === ctx.state.structureHash) return false;
 
   await ctx.deps.store.putStructure(built);
   await ctx.deps.store.patchSyncState({ structureHash: hash });
+  return true;
+}
+
+/**
+ * Notice a change to the active set, and widen this run so re-activation works.
+ *
+ * Returns true when the set changed. Without this a re-activated notebook would never be
+ * re-checked: tier 1 of `pickCandidates` skips a section whose
+ * `graphLastModifiedDateTime` is older than `overlapFrom(state.sectionsScannedThrough)`,
+ * and that cutoff advances on every completed run. A section last edited three months
+ * ago, while its notebook was inactive, is older than the cutoff for ever.
+ *
+ * Nulling the watermark costs one wide run: `overlapFrom(null)` is the epoch, so every
+ * mirrored active section becomes a candidate. Each still lists only its own changes,
+ * against its own per-section watermark, which this does not touch — so the cost is one
+ * `listPagesChangedSince` per section and no page re-fetches. The run is budget-bounded
+ * and resumable like any other.
+ */
+async function reconcileActivity(ctx: PassContext): Promise<boolean> {
+  const hash = activeSelectionHashOf(ctx.selection);
+  const stored = ctx.state.activeSelectionHash;
+  if (hash === stored) return false;
+
+  // A null stored hash is a state document written before this field existed, not a
+  // change to the active set. Nothing was skipped for inactivity under it, so there is
+  // nothing to widen — record the hash and leave the watermark alone. Resetting here
+  // instead would make the first run after every deploy a full-width scan.
+  if (stored === null) {
+    await ctx.deps.store.patchSyncState({ activeSelectionHash: hash });
+    return false;
+  }
+
+  await ctx.deps.store.patchSyncState({
+    sectionsScannedThrough: null,
+    activeSelectionHash: hash,
+  });
   return true;
 }
 
@@ -540,6 +626,57 @@ async function reconcileStructure(ctx: PassContext): Promise<boolean> {
  * absent" and "the timestamp cannot be relied on" have to behave identically, or a
  * service that quietly stopped returning it would silently stop the mirror updating.
  */
+/**
+ * Split sections into the ones this run may visit and a count of what it declined.
+ *
+ * A separate exported function rather than a parameter on `pickCandidates`, for two
+ * reasons. The count of what was declined has to reach the report, and a filter folded
+ * into `pickCandidates` would have to return it alongside the list. And `pickCandidates`
+ * has an early return for `!state.sectionRollUpTrusted || !timestampsAreFresh` that a
+ * folded-in filter would have to be applied on both sides of — the kind of duplication
+ * that ends with one side wrong.
+ *
+ * `includeBackfill` is what makes an inactive notebook fill up exactly once: a section
+ * that has never been synced is eligible whatever its notebook's activity, and from then
+ * on no incremental run lists it again. A sweep never backfills, so it passes false.
+ */
+export function splitByActivity(
+  sections: readonly MirrorSection[],
+  selection: NotebookSelection,
+  includeBackfill: boolean,
+): { eligible: MirrorSection[]; skippedInactive: number } {
+  const eligible: MirrorSection[] = [];
+  let skippedInactive = 0;
+
+  for (const section of sections) {
+    if (isActive(selection, section.notebookId)) {
+      eligible.push(section);
+    } else if (includeBackfill && section.pagesSyncedThrough === null) {
+      eligible.push(section);
+    } else {
+      skippedInactive += 1;
+    }
+  }
+
+  return { eligible, skippedInactive };
+}
+
+/**
+ * A hash of the active set alone, so a change to it is detectable across runs.
+ *
+ * Over the active ids only, not the whole selection: a change to `notebookIds` already
+ * moves the structure hash and rewrites the structure. The sentinel for "no active set
+ * named" has to be a value no id list can produce, because `null` and `[]` mean opposite
+ * things here.
+ */
+export function activeSelectionHashOf(selection: NotebookSelection): string {
+  if (selection.activeNotebookIds === null) return 'all';
+
+  const hash = createHash('sha256');
+  for (const id of [...selection.activeNotebookIds].sort()) hash.update(`${id}\n`);
+  return hash.digest('hex');
+}
+
 export function pickCandidates(
   sections: readonly MirrorSection[],
   state: MirrorSyncState,
@@ -859,13 +996,29 @@ async function deletePage(
  * same class of unknown as the section roll-up — so without this it would be invisible
  * until someone next edited it.
  */
-async function sweepPass(ctx: PassContext, unscoped: boolean): Promise<void> {
+async function sweepPass(
+  ctx: PassContext,
+  unscoped: boolean,
+  activeOnly: boolean,
+): Promise<void> {
   if (ctx.selection.notebookIds.length === 0) return;
 
   await reconcileStructure(ctx);
   await learnNestedGroups(ctx);
 
-  const all = await ctx.deps.store.listSectionsToSync();
+  const stored = await ctx.deps.store.listSectionsToSync();
+
+  // `includeBackfill` is false: a sweep reconciles page ids against a section it has
+  // already filled, and a never-synced section in an inactive notebook is the
+  // incremental pass's job. `sweep-all` skips the filter entirely, which is what it is
+  // for.
+  let all = stored;
+  if (activeOnly) {
+    const split = splitByActivity(stored, ctx.selection, false);
+    all = split.eligible;
+    ctx.tally.sectionsSkippedInactive = split.skippedInactive;
+  }
+
   const sections = unscoped ? all : pickCandidates(all, ctx.state, ctx.tally.treeRead);
 
   const resumeAt = ctx.state.sweepCursorSectionId;
