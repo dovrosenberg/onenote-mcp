@@ -38,6 +38,8 @@ import {
 
 import { logEvent } from './logging.ts';
 import {
+  NEW_GROUP_DEFAULTS,
+  NEW_SECTION_DEFAULTS,
   NOTEBOOKS_COLLECTION,
   PAGES_COLLECTION,
   PAGE_CONTENT_COLLECTION,
@@ -47,6 +49,7 @@ import {
   TOMBSTONES_COLLECTION,
   encodeMirrorId,
   leaseIsHeld,
+  planStructureWrite,
   readSelection,
   readSyncState,
   type MirrorNotebook,
@@ -57,6 +60,10 @@ import {
   type MirrorSyncState,
   type MirrorTombstone,
   type NotebookSelection,
+  type NotebookStructureWrite,
+  type SectionGroupStructureWrite,
+  type SectionStructureWrite,
+  type StructureIdentity,
   type SyncMode,
 } from './mirror-schema.ts';
 
@@ -226,7 +233,14 @@ export class MirrorStore {
     );
   }
 
-  /** Every mirrored section, oldest watermark first, which is the sync's visit order. */
+  /**
+   * Every mirrored section, oldest watermark first, which is the sync's visit order.
+   *
+   * The `orderBy` excludes any document that does not carry `pagesSyncedThrough`, so a
+   * section created without it is invisible to the sync permanently and nothing reports a
+   * section that was never enumerated. `NEW_SECTION_DEFAULTS` is what guarantees the field
+   * on a create; see its docstring.
+   */
   async listSectionsToSync(): Promise<MirrorSection[]> {
     return this.#query(
       'listing sections to sync',
@@ -262,20 +276,28 @@ export class MirrorStore {
   }
 
   /**
-   * Replace the whole structure, in batches, and delete what the tree no longer holds.
+   * Bring the structure collections in line with the tree, and delete what it no longer
+   * holds.
    *
    * Called only when the tree hash moved. Deletion is by absence from the incoming set
    * rather than by a `lastSeenAt` sweep, because the caller has just read the complete
    * tree in one request — so absence here is a fact rather than an inference.
+   *
+   * The creation defaults are per collection and are applied only to a document that was
+   * not already there. A notebook has none: every field on it comes from the tree.
    */
   async putStructure(structure: {
-    notebooks: readonly MirrorNotebook[];
-    sectionGroups: readonly MirrorSectionGroup[];
-    sections: readonly MirrorSection[];
+    notebooks: readonly NotebookStructureWrite[];
+    sectionGroups: readonly SectionGroupStructureWrite[];
+    sections: readonly SectionStructureWrite[];
   }): Promise<void> {
-    await this.#replaceCollection(this.#notebooks(), structure.notebooks);
-    await this.#replaceCollection(this.#sectionGroups(), structure.sectionGroups);
-    await this.#replaceCollection(this.#sections(), structure.sections);
+    await this.#reconcileCollection(this.#notebooks(), structure.notebooks, {});
+    await this.#reconcileCollection(
+      this.#sectionGroups(),
+      structure.sectionGroups,
+      NEW_GROUP_DEFAULTS,
+    );
+    await this.#reconcileCollection(this.#sections(), structure.sections, NEW_SECTION_DEFAULTS);
   }
 
   /** Advance one section's watermark. Written only after its whole changed set landed. */
@@ -553,19 +575,56 @@ export class MirrorStore {
   }
 
   /**
-   * Replace a whole collection with `documents`, deleting anything else in it.
+   * Bring one collection in line with `documents`, deleting anything else in it.
    *
-   * Reads the existing ids first so the delete set is exact. That read is one query
-   * against a collection of at most a few hundred documents, and it runs only when the
-   * tree hash moved — which is when someone added or renamed a notebook, not every
-   * fifteen minutes.
+   * Every decision about what that means — skip, merge, create, delete — is
+   * `planStructureWrite` in ./mirror-schema.ts, which is pure and unit-tested. What is
+   * left here is the query, the batching and the calls. Do not put a branch back: this
+   * module has no test, so a condition written here is a condition nothing checks.
+   *
+   * The query reads `identity` alone and supplies both halves of the plan's input: the
+   * id set that drives deletion, and the string that drives the skip.
+   *
+   * Two things here are assumptions about Firestore rather than facts this repository can
+   * check, because there is no backend on this machine. Both are settled by watching the
+   * first post-deploy sync: it should report a structure pass, leave `backfillComplete`
+   * where it was, and leave `pagesSyncedThrough` set on every section it did not create.
+   *
+   * `select('identity')` is assumed to be a **projection** — every document in the
+   * collection comes back, carrying that one field or, for a document written before the
+   * field existed, carrying nothing. Firestore documents it that way. If it filtered
+   * instead, every such document would be absent from the result, take the create branch,
+   * and be written with `pagesSyncedThrough: null` — the account-wide re-backfill this
+   * whole design removes. It is self-limiting if wrong: one re-backfill, after which every
+   * document carries `identity`.
+   *
+   * `{ merge: true }` on the `set` below is the line the whole design rests on, and it is
+   * the one nothing can catch. `planStructureWrite` deliberately omits the sync-owned
+   * fields from `write.fields`, so a `set` without the merge option would replace each
+   * document with the tree fields alone and clear `pagesSyncedThrough` on every section
+   * whose identity moved. That is narrower than the bug this design removes — it needs an
+   * identity change rather than any hash change — and exactly as silent. The store fake in
+   * test/mirror-sync.test.ts models the merge rather than asserting it, so deleting this
+   * option leaves the suite green.
+   *
+   * A skipped document's `lastSeenAt` is not refreshed. Nothing reads it — deletion is by
+   * absence from the incoming set — and refreshing it would cost the write the skip exists
+   * to avoid.
    */
-  async #replaceCollection(
+  async #reconcileCollection(
     collection: CollectionReference,
-    documents: readonly { id: string }[],
+    documents: readonly (StructureIdentity & { id: string })[],
+    createDefaults: object,
   ): Promise<void> {
-    await this.#run(`replacing ${collection.id}`, async () => {
-      const existing = new Set((await collection.select().get()).docs.map((doc) => doc.id));
+    await this.#run(`reconciling ${collection.id}`, async () => {
+      const stored = new Map(
+        (await collection.select('identity').get()).docs.map((doc) => [
+          doc.id,
+          doc.get('identity') as unknown,
+        ]),
+      );
+
+      const plan = planStructureWrite(stored, documents, createDefaults);
 
       let batch = this.#firestoreOf(this.#root).batch();
       let queued = 0;
@@ -576,19 +635,18 @@ export class MirrorStore {
         queued = 0;
       };
 
-      for (const document of documents) {
-        const encoded = encodeMirrorId(document.id);
-        existing.delete(encoded);
-        batch.set(collection.doc(encoded), {
-          ...document,
-          lastSeenAt: FieldValue.serverTimestamp(),
-        });
+      for (const write of plan.writes) {
+        batch.set(
+          collection.doc(write.documentId),
+          { ...write.fields, lastSeenAt: FieldValue.serverTimestamp() },
+          { merge: true },
+        );
         queued += 1;
         if (queued >= BATCH_LIMIT) await flush();
       }
 
-      for (const staleId of existing) {
-        batch.delete(collection.doc(staleId));
+      for (const documentId of plan.deletes) {
+        batch.delete(collection.doc(documentId));
         queued += 1;
         if (queued >= BATCH_LIMIT) await flush();
       }

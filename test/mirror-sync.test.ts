@@ -37,7 +37,14 @@ import type {
 } from '../src/graph-structure.ts';
 import { setEventSink } from '../src/logging.ts';
 import {
+  encodeMirrorId,
+  groupIdentity,
   initialSyncState,
+  NEW_GROUP_DEFAULTS,
+  NEW_SECTION_DEFAULTS,
+  notebookIdentity,
+  planStructureWrite,
+  sectionIdentity,
   type MirrorPage,
   type MirrorPageContent,
   type MirrorNotebook,
@@ -46,6 +53,7 @@ import {
   type MirrorSyncState,
   type MirrorTombstone,
   type NotebookSelection,
+  type StructureIdentity,
   type SyncMode,
 } from '../src/mirror-schema.ts';
 import {
@@ -95,6 +103,35 @@ function section(overrides: Partial<MirrorSection> = {}): MirrorSection {
     pageCount: 0,
     ...overrides,
   };
+}
+
+/**
+ * A stored structure document, which carries an `identity` a fresh fixture does not.
+ *
+ * `identity` is optional because a document written before that field existed has none,
+ * and the store reads its absence as "does not match" — one rewrite each, once. A test
+ * that wants the steady state seeds it through the helpers below.
+ */
+type StoredNotebook = MirrorNotebook & Partial<StructureIdentity>;
+type StoredSectionGroup = MirrorSectionGroup & Partial<StructureIdentity>;
+type StoredSection = MirrorSection & Partial<StructureIdentity>;
+
+/** A stored section that a matching tree would skip rather than rewrite. */
+function settled(doc: MirrorSection): StoredSection {
+  return { ...doc, identity: sectionIdentity(doc) };
+}
+
+function notebookDoc(overrides: Partial<MirrorNotebook> = {}): StoredNotebook {
+  const doc: MirrorNotebook = {
+    id: NB,
+    displayName: '2026',
+    mirrored: true,
+    sectionCount: 1,
+    sectionGroupCount: 0,
+    graphLastModifiedDateTime: null,
+    ...overrides,
+  };
+  return { ...doc, identity: notebookIdentity(doc) };
 }
 
 function summary(id: string, modified = '2026-08-19T11:30:00Z'): PageSummary {
@@ -175,9 +212,9 @@ function sel(notebookIds: string[], activeNotebookIds: string[] | null = null): 
 interface StoreState {
   selection: NotebookSelection;
   state: MirrorSyncState;
-  notebooks: MirrorNotebook[];
-  sections: MirrorSection[];
-  groups: MirrorSectionGroup[];
+  notebooks: StoredNotebook[];
+  sections: StoredSection[];
+  groups: StoredSectionGroup[];
   pages: Map<string, MirrorPage>;
   pageIdsBySection: Map<string, string[]>;
 }
@@ -188,10 +225,62 @@ interface StoreCalls {
   puts: { page: MirrorPage; hasContent: boolean }[];
   deletes: MirrorTombstone[];
   structures: number;
+  /** One entry per structure document actually written. A skipped one is absent. */
+  structureWrites: { id: string }[];
+  /** Documents the creation defaults were applied to. On an existing one that is a reset. */
+  structureResets: string[];
+  structureDeletes: string[];
   leases: SyncMode[];
   releases: string[];
   childGroupsKnown: string[];
   sweepResults: string[];
+}
+
+/**
+ * `#replaceCollection`, over an array in memory.
+ *
+ * It calls the real `planStructureWrite` rather than reimplementing the decision, so this
+ * fake cannot drift from the store it stands in for — and every assertion the tests below
+ * make about a skipped or merged document is an assertion about the shipped function. What
+ * is faked is only what Firestore does with the plan: `set(…, { merge: true })` is a spread
+ * onto the stored document, and a delete removes it.
+ *
+ * So this asserts the plan and **not** the write mode. The spread below models the merge
+ * rather than checking it, which means deleting `{ merge: true }` from the real
+ * `batch.set` leaves every test here green while clearing `pagesSyncedThrough` on every
+ * section whose identity moved. Nothing on this machine can close that; the check is a
+ * live one, on the first post-deploy sync — a section renamed in the OneNote client must
+ * come out of it with its watermark still set.
+ */
+function mergeStructure<S extends { id: string }, T extends { id: string; identity: string }>(
+  stored: readonly S[],
+  incoming: readonly T[],
+  createDefaults: object,
+  calls: StoreCalls,
+): S[] {
+  const byDocumentId = new Map(
+    stored.map((doc) => [encodeMirrorId(doc.id), doc as S & Partial<StructureIdentity>]),
+  );
+  const plan = planStructureWrite(
+    new Map([...byDocumentId].map(([documentId, doc]) => [documentId, doc.identity])),
+    incoming,
+    createDefaults,
+  );
+
+  for (const write of plan.writes) {
+    const existing = byDocumentId.get(write.documentId);
+    calls.structureWrites.push({ id: String(write.fields['id']) });
+    if (write.created) calls.structureResets.push(String(write.fields['id']));
+    byDocumentId.set(write.documentId, { ...existing, ...write.fields } as S &
+      Partial<StructureIdentity>);
+  }
+
+  for (const documentId of plan.deletes) {
+    calls.structureDeletes.push(byDocumentId.get(documentId)?.id ?? documentId);
+    byDocumentId.delete(documentId);
+  }
+
+  return [...byDocumentId.values()];
 }
 
 function fakeStore(initial: Partial<StoreState> = {}): {
@@ -216,6 +305,9 @@ function fakeStore(initial: Partial<StoreState> = {}): {
     puts: [],
     deletes: [],
     structures: 0,
+    structureWrites: [],
+    structureResets: [],
+    structureDeletes: [],
     leases: [],
     releases: [],
     childGroupsKnown: [],
@@ -238,15 +330,18 @@ function fakeStore(initial: Partial<StoreState> = {}): {
       calls.releases.push(heldSince);
       return Promise.resolve();
     },
-    // Firestore's `putStructure` replaces the collections wholesale — `#replaceCollection`
-    // calls `batch.set` with no merge — so a fake that only counted calls could not see a
-    // stored section's timestamp go stale, which is the failure this file's regression
-    // test is about.
+    // `#replaceCollection` in src/mirror-store.ts has three behaviours and this fake has
+    // to have all three, because that module has no test of its own: a document whose
+    // stored `identity` equals the incoming one is skipped, one whose identity differs is
+    // merged so the sync-owned fields under it survive, and one the tree no longer holds
+    // is deleted. A fake that replaced the collections wholesale — which is what the real
+    // store did before the identity split — would let every blast-radius test below pass
+    // against nothing.
     putStructure: (structure) => {
       calls.structures += 1;
-      data.notebooks = [...structure.notebooks];
-      data.sections = [...structure.sections];
-      data.groups = [...structure.sectionGroups];
+      data.notebooks = mergeStructure(data.notebooks, structure.notebooks, {}, calls);
+      data.groups = mergeStructure(data.groups, structure.sectionGroups, NEW_GROUP_DEFAULTS, calls);
+      data.sections = mergeStructure(data.sections, structure.sections, NEW_SECTION_DEFAULTS, calls);
       return Promise.resolve();
     },
     listSectionsToSync: () => Promise.resolve(data.sections.filter((s) => s.mirrored)),
@@ -380,11 +475,21 @@ function harness(
   const { blobs, calls: blobCalls } = fakeBlobs();
 
   // A harness starts in the steady state: the stored structure already matches the
-  // account, so `reconcileStructure` reads the tree and writes nothing. Without this the
-  // stored hash is null, every first run rewrites the structure, and `putStructure` —
-  // which replaces the collections wholesale and emits `pagesSyncedThrough: null` —
-  // discards whatever sections and watermarks the test seeded. A test that wants a
-  // structure rewrite says so by seeding a `structureHash` that does not match.
+  // account, so `reconcileStructure` reads the tree and writes nothing. Deleting this
+  // block fails ten tests, for three separate reasons, and the first is the one it is
+  // here for:
+  //
+  // 1. `mayFilterByTimestamp` is `treeRead && !rewritten`, so a run that writes the
+  //    structure has the timestamp filter switched off — and every test about which
+  //    sections are candidates would then pass with the thing it tests disabled.
+  // 2. A structure write happening at all is visible: it counts `structures`, patches
+  //    `structureHash`, and a test asserting a quiet run wrote nothing sees it.
+  // 3. A seeded document the incoming tree does not name is deleted. Merging protects the
+  //    sync-owned fields of a document the tree still holds; it does nothing for one the
+  //    tree has dropped, and `treeFrom` describes `NB` alone.
+  //
+  // A test that wants a structure rewrite says so by seeding a `structureHash` that does
+  // not match.
   if (data.state.structureHash === null && typeof tree !== 'function') {
     data.state = {
       ...data.state,
@@ -457,11 +562,22 @@ test('a section inside a section group gets the group in its path and as its par
   assert.equal(nested?.notebookId, NB, 'the notebook is denormalised so no query joins');
 });
 
-test('childGroupsKnown is false on every group the expanded tree produced', () => {
-  // $expand nests two levels, so a first-level group's nested groups are absent from the
-  // response rather than known to be empty. The read path treats false as a mirror miss.
+test('buildStructure emits tree-owned fields only, and no sync-owned defaults', () => {
+  // The whole split. `pagesSyncedThrough`, `pageCount` and `childGroupsKnown` are learned
+  // over hours of Graph requests and the tree read knows none of them, so a structure
+  // write that carried them would reset the lot. They are creation defaults now, applied
+  // by the store to a document that was not there and never to one that was.
   const built = buildStructure(TREE, sel([NB]));
-  assert.deepEqual(built.sectionGroups.map((g) => g.childGroupsKnown), [false]);
+
+  const asRecord = (value: unknown): Record<string, unknown> => value as Record<string, unknown>;
+  const section = asRecord(built.sections[0]);
+  assert.equal('pagesSyncedThrough' in section, false);
+  assert.equal('pageCount' in section, false);
+  assert.equal('childGroupsKnown' in asRecord(built.sectionGroups[0]), false);
+
+  // What those three are instead is asserted on real stored output by the two
+  // creation-default tests above, not against the constants: a test that reads
+  // `NEW_SECTION_DEFAULTS.pagesSyncedThrough` restates the literal it is checking.
 });
 
 test('a selected notebook id matching nothing is reported rather than ignored', () => {
@@ -501,6 +617,262 @@ test('the structure hash ignores timestamps and notices everything else', () => 
 
   const reselected = structureHashOf(buildStructure(TREE, sel([NB, 'nb-2'])));
   assert.notEqual(reselected, base, 'and so is a change to the selection');
+});
+
+// ---------------------------------------------------------------------------
+// What a structure write costs
+//
+// The requirement these three are written against: a change to one notebook must not
+// start work on any other. Before the identity split a structure write set every document
+// in the account from the tree alone, so renaming one section — or creating a notebook in
+// a corner of the account that is not mirrored — cleared `pagesSyncedThrough` on all 202
+// mirrored sections and triggered a full re-backfill, one content fetch per page across
+// about 2000 pages. Each test below runs with `requestBudget: 1`, which buys the tree read
+// and nothing after it, so what they assert is the structure pass alone.
+// ---------------------------------------------------------------------------
+
+const TREE_READ_ONLY = { requestBudget: 1 };
+
+test('renaming one section writes that section and nothing else', async () => {
+  const renamed: ExpandedNotebook[] = [
+    {
+      id: NB,
+      displayName: '2026',
+      sections: [
+        { id: 'sec-1', displayName: 'Daily log', lastModifiedDateTime: '2026-08-19T11:00:00Z' },
+        { id: 'sec-2', displayName: 'Weekly', lastModifiedDateTime: '2026-08-19T11:00:00Z' },
+      ],
+      sectionGroups: [],
+    },
+  ];
+
+  const h = harness(
+    { tree: renamed },
+    {
+      notebooks: [notebookDoc({ sectionCount: 2 })],
+      sections: [
+        {
+          // A section mid-write, with a page count and a listing hold on it. None of the
+          // three is a tree field, and all three are gone from the document if the write
+          // stops merging.
+          ...settled(section({ id: 'sec-1', displayName: 'Daily', path: '2026 / Daily' })),
+          pageCount: 7,
+          pendingWrites: 1,
+          pendingWritesSince: '2026-08-19T11:59:00.000Z',
+        },
+        settled(section({ id: 'sec-2', displayName: 'Weekly', path: '2026 / Weekly' })),
+      ],
+      // A hash that does not match, which is what makes the run write the structure at all.
+      state: { ...initialSyncState(), structureHash: 'stale' },
+    },
+  );
+
+  await runIncremental(h.deps, TREE_READ_ONLY);
+
+  assert.deepEqual(h.storeCalls.structureWrites.map((w) => w.id), ['sec-1']);
+  assert.deepEqual(h.storeCalls.structureDeletes, []);
+  assert.deepEqual(h.storeCalls.structureResets, [], 'nothing that already existed was created');
+
+  const byId = new Map(h.data.sections.map((s) => [s.id, s]));
+  assert.equal(byId.get('sec-1')?.displayName, 'Daily log', 'the rename did land');
+  assert.equal(byId.get('sec-1')?.path, '2026 / Daily log');
+
+  // The failure the whole task is about: a watermark cleared here is a full re-backfill of
+  // the section, and clearing all 202 of them is five hours of the hourly request budget.
+  assert.equal(byId.get('sec-1')?.pagesSyncedThrough, '2026-08-19T10:00:00Z');
+  assert.equal(byId.get('sec-2')?.pagesSyncedThrough, '2026-08-19T10:00:00Z');
+  assert.equal(byId.get('sec-1')?.pageCount, 7);
+
+  // A cleared hold is narrower damage and just as invisible: `list_pages` on this section
+  // would answer from the mirror again while a `create_page` or a rename is still in
+  // flight against it.
+  assert.equal(byId.get('sec-1')?.pendingWrites, 1);
+  assert.equal(byId.get('sec-1')?.pendingWritesSince, '2026-08-19T11:59:00.000Z');
+  assert.deepEqual(h.storeCalls.watermarks, [], 'and the run spent no budget on either');
+});
+
+test('adding a notebook to the selection leaves every other notebook alone', async () => {
+  const NB2 = 'nb-2';
+  const tree: ExpandedNotebook[] = [
+    {
+      id: NB,
+      displayName: '2026',
+      sections: [
+        { id: 'sec-1', displayName: 'Daily', lastModifiedDateTime: '2026-08-19T11:00:00Z' },
+      ],
+      sectionGroups: [],
+    },
+    {
+      id: NB2,
+      displayName: '2025',
+      sections: [
+        { id: 'sec-2', displayName: 'Archive', lastModifiedDateTime: '2026-08-19T11:00:00Z' },
+      ],
+      sectionGroups: [],
+    },
+  ];
+
+  const h = harness(
+    { tree },
+    {
+      // The steady state before the edit: NB selected and backfilled, NB2 stored but not
+      // mirrored, so its section has never been synced.
+      selection: sel([NB, NB2]),
+      notebooks: [
+        notebookDoc(),
+        notebookDoc({ id: NB2, displayName: '2025', mirrored: false }),
+      ],
+      sections: [
+        settled(section({ id: 'sec-1' })),
+        settled(
+          section({
+            id: 'sec-2',
+            displayName: 'Archive',
+            notebookId: NB2,
+            parentId: NB2,
+            path: '2025 / Archive',
+            mirrored: false,
+            pagesSyncedThrough: null,
+          }),
+        ),
+      ],
+      state: { ...initialSyncState(), structureHash: 'stale' },
+    },
+  );
+
+  await runIncremental(h.deps, TREE_READ_ONLY);
+
+  // `mirrored` moved on the new notebook and on its section, and on nothing else.
+  assert.deepEqual(h.storeCalls.structureWrites.map((w) => w.id), ['nb-2', 'sec-2']);
+  assert.deepEqual(h.storeCalls.structureResets, []);
+  assert.deepEqual(h.storeCalls.structureDeletes, []);
+
+  const byId = new Map(h.data.sections.map((s) => [s.id, s]));
+  assert.equal(byId.get('sec-2')?.mirrored, true, 'the new notebook is now mirrored');
+  assert.equal(
+    byId.get('sec-1')?.pagesSyncedThrough,
+    '2026-08-19T10:00:00Z',
+    'and the notebook that was already there kept its backfill',
+  );
+});
+
+test('a section that leaves the tree is still deleted', async () => {
+  // Deletion is by absence from the incoming set rather than by identity, so the skip
+  // must not reach it: the caller has just read the whole tree in one request, which makes
+  // absence a fact rather than an inference.
+  const tree: ExpandedNotebook[] = [
+    {
+      id: NB,
+      displayName: '2026',
+      sections: [
+        { id: 'sec-1', displayName: 'Daily', lastModifiedDateTime: '2026-08-19T11:00:00Z' },
+      ],
+      sectionGroups: [],
+    },
+  ];
+
+  const h = harness(
+    { tree },
+    {
+      notebooks: [notebookDoc()],
+      sections: [
+        settled(section({ id: 'sec-1' })),
+        settled(section({ id: 'sec-2', displayName: 'Gone', path: '2026 / Gone' })),
+      ],
+      state: { ...initialSyncState(), structureHash: 'stale' },
+    },
+  );
+
+  await runIncremental(h.deps, TREE_READ_ONLY);
+
+  assert.deepEqual(h.storeCalls.structureDeletes, ['sec-2']);
+  assert.deepEqual(h.storeCalls.structureWrites, [], 'and the surviving section was skipped');
+  assert.deepEqual(h.data.sections.map((s) => s.id), ['sec-1']);
+});
+
+test('a section the tree just gained is created ready to be backfilled', async () => {
+  // `pagesSyncedThrough: null` on a create is the only thing that makes a new section
+  // reachable at all. `listSectionsToSync` orders by that field and a Firestore `orderBy`
+  // drops a document that does not carry it, so a section created without it is invisible
+  // to every later run and nothing reports a section that was never enumerated. Before
+  // this split `buildStructure` sent the field on every write; now only the create
+  // default supplies it.
+  //
+  // Both sections carry a 2020 timestamp, so the tier-1 filter would skip either one on
+  // its timestamp alone. The second run is what shows the default doing its job.
+  const tree: ExpandedNotebook[] = [
+    {
+      id: NB,
+      displayName: '2026',
+      sections: [
+        { id: 'sec-1', displayName: 'Daily', lastModifiedDateTime: '2020-01-01T00:00:00Z' },
+        { id: 'sec-2', displayName: 'New', lastModifiedDateTime: '2020-01-01T00:00:00Z' },
+      ],
+      sectionGroups: [],
+    },
+  ];
+
+  const h = harness(
+    { tree },
+    {
+      notebooks: [notebookDoc({ sectionCount: 2 })],
+      sections: [
+        settled(section({ id: 'sec-1', graphLastModifiedDateTime: '2020-01-01T00:00:00Z' })),
+      ],
+      state: {
+        ...initialSyncState(),
+        structureHash: 'stale',
+        sectionsScannedThrough: '2026-08-19T11:00:00.000Z',
+      },
+    },
+  );
+
+  await runIncremental(h.deps, TREE_READ_ONLY);
+
+  assert.deepEqual(h.storeCalls.structureResets, ['sec-2'], 'and only the new one');
+  const created = h.data.sections.find((s) => s.id === 'sec-2');
+  assert.strictEqual(created?.pagesSyncedThrough, null);
+  assert.strictEqual(created?.pageCount, 0);
+  assert.equal(
+    h.data.sections.find((s) => s.id === 'sec-1')?.pagesSyncedThrough,
+    '2026-08-19T10:00:00Z',
+    'the section that was already there kept its watermark',
+  );
+
+  // The second run writes no structure — the hash matches now — so the timestamp filter
+  // applies, and a 2020 timestamp is far behind the cutoff. Only the null watermark can
+  // get `sec-2` visited.
+  await runIncremental(h.deps, BUDGET);
+  assert.deepEqual(h.graphCalls.changedSince, ['sec-2']);
+});
+
+test('a section group the tree just gained is created not knowing its nested groups', async () => {
+  // `childGroupsKnown: false` is what the read path treats as a mirror miss. Created true,
+  // a `list_sections` on this group would answer from the mirror and silently omit every
+  // group nested inside it — `$expand` reaches one level, so those are absent from the
+  // response rather than known to be empty.
+  const tree: ExpandedNotebook[] = [
+    {
+      id: NB,
+      displayName: '2026',
+      sections: [],
+      sectionGroups: [{ id: 'grp-1', displayName: '062 - February', sections: [] }],
+    },
+  ];
+
+  const h = harness(
+    { tree },
+    {
+      notebooks: [notebookDoc({ sectionCount: 0, sectionGroupCount: 1 })],
+      sections: [],
+      state: { ...initialSyncState(), structureHash: 'stale' },
+    },
+  );
+
+  await runIncremental(h.deps, TREE_READ_ONLY);
+
+  assert.deepEqual(h.storeCalls.structureResets, ['grp-1']);
+  assert.strictEqual(h.data.groups.find((g) => g.id === 'grp-1')?.childGroupsKnown, false);
 });
 
 // ---------------------------------------------------------------------------
@@ -614,9 +986,11 @@ test('withLiveMtimes takes the observed timestamp, and keeps the stored one when
 
 test('an edit is still noticed after the structure has stopped changing', async () => {
   // The failure this guards: `graphLastModifiedDateTime` is written only by
-  // `putStructure`, which runs only when the tree hash moves — and the hash excludes
-  // timestamps. A stored copy therefore freezes while `sectionsScannedThrough` advances
-  // on every completed run, and the section stops being a candidate for ever.
+  // `putStructure`, which runs only when the tree hash moves — and neither the hash nor a
+  // document's identity covers timestamps, so even a run that does write the structure
+  // skips a section whose timestamp is the only thing that moved. A stored copy therefore
+  // freezes while `sectionsScannedThrough` advances on every completed run, and the
+  // section stops being a candidate for ever.
   //
   // Three runs, because two are not enough: the first writes the structure, the second is
   // what advances the cutoff past the frozen timestamp, and only the third can be wrongly
@@ -917,8 +1291,8 @@ test('the datetime filter failing falls back to the unfiltered list, once', asyn
   const { blobs } = fakeBlobs();
   data.sections = [section({ id: 'sec-1' }), section({ id: 'sec-2', path: '2026 / Other' })];
   // These deps are built by hand, so nothing seeds the stored hash the way `harness` does.
-  // Without it the run rewrites the structure and `putStructure` replaces both sections
-  // with TREE's, and the assertion below would hold on TREE's ids rather than on these.
+  // Without it the run rewrites the structure, `mayFilterByTimestamp` is false, and the
+  // assertion below would hold whatever the timestamp filter did.
   data.state = { ...data.state, structureHash: structureHashOf(buildStructure(TREE, sel([NB]))) };
 
   await runIncremental(
@@ -1114,8 +1488,9 @@ test('a state document that predates the field records the hash and widens nothi
 });
 
 test('the structure hash does not move when only the active set changed', () => {
-  // If it did, putStructure would rewrite every section with pagesSyncedThrough null and
-  // an activation edit would trigger a full re-backfill — hours of the request budget.
+  // If it did, an activation edit would disable the timestamp filter for a pass and write
+  // an `activeSelectionHash` the structure documents say nothing about. The two changes
+  // need different responses, and `reconcileActivity` gives activity its own.
   const base = structureHashOf(buildStructure(TREE, sel([NB])));
   assert.equal(structureHashOf(buildStructure(TREE, sel([NB], []))), base);
   assert.equal(structureHashOf(buildStructure(TREE, sel([NB], [NB]))), base);

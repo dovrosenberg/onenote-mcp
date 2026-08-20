@@ -54,14 +54,16 @@ import { fitInkToByteBudget } from './ink.ts';
 import { logEvent } from './logging.ts';
 import type { MirrorBlobWriter } from './mirror-blobs.ts';
 import {
+  groupIdentity,
   htmlPlacement,
   htmlObjectName,
   inkObjectName,
   isActive,
   inkmlObjectName,
+  notebookIdentity,
   overlapFrom,
+  sectionIdentity,
   utf8Bytes,
-  type MirrorNotebook,
   type MirrorPage,
   type MirrorPageContent,
   type MirrorSection,
@@ -69,6 +71,12 @@ import {
   type MirrorSyncState,
   type MirrorTombstone,
   type NotebookSelection,
+  type NotebookStructureWrite,
+  type NotebookTreeFields,
+  type SectionGroupStructureWrite,
+  type SectionGroupTreeFields,
+  type SectionStructureWrite,
+  type SectionTreeFields,
   type SyncMode,
   type SyncOutcome,
 } from './mirror-schema.ts';
@@ -107,9 +115,9 @@ export interface SyncStore {
   acquireLease(mode: SyncMode, nowIso: string): Promise<void>;
   releaseLease(heldSince: string): Promise<void>;
   putStructure(structure: {
-    notebooks: readonly MirrorNotebook[];
-    sectionGroups: readonly MirrorSectionGroup[];
-    sections: readonly MirrorSection[];
+    notebooks: readonly NotebookStructureWrite[];
+    sectionGroups: readonly SectionGroupStructureWrite[];
+    sections: readonly SectionStructureWrite[];
   }): Promise<void>;
   listSectionsToSync(): Promise<MirrorSection[]>;
   listAllSectionGroups(): Promise<MirrorSectionGroup[]>;
@@ -198,9 +206,9 @@ class SyncBudget {
 // ---------------------------------------------------------------------------
 
 export interface BuiltStructure {
-  readonly notebooks: MirrorNotebook[];
-  readonly sectionGroups: MirrorSectionGroup[];
-  readonly sections: MirrorSection[];
+  readonly notebooks: NotebookStructureWrite[];
+  readonly sectionGroups: SectionGroupStructureWrite[];
+  readonly sections: SectionStructureWrite[];
   /** Selected notebook ids that matched no notebook in the tree. */
   readonly unknownNotebookIds: string[];
   /**
@@ -225,9 +233,18 @@ export interface BuiltStructure {
  * 3 of 55 notebooks, and a partial answer that cannot be detected as partial is the
  * failure CLAUDE.md already names about truncated searches.
  *
- * `childGroupsKnown` is false on every group here, because `$expand` reaches one level of
- * section group and a first-level group's nested groups are *absent from the response*
- * rather than known to be empty. The sweep sets it true.
+ * **It emits tree-owned fields only.** No `pagesSyncedThrough`, no `pageCount`, no
+ * `childGroupsKnown`, no `pendingWrites` — the tree read knows none of them, and a
+ * structure write that carried a default for one would reset hours of Graph requests.
+ * `NEW_SECTION_DEFAULTS` and `NEW_GROUP_DEFAULTS` in ./mirror-schema.ts are what a
+ * document gets the first time it appears, applied by the store on a create and never on
+ * an update. `childGroupsKnown: false` is the creation default for the reason its own
+ * docstring gives: `$expand` reaches one level of section group, so a new group's nested
+ * groups are absent from the response rather than known to be empty, and the sweep sets it
+ * true.
+ *
+ * Each document carries an `identity` built from those tree fields alone, which is what
+ * lets the store skip one that did not change.
  */
 export function buildStructure(
   tree: readonly ExpandedNotebook[],
@@ -236,25 +253,25 @@ export function buildStructure(
   const selected = new Set(selection.notebookIds);
   const seen = new Set<string>();
 
-  const notebooks: MirrorNotebook[] = [];
-  const sectionGroups: MirrorSectionGroup[] = [];
-  const sections: MirrorSection[] = [];
+  const notebooks: NotebookStructureWrite[] = [];
+  const sectionGroups: SectionGroupStructureWrite[] = [];
+  const sections: SectionStructureWrite[] = [];
 
   for (const notebook of tree) {
     seen.add(notebook.id);
     const mirrored = selected.has(notebook.id);
 
-    notebooks.push({
+    notebooks.push(withNotebookIdentity({
       id: notebook.id,
       displayName: notebook.displayName,
       mirrored,
       sectionCount: notebook.sections.length,
       sectionGroupCount: notebook.sectionGroups.length,
       graphLastModifiedDateTime: notebook.lastModifiedDateTime ?? null,
-    });
+    }));
 
     for (const section of notebook.sections) {
-      sections.push({
+      sections.push(withSectionIdentity({
         id: section.id,
         displayName: section.displayName,
         notebookId: notebook.id,
@@ -263,14 +280,12 @@ export function buildStructure(
         path: `${notebook.displayName} / ${section.displayName}`,
         mirrored,
         graphLastModifiedDateTime: section.lastModifiedDateTime ?? null,
-        pagesSyncedThrough: null,
-        pageCount: 0,
-      });
+      }));
     }
 
     for (const group of notebook.sectionGroups) {
       const groupPath = `${notebook.displayName} / ${group.displayName}`;
-      sectionGroups.push({
+      sectionGroups.push(withGroupIdentity({
         id: group.id,
         displayName: group.displayName,
         notebookId: notebook.id,
@@ -278,11 +293,10 @@ export function buildStructure(
         parentKind: 'notebook',
         mirrored,
         path: groupPath,
-        childGroupsKnown: false,
-      });
+      }));
 
       for (const section of group.sections) {
-        sections.push({
+        sections.push(withSectionIdentity({
           id: section.id,
           displayName: section.displayName,
           notebookId: notebook.id,
@@ -291,9 +305,7 @@ export function buildStructure(
           path: `${groupPath} / ${section.displayName}`,
           mirrored,
           graphLastModifiedDateTime: section.lastModifiedDateTime ?? null,
-          pagesSyncedThrough: null,
-          pageCount: 0,
-        });
+        }));
       }
     }
   }
@@ -311,28 +323,54 @@ export function buildStructure(
   };
 }
 
+// The three wrappers below exist so a field added to a tree-field type is a type error
+// here rather than a field silently missing from the identity — the object literal is
+// checked against the parameter type, and the identity is computed from the same value.
+
+function withNotebookIdentity(fields: NotebookTreeFields): NotebookStructureWrite {
+  return { ...fields, identity: notebookIdentity(fields) };
+}
+
+function withGroupIdentity(fields: SectionGroupTreeFields): SectionGroupStructureWrite {
+  return { ...fields, identity: groupIdentity(fields) };
+}
+
+function withSectionIdentity(fields: SectionTreeFields): SectionStructureWrite {
+  return { ...fields, identity: sectionIdentity(fields) };
+}
+
 /**
  * A hash of everything about the tree the mirror stores.
  *
- * An unchanged hash skips every structure write. The account has 55 notebooks and 568
- * sections; rewriting all of them every fifteen minutes would be millions of writes a
- * month for a tree that changes when someone adds a notebook. The timestamps are
- * deliberately **excluded**, because they move constantly and would rewrite every
- * document on every run. `reconcileStructure` therefore returns them separately, and
- * `withLiveMtimes` overlays them onto the stored sections before `pickCandidates` reads
- * them — without that overlay the stored copies freeze here and the sync goes blind.
+ * An unchanged hash skips `putStructure` entirely, so a run against an unchanged tree
+ * makes no Firestore query against the structure collections at all. The account has 55
+ * notebooks and 568 sections, and the tree changes when someone adds or renames one; a run
+ * every fifteen minutes would otherwise read all three collections each time.
+ *
+ * It is built from the same `identity` strings the documents themselves carry, so "the
+ * hash moved" and "this document changed" cannot disagree. The two answer different
+ * questions: the hash is the cheap check that decides whether to call `putStructure` at
+ * all, and the per-document identity decides what that call writes.
+ *
+ * That makes the hash **wider** than the one it replaced, which covered `id`,
+ * `displayName`, `parentId` and `mirrored` alone. `path`, `parentKind` and a notebook's
+ * two counts now move it too. More edits therefore trigger a structure pass — and that is
+ * a fix rather than a cost, because a pass now writes only the documents whose identity
+ * moved. Under the old wholesale write, widening the hash would have meant re-backfilling
+ * the selection over a moved section; a section renamed inside a group changes the `path`
+ * of nothing but itself.
+ *
+ * The timestamps are deliberately **excluded**, because they move constantly and would
+ * rewrite every document on every run. `reconcileStructure` therefore returns them
+ * separately, and `withLiveMtimes` overlays them onto the stored sections before
+ * `pickCandidates` reads them — without that overlay the stored copies freeze here and the
+ * sync goes blind.
  */
 export function structureHashOf(built: BuiltStructure): string {
   const hash = createHash('sha256');
-  for (const notebook of built.notebooks) {
-    hash.update(`n ${notebook.id} ${notebook.displayName} ${notebook.mirrored}\n`);
-  }
-  for (const group of built.sectionGroups) {
-    hash.update(`g ${group.id} ${group.displayName} ${group.parentId} ${group.mirrored}\n`);
-  }
-  for (const section of built.sections) {
-    hash.update(`s ${section.id} ${section.displayName} ${section.parentId} ${section.mirrored}\n`);
-  }
+  for (const notebook of built.notebooks) hash.update(`${notebook.identity}\n`);
+  for (const group of built.sectionGroups) hash.update(`${group.identity}\n`);
+  for (const section of built.sections) hash.update(`${section.identity}\n`);
   return hash.digest('hex');
 }
 
@@ -547,7 +585,13 @@ export type SectionMtimes = ReadonlyMap<string, string | null>;
  * failed.
  */
 interface StructureResult {
-  /** True when the structure documents were written. */
+  /**
+   * True when the tree hash moved and `putStructure` ran.
+   *
+   * Not "documents were written": the hash covers the whole account and the plan may still
+   * write nothing, because whether any single document changes is decided per document by
+   * its `identity`. The consumer wants the hash-moved meaning — see `pickCandidates`.
+   */
   readonly rewritten: boolean;
   readonly liveMtimes: SectionMtimes;
   /**
@@ -755,12 +799,17 @@ export function withLiveMtimes(
  *
  * `mayFilterByTimestamp` is not "the timestamps are fresh": they are fresh whenever a tree
  * read succeeded, rewrite or not. It means the filter may be applied at all, which needs a
- * tree read **and** an unchanged tree shape. A rewrite disables it because the tree
- * changed — a section that was created, renamed or moved has a stored watermark that no
- * longer describes what the mirror holds for it, and one wide pass settles all of them.
+ * tree read **and** an unchanged tree shape. A rewrite disables it because the filter is a
+ * comparison against `sectionsScannedThrough`, and a changed tree may hold sections that
+ * cutoff never covered — one created or moved into the selection since the last run, whose
+ * timestamp is older than a cutoff that was never applied to it. One pass ignoring the
+ * filter settles every such section without anything having to work out which they are.
+ * Watermarks are not the reason: a created section gets `pagesSyncedThrough: null` from
+ * `NEW_SECTION_DEFAULTS` and is a candidate whatever the clock says, and a renamed or
+ * moved one keeps a watermark that no structure write touches.
  * The incremental pass therefore passes `treeRead && !rewritten`; the sweep passes
- * `treeRead` alone, because `putStructure` has already replaced its section list and a
- * sweep reconciles page ids rather than resuming a watermark.
+ * `treeRead` alone, because a sweep reconciles page ids against what the tree just said
+ * rather than resuming a watermark.
  *
  * Two sections are always candidates whatever the clock says: one never synced
  * (`pagesSyncedThrough === null`), and one Graph reports no timestamp for — "the field is

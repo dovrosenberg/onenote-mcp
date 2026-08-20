@@ -1036,12 +1036,13 @@ page ids against a section that is already filled. `sweep-all` skips the filter 
 is the only thing that reaches a frozen notebook, which is what it is for.
 
 **`active` stays out of `structureHashOf` and off the section documents, and that is not
-tidiness.** `putStructure` replaces documents wholesale — `#replaceCollection` calls
-`batch.set` with no merge — and `buildStructure` emits `pagesSyncedThrough: null`, so
-anything entering the structure hash resets every section's watermark when it changes.
-Putting `active` there would make an activation edit trigger a full re-backfill of the whole
-selection, which is hours of the request budget. It gets its own `activeSelectionHash`
-instead.
+tidiness.** Activity is not a field on any structure document, so a structure pass has
+nothing to say about it: the hash it moved would name no document to write, and
+`planStructureWrite` would skip every one of them on an unchanged identity. The two changes
+also need different responses — a structure change disables the timestamp filter for one
+pass, and an activation change clears `sectionsScannedThrough` so a re-activated notebook's
+months-old sections come back into range. So `active` gets its own `activeSelectionHash`,
+and `reconcileActivity` acts on it.
 
 **Changing the active set clears `sectionsScannedThrough`, and a null stored hash does
 not.** Tier 1 of `pickCandidates` skips a section whose `graphLastModifiedDateTime` is older

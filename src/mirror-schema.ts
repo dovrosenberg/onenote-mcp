@@ -345,14 +345,274 @@ export interface MirrorSection {
    * moves the page within an ordering — no listing becomes wrong about what exists or
    * what it is called.
    *
-   * A structure replacement clears it, because `putStructure` writes each section
-   * document whole. That runs only when the tree hash moves — someone added or renamed a
-   * notebook — so it is a rare race with an in-flight write, and it fails in the same
-   * direction as the expiry below rather than in a new one.
+   * A structure write does not clear it. `putStructure` sends the tree-owned fields and
+   * merges, and this is not one of them — see `SectionTreeFields`. It used to, which was
+   * a rare race with an in-flight write; the expiry below is what still covers a hold
+   * nothing lowers.
    */
   readonly pendingWrites?: number;
   /** When the most recent hold was taken, so a hold a dead process left expires. */
   readonly pendingWritesSince?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Tree-owned fields, and the identity that says whether one changed
+//
+// A structure document has two owners. `buildStructure` in ./mirror-sync.ts knows what
+// the expanded tree said — a name, a parent, a path, whether the notebook is in the
+// selection. The sync and the write tools own everything else — a section's watermark and
+// page count, a group's `childGroupsKnown`, a section's listing hold. Those are learned
+// over hours of Graph requests and the tree read knows nothing about them.
+//
+// Before this split a structure write sent whole documents built from the tree alone, so
+// every one of the sync-owned fields was reset to its creation default whenever the tree
+// hash moved — for a section renamed in the OneNote client, or a notebook created in a
+// part of the account that is not even mirrored. A reset watermark is a full re-backfill
+// of the selection; a reset `childGroupsKnown` sends every `list_sections` on a section
+// group to Graph until the next sweep.
+// ---------------------------------------------------------------------------
+
+export type NotebookTreeFields = Pick<
+  MirrorNotebook,
+  | 'id'
+  | 'displayName'
+  | 'mirrored'
+  | 'sectionCount'
+  | 'sectionGroupCount'
+  | 'graphLastModifiedDateTime'
+>;
+
+export type SectionGroupTreeFields = Pick<
+  MirrorSectionGroup,
+  'id' | 'displayName' | 'notebookId' | 'parentId' | 'parentKind' | 'path' | 'mirrored'
+>;
+
+export type SectionTreeFields = Pick<
+  MirrorSection,
+  | 'id'
+  | 'displayName'
+  | 'notebookId'
+  | 'parentId'
+  | 'parentKind'
+  | 'path'
+  | 'mirrored'
+  | 'graphLastModifiedDateTime'
+>;
+
+/** The `identity` field every structure document carries, so the store can skip a write. */
+export interface StructureIdentity {
+  readonly identity: string;
+}
+
+export type NotebookStructureWrite = NotebookTreeFields & StructureIdentity;
+export type SectionGroupStructureWrite = SectionGroupTreeFields & StructureIdentity;
+export type SectionStructureWrite = SectionTreeFields & StructureIdentity;
+
+/**
+ * What a structure document is created with the first time it appears, and never again.
+ *
+ * `pagesSyncedThrough: null` is what makes a brand new section a backfill candidate —
+ * `pickCandidates` in ./mirror-sync.ts treats it as "never synced" and reads it whatever
+ * its timestamp says. Re-sending it to a section that already exists is the reset this
+ * split removes, so the store applies these only on a document it just created.
+ *
+ * The field is not optional, and the reason is a Firestore rule rather than a convention.
+ * `listSectionsToSync` orders by `pagesSyncedThrough`, and an `orderBy` excludes every
+ * document that does not carry the field — so a section created without it is absent from
+ * the sync's own listing for ever, and nothing reports a section it never enumerated.
+ * `buildStructure` used to guarantee the field by sending it on every write; now the only
+ * thing that guarantees it is this default being applied on a create.
+ */
+export const NEW_SECTION_DEFAULTS = { pagesSyncedThrough: null, pageCount: 0 } as const satisfies
+  Pick<MirrorSection, 'pagesSyncedThrough' | 'pageCount'>;
+
+/**
+ * `childGroupsKnown: false` is what a group is created with, for the reason the field's
+ * own docstring gives: `$expand` reaches one level of section group, so a new group's
+ * nested groups are absent from the response rather than known to be empty.
+ */
+export const NEW_GROUP_DEFAULTS = { childGroupsKnown: false } as const satisfies
+  Pick<MirrorSectionGroup, 'childGroupsKnown'>;
+
+/**
+ * The separator between fields in an identity string.
+ *
+ * A NUL, because a OneNote display name can hold every other plausible separator. With a
+ * space, `{displayName: 'a b', notebookId: 'c'}` and `{displayName: 'a', notebookId: 'b c'}`
+ * join to the same string, so a rename that moved a space across a field boundary would
+ * produce an unchanged identity and the document would never be rewritten.
+ */
+const IDENTITY_SEPARATOR = '\0';
+
+/**
+ * What the tree said about this notebook, as one string.
+ *
+ * Two documents with the same identity are the same as far as a structure write is
+ * concerned, so the store skips the second one. `structureHashOf` in ./mirror-sync.ts
+ * hashes these same strings, which is what stops "the hash moved" and "this document
+ * changed" from ever disagreeing.
+ *
+ * `graphLastModifiedDateTime` is deliberately absent from all three identities. It moves
+ * whenever anyone edits a page, so including it would rewrite every document in the
+ * account on nearly every run — and nothing reads the stored copy for freshness anyway:
+ * `withLiveMtimes` overlays what this run's tree read saw before `pickCandidates` filters
+ * on it.
+ */
+export function notebookIdentity(fields: NotebookTreeFields): string {
+  const {
+    id,
+    displayName,
+    mirrored,
+    sectionCount,
+    sectionGroupCount,
+    graphLastModifiedDateTime,
+    ...rest
+  } = fields;
+  everyFieldConsidered(rest, graphLastModifiedDateTime);
+
+  return [
+    'n',
+    id,
+    displayName,
+    String(mirrored),
+    String(sectionCount),
+    String(sectionGroupCount),
+  ].join(IDENTITY_SEPARATOR);
+}
+
+/** See `notebookIdentity`. `childGroupsKnown` is sync-owned and is not a tree field. */
+export function groupIdentity(fields: SectionGroupTreeFields): string {
+  const { id, displayName, notebookId, parentId, parentKind, path, mirrored, ...rest } = fields;
+  everyFieldConsidered(rest);
+
+  return ['g', id, displayName, notebookId, parentId, parentKind, path, String(mirrored)].join(
+    IDENTITY_SEPARATOR,
+  );
+}
+
+/** See `notebookIdentity`. The watermark and the page count are sync-owned. */
+export function sectionIdentity(fields: SectionTreeFields): string {
+  const {
+    id,
+    displayName,
+    notebookId,
+    parentId,
+    parentKind,
+    path,
+    mirrored,
+    graphLastModifiedDateTime,
+    ...rest
+  } = fields;
+  everyFieldConsidered(rest, graphLastModifiedDateTime);
+
+  return ['s', id, displayName, notebookId, parentId, parentKind, path, String(mirrored)].join(
+    IDENTITY_SEPARATOR,
+  );
+}
+
+/**
+ * A compile-time check that an identity function has looked at every field of its input.
+ *
+ * Each of the three above destructures its parameter completely — the fields that go into
+ * the string, then the ones deliberately left out, then a rest binding — and passes the
+ * rest here. A field added to one of the tree-field types and not named in the
+ * destructuring lands in `rest`, and `Record<string, never>` refuses it.
+ *
+ * Without this, adding a field to `SectionTreeFields` is a type error in `buildStructure`,
+ * where the object literal is checked, and *not* in `sectionIdentity`, which would keep
+ * compiling while ignoring it. A section whose only change was that field would then have
+ * an unchanged identity and would never be written — the silent-skip failure this whole
+ * design is built to avoid, arriving through the one door the types left open.
+ *
+ * `omitted` takes the deliberate exclusions so a destructured-but-unused binding is a use.
+ * Nothing here runs for any other reason; the parameter types are the whole point.
+ */
+function everyFieldConsidered(_rest: Record<string, never>, ..._omitted: unknown[]): void {}
+
+// ---------------------------------------------------------------------------
+// What a structure write does to one collection
+// ---------------------------------------------------------------------------
+
+/** One document to write, already keyed by its Firestore document id. */
+export interface PlannedStructureWrite {
+  readonly documentId: string;
+  /** Ready to `set(…, { merge: true })`. Creation defaults are already folded in. */
+  readonly fields: Record<string, unknown>;
+  /**
+   * True when no document with this id was there. Only a create carries the defaults.
+   *
+   * Nothing in `src/` reads it — `#reconcileCollection` sends every write the same way. It
+   * is here for the tests, which cannot otherwise tell a create from a merge on a notebook:
+   * `createDefaults` is `{}` there, so the written fields are identical either way. Do not
+   * delete it as dead, and do not log from it expecting the store to have branched on it.
+   */
+  readonly created: boolean;
+}
+
+export interface StructureWritePlan {
+  readonly writes: readonly PlannedStructureWrite[];
+  /** Document ids the tree no longer holds. */
+  readonly deletes: readonly string[];
+}
+
+/**
+ * Decide what one structure collection needs, given what it holds and what the tree says.
+ *
+ * This is the whole of `#replaceCollection`'s judgement, and it lives here because
+ * ./mirror-store.ts cannot be tested on this machine — the rule stated at the top of this
+ * file. That module is left holding the Firestore query, the batching and the calls; every
+ * branch below is reachable from a plain unit test.
+ *
+ * Four outcomes, and each one exists because its absence is a specific failure:
+ *
+ * - **Skip** a document whose stored `identity` equals the incoming one. Without it,
+ *   renaming a single section rewrites all 568 section documents in the account.
+ * - **Merge** a document whose identity differs, by sending the tree fields and nothing
+ *   else. The fields the tree does not know — `pagesSyncedThrough`, `pageCount`,
+ *   `lastSweptAt`, `childGroupsKnown`, `pendingWrites`, `pendingWritesSince` — are absent
+ *   from `fields`, so a merging write leaves them where they are. A cleared watermark is a
+ *   full re-backfill of that section.
+ * - **Create** with `createDefaults` a document that was not there. See
+ *   `NEW_SECTION_DEFAULTS` for what a missing `pagesSyncedThrough` costs.
+ * - **Delete** a document the incoming set does not name. By absence rather than by a
+ *   `lastSeenAt` sweep, because the caller has just read the complete tree in one request
+ *   — so absence is a fact rather than an inference, and it must not be reached by the
+ *   skip above.
+ *
+ * One consequence of merging that the old wholesale write did not have: a field dropped
+ * from `buildStructure` is no longer removed from the stored documents. `set(…, { merge:
+ * true })` leaves a field it does not mention exactly where it is, so a retired field
+ * lingers until a `FieldValue.delete()` or a one-off pass clears it. Retiring a field is
+ * therefore a migration now, not an edit.
+ *
+ * `storedIdentities` maps document id to whatever the stored `identity` field held. A
+ * present key with an `undefined` value is a document written before that field existed:
+ * it exists, so it is merged rather than created, and it does not match, so it is written
+ * once. That is the one-off pass every deployment of this change pays.
+ */
+export function planStructureWrite(
+  storedIdentities: ReadonlyMap<string, unknown>,
+  documents: readonly (StructureIdentity & { id: string })[],
+  createDefaults: object,
+): StructureWritePlan {
+  const unseen = new Set(storedIdentities.keys());
+  const writes: PlannedStructureWrite[] = [];
+
+  for (const document of documents) {
+    const documentId = encodeMirrorId(document.id);
+    const existed = storedIdentities.has(documentId);
+    unseen.delete(documentId);
+
+    if (existed && storedIdentities.get(documentId) === document.identity) continue;
+
+    writes.push({
+      documentId,
+      fields: { ...(existed ? {} : createDefaults), ...document },
+      created: !existed,
+    });
+  }
+
+  return { writes, deletes: [...unseen] };
 }
 
 export type ContentState = 'present' | 'stale' | 'missing';
@@ -478,10 +738,12 @@ export interface MirrorSyncState {
   /**
    * sha256 over the active notebook ids, so a change to them is detectable.
    *
-   * It is not folded into `structureHash`, and that is deliberate: `putStructure`
-   * replaces documents wholesale and `buildStructure` emits `pagesSyncedThrough: null`,
-   * so anything entering that hash resets every section's watermark when it changes. An
-   * activation edit would then trigger a full re-backfill of the whole selection.
+   * It is not folded into `structureHash`, and that is deliberate: activity is not a
+   * field on any structure document, so a structure write has nothing to say about it and
+   * the hash it moved would name no document to write. The two changes also need
+   * different responses — a structure change disables the timestamp filter for one pass,
+   * and an activation change clears `sectionsScannedThrough` so a re-activated notebook's
+   * months-old sections come back into range. `reconcileActivity` does the second.
    */
   readonly activeSelectionHash: string | null;
   /** How many *active* ids matched no notebook. Same failure as `unknownNotebookIds`. */

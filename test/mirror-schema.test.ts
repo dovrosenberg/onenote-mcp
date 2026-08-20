@@ -22,6 +22,7 @@ import {
   SCHEMA_VERSION,
   WATERMARK_OVERLAP_MS,
   encodeMirrorId,
+  groupIdentity,
   htmlObjectName,
   htmlPlacement,
   initialSyncState,
@@ -30,10 +31,13 @@ import {
   leaseIsHeld,
   listingIsHeld,
   LISTING_HOLD_EXPIRY_MS,
+  notebookIdentity,
   overlapFrom,
+  planStructureWrite,
   isActive,
   readSelection,
   readSyncState,
+  sectionIdentity,
   utf8Bytes,
 } from '../src/mirror-schema.ts';
 
@@ -399,4 +403,227 @@ test('a lease with no mode, or an unreadable timestamp, is not held', () => {
     leaseIsHeld({ ...initialSyncState(), runningMode: 'sweep', runningSince: 'nonsense' }, now),
     false,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Structure document identities
+// ---------------------------------------------------------------------------
+
+const NOTEBOOK_FIELDS = {
+  id: 'nb-1',
+  displayName: '2026',
+  mirrored: true,
+  sectionCount: 3,
+  sectionGroupCount: 1,
+  graphLastModifiedDateTime: '2026-08-19T11:00:00Z',
+};
+
+const GROUP_FIELDS = {
+  id: 'grp-1',
+  displayName: '062 - February',
+  notebookId: 'nb-1',
+  parentId: 'nb-1',
+  parentKind: 'notebook' as const,
+  path: '2026 / 062 - February',
+  mirrored: true,
+};
+
+test('a section identity covers the tree fields and excludes the timestamp', () => {
+  const base = {
+    id: 'sec-1',
+    displayName: 'Daily',
+    notebookId: 'nb-1',
+    parentId: 'nb-1',
+    parentKind: 'notebook' as const,
+    path: '2026 / Daily',
+    mirrored: true,
+    graphLastModifiedDateTime: '2026-08-19T11:00:00Z',
+  };
+
+  // The timestamp moves whenever anyone edits a page. Including it would rewrite every
+  // section document on every structure change, which is the cost this whole task removes.
+  assert.equal(
+    sectionIdentity(base),
+    sectionIdentity({ ...base, graphLastModifiedDateTime: '2026-08-19T23:59:00Z' }),
+  );
+
+  // Each of these is a real structural change and must produce a different identity.
+  assert.notEqual(sectionIdentity(base), sectionIdentity({ ...base, displayName: 'Weekly' }));
+  assert.notEqual(sectionIdentity(base), sectionIdentity({ ...base, mirrored: false }));
+  assert.notEqual(sectionIdentity(base), sectionIdentity({ ...base, parentId: 'grp-1' }));
+  assert.notEqual(sectionIdentity(base), sectionIdentity({ ...base, path: '2026 / Other' }));
+  assert.notEqual(
+    sectionIdentity(base),
+    sectionIdentity({ ...base, parentKind: 'sectionGroup' as const }),
+  );
+});
+
+test('a section group identity covers the tree fields and not childGroupsKnown', () => {
+  // `childGroupsKnown` is sync-owned: the sweep sets it true after enumerating the nested
+  // groups, and a structure write that carried it would put it back to false and send
+  // every `list_sections` on that group to Graph until the next sweep re-learned them.
+  const base = groupIdentity(GROUP_FIELDS);
+  assert.notEqual(base, groupIdentity({ ...GROUP_FIELDS, displayName: 'March' }));
+  assert.notEqual(base, groupIdentity({ ...GROUP_FIELDS, mirrored: false }));
+  assert.notEqual(base, groupIdentity({ ...GROUP_FIELDS, parentId: 'grp-0' }));
+  assert.notEqual(base, groupIdentity({ ...GROUP_FIELDS, path: '2026 / Other' }));
+
+  // A group carries no timestamp at all, so nothing here can be confused with one.
+  assert.equal(base, groupIdentity({ ...GROUP_FIELDS }));
+});
+
+test('a notebook identity covers the counts and excludes the timestamp', () => {
+  assert.equal(
+    notebookIdentity(NOTEBOOK_FIELDS),
+    notebookIdentity({ ...NOTEBOOK_FIELDS, graphLastModifiedDateTime: '2099-01-01T00:00:00Z' }),
+  );
+
+  assert.notEqual(
+    notebookIdentity(NOTEBOOK_FIELDS),
+    notebookIdentity({ ...NOTEBOOK_FIELDS, displayName: '2027' }),
+  );
+  assert.notEqual(
+    notebookIdentity(NOTEBOOK_FIELDS),
+    notebookIdentity({ ...NOTEBOOK_FIELDS, mirrored: false }),
+  );
+  // The counts are what a `list_notebooks` answer prints, so a section added to a notebook
+  // has to reach the stored document even though nothing else about the notebook moved.
+  assert.notEqual(
+    notebookIdentity(NOTEBOOK_FIELDS),
+    notebookIdentity({ ...NOTEBOOK_FIELDS, sectionCount: 4 }),
+  );
+  assert.notEqual(
+    notebookIdentity(NOTEBOOK_FIELDS),
+    notebookIdentity({ ...NOTEBOOK_FIELDS, sectionGroupCount: 0 }),
+  );
+});
+
+const SEPARATOR_FIELDS = {
+  id: 'sec-1',
+  displayName: 'a b',
+  notebookId: 'c',
+  parentId: 'nb-1',
+  parentKind: 'notebook' as const,
+  path: '2026 / Daily',
+  mirrored: true,
+  graphLastModifiedDateTime: null,
+};
+
+test('a display name holding the separator cannot forge another split of the fields', () => {
+  // The failure a space separator has: `{displayName: 'a b', notebookId: 'c'}` and
+  // `{displayName: 'a', notebookId: 'b c'}` join to the same string, so a rename that
+  // moved a space across a field boundary would be invisible and the document would never
+  // be rewritten. A OneNote display name can hold a space; it cannot hold a NUL.
+  const left = sectionIdentity({ ...SEPARATOR_FIELDS, displayName: 'a b', notebookId: 'c' });
+  const right = sectionIdentity({ ...SEPARATOR_FIELDS, displayName: 'a', notebookId: 'b c' });
+  assert.notEqual(left, right);
+});
+
+// ---------------------------------------------------------------------------
+// planStructureWrite
+//
+// This is `#replaceCollection`'s whole judgement, extracted so a test can reach it:
+// src/mirror-store.ts needs a Firestore backend and has none here, so a branch left in
+// that file is a branch nothing checks. Every test below is a mutation that used to pass.
+// ---------------------------------------------------------------------------
+
+const SECTION_DEFAULTS = { pagesSyncedThrough: null, pageCount: 0 };
+
+function incoming(id: string, identity: string): { id: string; identity: string } {
+  return { id, identity };
+}
+
+test('a document whose stored identity matches is not written at all', () => {
+  // The failure without it: renaming one section moves the tree hash, and every one of the
+  // account's 568 section documents is rewritten with the tree's idea of it.
+  const plan = planStructureWrite(
+    new Map([
+      ['sec-1', 'same'],
+      ['sec-2', 'same'],
+    ]),
+    [incoming('sec-1', 'same'), incoming('sec-2', 'moved')],
+    SECTION_DEFAULTS,
+  );
+
+  assert.deepEqual(plan.writes.map((w) => w.documentId), ['sec-2']);
+  assert.deepEqual(plan.deletes, []);
+});
+
+test('a document that already existed is merged, and carries no creation default', () => {
+  // The defaults are the reset this whole split removes. `pagesSyncedThrough` absent from
+  // the written fields is what makes the stored watermark survive a `set(…, {merge:true})`.
+  const plan = planStructureWrite(
+    new Map([['sec-1', 'old']]),
+    [incoming('sec-1', 'new')],
+    SECTION_DEFAULTS,
+  );
+
+  const write = plan.writes[0];
+  assert.equal(write?.created, false);
+  assert.equal('pagesSyncedThrough' in (write?.fields ?? {}), false);
+  assert.equal('pageCount' in (write?.fields ?? {}), false);
+  assert.deepEqual(write?.fields, { id: 'sec-1', identity: 'new' });
+});
+
+test('a document that was not there is created with the defaults', () => {
+  const plan = planStructureWrite(new Map(), [incoming('sec-1', 'new')], SECTION_DEFAULTS);
+
+  const write = plan.writes[0];
+  assert.equal(write?.created, true);
+  // Not decoration: `listSectionsToSync` orders by this field, and an `orderBy` drops a
+  // document that lacks it — so a section created without it is never synced and nothing
+  // says so.
+  // Strict, because `assert.equal` is `==`: a default of `'0'` for `pageCount`, or of `0`
+  // for a field Firestore then orders on, would pass a loose comparison.
+  assert.strictEqual(write?.fields['pagesSyncedThrough'], null);
+  assert.strictEqual(write?.fields['pageCount'], 0);
+});
+
+test('a stored document with no identity is merged, not created', () => {
+  // What every document looks like on the first run after this field was introduced. It
+  // exists, so it must not take the create branch — that would null every watermark in the
+  // account, which is the failure the identity exists to prevent — and it does not match,
+  // so it is written once.
+  const plan = planStructureWrite(
+    new Map([['sec-1', undefined]]),
+    [incoming('sec-1', 'new')],
+    SECTION_DEFAULTS,
+  );
+
+  assert.equal(plan.writes[0]?.created, false);
+  assert.equal('pagesSyncedThrough' in (plan.writes[0]?.fields ?? {}), false);
+});
+
+test('a document the tree no longer names is deleted, and the skip does not reach it', () => {
+  // Deletion is by absence from the incoming set, which is a fact rather than an
+  // inference: the caller has just read the whole tree in one request.
+  const plan = planStructureWrite(
+    new Map([
+      ['sec-1', 'same'],
+      ['gone', 'whatever'],
+    ]),
+    [incoming('sec-1', 'same')],
+    SECTION_DEFAULTS,
+  );
+
+  assert.deepEqual(plan.writes, []);
+  assert.deepEqual(plan.deletes, ['gone']);
+});
+
+test('a plan keys its writes by the Firestore document id, not the Graph id', () => {
+  // A OneNote id can contain a `/`, which Firestore forbids in a document id. The stored
+  // map is keyed by the encoded form, so the plan has to encode before it compares — a
+  // comparison against the raw id would find nothing stored and create every document.
+  const graphId = '0-abc/def!1-ghi';
+  const documentId = encodeMirrorId(graphId);
+  assert.notEqual(documentId, graphId);
+
+  const plan = planStructureWrite(
+    new Map([[documentId, 'same']]),
+    [incoming(graphId, 'same')],
+    SECTION_DEFAULTS,
+  );
+
+  assert.deepEqual(plan.writes, []);
+  assert.deepEqual(plan.deletes, [], 'and it is not read as a document the tree dropped');
 });
