@@ -636,8 +636,24 @@ that and to stop rather than overrun.
 
 `MIRROR_SYNC_REQUEST_BUDGET` (default 120) is a hard stop. A run that reaches it commits
 what it did, answers 200 with `"done": false`, and resumes on the next schedule. That is
-what makes the first backfill possible: 2000 pages at four runs an hour drains in about
-five hours without ever spending more than half the hourly limit.
+what makes the first backfill possible at all.
+
+**The schedule and the budget multiply, and the product has to stay under 400.** This is
+the one arithmetic mistake here that gets the account throttled, and a throttle outlasts a
+short backoff — see the `Graph request budget` section of `CLAUDE.md`. Every run during a
+backfill spends its whole budget, so:
+
+| Schedule | Budget | Requests/hour | |
+|---|---|---|---|
+| `*/15` | 120 | 480 | **over the limit** |
+| `*/20` | 120 | 360 | leaves 40/hour for tools |
+| `*/20` | 100 | 300 | leaves 100/hour for tools — use this while backfilling |
+| `*/15` | 120 | ~4–45 | fine *after* the backfill, when runs are near-empty |
+
+Backfill on this account — 180 mirrored sections — is roughly one request per section plus
+one per page, so a notebook set holding a few thousand pages is ten hours or more of
+slices. Start on `*/20`, and move to `*/15` once `sync/state.backfillComplete` is true and
+runs are answering `outcome: complete` in a couple of requests.
 
 ### Setting it up
 
@@ -653,7 +669,7 @@ gh workflow run deploy.yml --ref main
 #    the platform's cut is the one that happens and the scheduler records it.
 gcloud scheduler jobs create http onenote-mcp-sync \
   --project="$GCP_PROJECT" --location="$GCP_REGION" \
-  --schedule="*/15 * * * *" --time-zone=UTC \
+  --schedule="*/20 * * * *" --time-zone=UTC \
   --uri="$MCP_PUBLIC_URL/sync" --http-method=POST \
   --headers="X-Sync-Secret=$(cat sync.secret)" \
   --attempt-deadline=330s --max-retry-attempts=2
