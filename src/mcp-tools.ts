@@ -16,6 +16,7 @@ import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 import { GraphAuthError } from './graph-auth.ts';
 import { GraphRequestError, GraphResponseError } from './graph-structure.ts';
 import { InkParseError, InkRenderError } from './ink.ts';
+import { MirrorUnavailableError } from './mirror-store.ts';
 import { NameLookupError } from './name-lookup.ts';
 
 /**
@@ -115,6 +116,16 @@ function toolErrorText(toolName: string, err: unknown): string {
     // the calling model fix the argument without another browsing call.
     return `${toolName}: ${err.message}`;
   }
+  if (err instanceof MirrorUnavailableError) {
+    // Only reachable when the local mirror *and* Microsoft Graph both failed — a mirror
+    // failure alone falls through to Graph and never becomes a tool error. Its own arm so
+    // the caller learns the local copy is not the problem to fix. No cause message: it
+    // wraps an arbitrary Firestore error, which can carry a document path.
+    return (
+      `${toolName}: ${err.message} The direct read from Microsoft Graph also failed; ` +
+      'check the service logs.'
+    );
+  }
   // Anything else is a bug in this server. Report that it happened and nothing more:
   // an arbitrary error's message may carry a request body, and this output is read by a
   // client that may log it.
@@ -177,6 +188,24 @@ export function optionalString(
   if (value === undefined || value === null) return undefined;
   if (typeof value !== 'string' || value.trim() === '') {
     throw new ToolInputError(name, 'must be a non-empty string when given');
+  }
+  return value;
+}
+
+/**
+ * A boolean, or undefined when absent.
+ *
+ * Strict about the type rather than truthy: a model passing the string `"false"` means
+ * false, and coercing it to true would silently do the opposite of what was asked.
+ */
+export function optionalBoolean(
+  args: Readonly<Record<string, unknown>>,
+  name: string,
+): boolean | undefined {
+  const value = args[name];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'boolean') {
+    throw new ToolInputError(name, 'must be true or false when given');
   }
   return value;
 }

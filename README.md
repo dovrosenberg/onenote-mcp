@@ -750,6 +750,37 @@ shared request gate, which is the failure that gets the whole account throttled.
 | 503, `reason: silent-failed` | The Microsoft refresh token is gone | Re-run `npm run bootstrap` |
 | 503, `reason: cache-unavailable` | Firestore did not answer | Retry; the credential is fine |
 
+### Reading from it
+
+`MIRROR_READ_ENABLED` is the switch. With it `false` — the default — every tool answers
+from Microsoft Graph exactly as it did before the mirror existed. With it `true`, seven
+tools try the local copy first and fall back to Graph on anything they do not hold:
+`list_notebooks`, `list_sections`, `list_pages`, `list_pages_by_name`,
+`find_page_by_name`, `get_page_content` and `search_pages`.
+
+Every one of them reports `source` as `mirror` or `graph`, and a mirrored answer carries
+`mirroredAt`. Every one also takes `useLiveData: true`, which skips the local copy for
+that call — the argument to pass when you need an edit made in the last few minutes.
+
+Turning it off is a complete rollback: set the variable to `false`, redeploy, and the
+tools are byte-identical to their pre-mirror behaviour. No data migration, and the mirror
+keeps filling in the background.
+
+Two things to check before turning it on:
+
+- **All four composite indexes read `READY`.** A query against one still `CREATING` fails
+  with `FAILED_PRECONDITION`.
+- **`sync/state.backfillComplete` is true.** Turning it on earlier is safe — an unmirrored
+  page is a miss and goes to Graph — but most reads would fall through, which is slower
+  than not having the mirror at all and spends budget the backfill needs.
+
+The one behaviour change worth knowing about is `search_pages`. Answered from Graph it
+walks sections and stops at 60 of them or 25 seconds, so it reports `sectionsSearched`,
+`sectionsFound` and `stoppedEarly`. Answered from the mirror there is no walk and no
+bound — but page content is held only for the notebooks in your selection, so it reports
+`notebooksSearched` against `notebooksInAccount` instead, and says so in its note when
+they differ. A model reading "no matches" needs to know which of those it got.
+
 ### Recovering from a bad mirror
 
 Delete the `notebooks`, `sectionGroups`, `sections`, `pages`, `pageContent` and

@@ -29,7 +29,13 @@ import {
   type InkImage,
 } from './ink.ts';
 import type { PageContent } from './page-content.ts';
-import { requiredString, type ToolDefinition } from './mcp-tools.ts';
+import { optionalBoolean, requiredString, type ToolDefinition } from './mcp-tools.ts';
+import {
+  USE_LIVE_DATA_PROPERTY,
+  readSourced,
+  type MirrorReader,
+  type MirrorSource,
+} from './mirror-reader.ts';
 
 /** This tool reads; it does not write. */
 const READ_ONLY: Tool['annotations'] = { readOnlyHint: true, openWorldHint: true };
@@ -58,6 +64,7 @@ export interface InkImageSummary {
 export function createPageTools(
   content: PageContentClient,
   maxBytes: number = MAX_INK_PNG_BYTES,
+  mirror?: MirrorReader,
 ): ToolDefinition[] {
   return [
     {
@@ -79,6 +86,7 @@ export function createPageTools(
             type: 'string',
             description: 'A page id from list_pages or search_pages.',
           },
+          useLiveData: USE_LIVE_DATA_PROPERTY,
         },
         required: ['pageId'],
         additionalProperties: false,
@@ -86,9 +94,23 @@ export function createPageTools(
       annotations: READ_ONLY,
       handle: async (args) => {
         const pageId = requiredString(args, 'pageId');
-        const page = await content.fetchContent(pageId);
+
+        // The mirror stores the raw HTML untrimmed and the ink as a rendered PNG, so a
+        // hit costs no Graph request. A page it does not hold, one a write has marked
+        // stale, and one whose stored content went missing are all misses and go to
+        // Graph — see MirrorReader.getPageContent.
+        const answer = await readSourced(
+          mirror,
+          'get_page_content',
+          optionalBoolean(args, 'useLiveData') ?? false,
+          (reader) => reader.getPageContent(pageId),
+          () => content.fetchContent(pageId),
+          (reader) => reader.syncedAt(pageId),
+        );
+
+        const page = answer.data;
         const ink = page.ink === null ? null : fitInkToByteBudget(page.ink, maxBytes);
-        return pageResult(pageId, page.html, ink);
+        return pageResult(pageId, page.html, ink, answer.source, answer.mirroredAt);
       },
     },
   ];
@@ -99,6 +121,8 @@ export function pageResult(
   pageId: string,
   html: string | null,
   ink: InkImage | null,
+  source: MirrorSource = 'graph',
+  mirroredAt?: string,
 ): CallToolResult {
   const summary = ink === null ? null : summarise(ink);
 
@@ -106,7 +130,14 @@ export function pageResult(
     {
       type: 'text',
       text: JSON.stringify(
-        { pageId, html, inkImage: summary, note: note(html, summary) },
+        {
+          pageId,
+          html,
+          inkImage: summary,
+          source,
+          ...(mirroredAt === undefined ? {} : { mirroredAt }),
+          note: note(html, summary, source, mirroredAt),
+        },
         null,
         2,
       ),
@@ -144,8 +175,23 @@ function summarise(ink: InkImage): InkImageSummary {
  * "this handwriting is illegible" from "this render is too small to read". Both cases
  * are stated rather than inferred.
  */
-function note(html: string | null, ink: InkImageSummary | null): string {
+function note(
+  html: string | null,
+  ink: InkImageSummary | null,
+  source: MirrorSource,
+  mirroredAt: string | undefined,
+): string {
   const parts: string[] = [];
+
+  // Said in prose as well as in a field, so a model that ignores keys it does not
+  // recognise still learns the answer may be minutes old.
+  if (source === 'mirror') {
+    parts.push(
+      "Answered from this server's local copy" +
+        (mirroredAt === undefined ? '' : `, last synced ${mirroredAt}`) +
+        '. Pass useLiveData true for a direct read from OneNote.',
+    );
+  }
 
   if (html === null) {
     parts.push('Graph returned no HTML for this page.');

@@ -318,6 +318,45 @@ export interface MirrorPage {
   readonly htmlObject: string | null;
   readonly htmlBytes: number;
   readonly ink: MirrorPageInk | null;
+  /**
+   * When the sync last wrote this page's content.
+   *
+   * Typed `unknown` because it is written with `FieldValue.serverTimestamp()` and comes
+   * back as a Firestore `Timestamp`, not a string. `timestampToIso` is what reads it;
+   * nothing else should touch it.
+   */
+  readonly contentSyncedAt?: unknown;
+}
+
+/**
+ * A Firestore timestamp as an ISO string, or null for anything unrecognised.
+ *
+ * Three shapes reach this: a `Timestamp` with `toDate()`, the plain
+ * `{_seconds, _nanoseconds}` a serialised one decodes to, and an absent field on a
+ * document written before the field existed. None of them is worth throwing over — the
+ * value's only job is to tell a model how stale an answer is, and "unknown" is a
+ * survivable answer where a failed tool call is not.
+ */
+export function timestampToIso(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+
+  if (typeof value === 'object' && 'toDate' in value) {
+    const date = (value as { toDate: () => Date }).toDate();
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  }
+
+  if (typeof value === 'object' && '_seconds' in value) {
+    const seconds = (value as { _seconds: unknown })._seconds;
+    if (typeof seconds !== 'number' || !Number.isFinite(seconds)) return null;
+    return new Date(seconds * 1000).toISOString();
+  }
+
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : new Date(parsed).toISOString();
+  }
+
+  return null;
 }
 
 export interface MirrorPageContent {

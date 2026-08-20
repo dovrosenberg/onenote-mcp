@@ -8,7 +8,13 @@ import { MCP_PATH, mcpRouter } from './mcp-server.ts';
 import { createOAuthProvider } from './oauth-provider.ts';
 import { oauthRouter, protectedResourceMetadataUrl } from './oauth-router.ts';
 import { SYNC_PATH, syncRouter } from './sync-route.ts';
-import { createGraphAuthFor, createSyncTargetFor, createTools } from './tools.ts';
+import {
+  createGraphAuthFor,
+  createMirrorInvalidatorFor,
+  createMirrorReaderFor,
+  createSyncTargetFor,
+  createTools,
+} from './tools.ts';
 import { SERVICE_NAME, VERSION } from './version.ts';
 
 /**
@@ -115,7 +121,7 @@ export function createApp(config: Config): Application {
       verifier: provider,
       resourceMetadataUrl: protectedResourceMetadataUrl(config.oauth),
     }),
-    mcpRouter(createTools(auth)),
+    mcpRouter(createTools(auth, createMirrorReaderFor(config), createMirrorInvalidatorFor(config))),
   );
 
   return app;

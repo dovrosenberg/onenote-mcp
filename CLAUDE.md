@@ -187,6 +187,18 @@ forced refresh actually slides Microsoft's window — that is a property of Entr
 nothing confirms it until an operator watches the scheduler job run for longer than the
 window.
 
+`test/mirror-reader.test.ts` and `test/mirror-tools.test.ts` cover the read path, and
+they are separate from `test/structure-tools.test.ts` and `test/page-tools.test.ts` on
+purpose: those two build their tools with no mirror argument, and every assertion in them
+still holds unchanged. That is the property worth protecting — an absent mirror means
+"always Graph", which is what makes `MIRROR_READ_ENABLED=false` a rollback rather than a
+code path with its own bugs. Almost every assertion in the pair is about a **miss**,
+because a miss is what sends a read to Graph and every way of getting it wrong produces a
+confident wrong answer rather than an error. The worst of them, and the one a refactor is
+most likely to reintroduce: a page whose stored ink object has gone must be a miss for
+the whole page, because answering `ink: null` there says "this page has no handwriting",
+which a model cannot detect and which silently drops the only copy of what the page says.
+
 `test/mirror-sync.test.ts` drives the sync through fakes that count their calls, with no
 `fetch` anywhere in it — every URL the sync builds is already asserted in
 `test/graph-structure.test.ts` against an exact-URL fake. What it asserts is the
@@ -857,6 +869,58 @@ Microsoft's refresh token does not slide. That is fine for a tool call and usele
 keepalive: the whole point of `GraphAuth.refresh()` is the side effect, a replacement
 refresh token with a fresh inactivity window written back to Firestore. Do not add it to
 the tool path — every forced refresh is a token-endpoint round trip and a Firestore write.
+
+**The read branch lives in the tool modules, not behind an adapter.** An adapter
+implementing `StructureClient` would return `PageSummary[]` with nowhere to say who
+answered; reporting the source would need either state on an object `createTools` shares
+across every request — wrong the moment two calls overlap — or a widening of every narrow
+interface's return type, which would change every existing fake in three test files. And
+"which source answered" is part of the tool's contract with the model, exactly like
+`moreAvailable`, `stoppedEarly` and `deepSearchUsed`. `readSourced` in
+`src/mirror-reader.ts` is the one place the branch is written; every covered tool calls it
+and spreads `source` and `mirroredAt` into its JSON.
+
+**Every mirror read answers `null` on a miss, and every miss means "ask Graph".** A page
+the mirror does not hold, a write-marked-stale page, a Firestore outage, and a caller that
+passed `useLiveData` all end in the same place. Refusing a tool call because a cache is
+down would be strictly worse than the behaviour before the mirror existed, which is the
+bar. Three misses look like hits if you write them carelessly: a page whose stored ink
+object is gone (answering `ink: null` claims the page has no handwriting), a section group
+whose `childGroupsKnown` is false (answering a short list that looks complete), and an
+empty structure collection (answering "no notebooks" rather than "never synced").
+
+**`list_notebooks` and unscoped `search_pages` cannot miss, which is why structure is
+mirrored for the whole account.** Neither takes an argument the mirror could fail to find,
+so both would answer confidently and partially from a mirror holding three notebooks out
+of fifty-five. The tree read returns every notebook and section for the same one request,
+so storing all of it is free; `mirrored` on each document records which have their *pages*
+held. Unscoped `search_pages` still reports `notebooksSearched` against
+`notebooksInAccount`, because its pages really are a subset — and it drops
+`stoppedEarly` and the section counts, which describe a walk that did not happen.
+
+**A `NameLookupError` from the mirror is a miss, not an answer.** The mirror's structure
+equals Graph's expanded tree by construction but is only as fresh as the last sync, so a
+section created ten minutes ago is absent and `resolveSection` would turn that into
+"sectionName matched nothing" listing the wrong siblings — which reads to a model as "no
+such section". Both `_by_name` reading tools retry the whole resolve-and-list against
+Graph before reporting. The retry costs one request and only on a failure, and a name that
+exists nowhere still raises.
+
+**A write invalidates the mirrored page, and a failed invalidation never fails the
+write.** `append_to_page`, `append_to_page_by_name` and `update_page_title` call
+`markPageStale` after a successful PATCH; `create_page` does not, because a page the
+mirror has never seen is already a miss. The write has already happened by then, so
+turning a lost invalidation into a reported error would send the caller to retry a change
+that is already made — and the damage is self-healing, because the write moved the page's
+`lastModifiedDateTime` and the next incremental run picks it up. There is deliberately no
+re-fetch from Graph in the write path: it would cost a request on every write, on top of
+the one `append_to_page` already pays for ink clearance, and `api-overview.md` records
+that page metadata read immediately after a write can come back wrong.
+
+**The invalidator is bound whenever a mirror exists, not only when reads are enabled.** A
+mirror being filled by the sync while `MIRROR_READ_ENABLED` is false still holds copies a
+write supersedes, and marking them stale then is what makes turning reads on later safe
+rather than a race with whatever was written in between.
 
 **`POST /sync` is the page mirror's way in, on the same terms as `/keepalive` and for the
 same reason.** Its own secret rather than the keepalive one, because the two reach

@@ -15,7 +15,9 @@ import { createGraphAuth, type GraphAuth } from './graph-auth.ts';
 import { createGraphStructure } from './graph-structure.ts';
 import type { ToolDefinition } from './mcp-tools.ts';
 import { createMirrorBlobStore } from './mirror-blobs.ts';
+import { MirrorReader } from './mirror-reader.ts';
 import { createMirrorStore } from './mirror-store.ts';
+import type { MirrorInvalidator } from './write-tools.ts';
 import { runFullSweep, runIncremental, runSweep, type SyncDeps } from './mirror-sync.ts';
 import { createGraphPageContent } from './page-content.ts';
 import { createPageTools } from './page-tools.ts';
@@ -56,7 +58,51 @@ export function createGraphAuthFor(config: Config): GraphAuth {
  *
  * The writing tools come last so `tools/list` reads as browse, read, then write.
  */
-export function createTools(auth: GraphAuth): ToolDefinition[] {
+/**
+ * The mirror reader, when reads are configured to use it.
+ *
+ * Undefined turns the whole feature off: every tool module treats an absent mirror as
+ * "always Graph", so `MIRROR_READ_ENABLED=false` is a complete rollback with no code
+ * change and no data migration. The bucket is required by `loadConfig`'s cross-field
+ * rule, so the check here is a type narrowing rather than a reachable branch.
+ */
+export function createMirrorReaderFor(config: Config): MirrorReader | undefined {
+  const mirror = config.mirror;
+  const firestore = config.firestore;
+  if (mirror === undefined || firestore === undefined || !mirror.readEnabled) return undefined;
+
+  if (mirror.bucket === undefined) {
+    throw new Error('internal: MIRROR_READ_ENABLED is true without MIRROR_BUCKET');
+  }
+
+  return new MirrorReader(
+    createMirrorStore(firestoreFor(firestore), mirror.rootDocumentPath),
+    createMirrorBlobStore(mirror.bucket, firestore.projectId),
+  );
+}
+
+/**
+ * The invalidator the write tools call after a successful write.
+ *
+ * Bound whenever a mirror exists at all, not only when reads are enabled: a mirror being
+ * filled by the sync while `MIRROR_READ_ENABLED` is false still holds copies that a write
+ * supersedes, and marking them stale then is what makes turning reads on later safe
+ * rather than a race with whatever was written in between.
+ */
+export function createMirrorInvalidatorFor(config: Config): MirrorInvalidator | undefined {
+  const mirror = config.mirror;
+  const firestore = config.firestore;
+  if (mirror === undefined || firestore === undefined) return undefined;
+  if (mirror.syncSecret === undefined && !mirror.readEnabled) return undefined;
+
+  return createMirrorStore(firestoreFor(firestore), mirror.rootDocumentPath);
+}
+
+export function createTools(
+  auth: GraphAuth,
+  mirror?: MirrorReader,
+  invalidator?: MirrorInvalidator,
+): ToolDefinition[] {
   // One page-content client serves both the reading tool and `append_to_page`, which
   // reads a page's layout before it writes so its content does not land on handwriting.
   const content = createGraphPageContent(auth);
@@ -67,9 +113,14 @@ export function createTools(auth: GraphAuth): ToolDefinition[] {
   const structure = createGraphStructure(auth);
 
   return [
-    ...createStructureTools(structure),
-    ...createPageTools(content),
-    ...createWriteTools(createGraphPageWrite(auth), content, structure),
+    // The mirror is passed to the read tools only. Writes always go to Graph, which
+    // stays the source of truth; the mirror is a copy that the sync refreshes.
+    ...createStructureTools(structure, {}, mirror),
+    ...createPageTools(content, undefined, mirror),
+    // The mirror reaches the write tools only as an invalidator: a successful write
+    // marks its page stale so the next read goes to Graph rather than serving the copy
+    // the write just superseded.
+    ...createWriteTools(createGraphPageWrite(auth), content, structure, invalidator),
   ];
 }
 

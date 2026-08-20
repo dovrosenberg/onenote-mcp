@@ -41,6 +41,7 @@ import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 
 import type { PageSummary } from './graph-structure.ts';
 import { InkParseError, parseInkStrokes, strokeBounds } from './ink.ts';
+import { logEvent } from './logging.ts';
 import { ToolInputError, optionalString, requiredString, type ToolDefinition } from './mcp-tools.ts';
 import {
   NameLookupError,
@@ -123,10 +124,21 @@ const NAME_PATH_PROPERTIES = {
  * Build the writing tools over a write client, the reader the appends use, and the
  * structure client the two `_by_name` tools resolve names through.
  */
+/**
+ * What a successful write tells the mirror.
+ *
+ * One method, taking a page id. `MirrorStore` satisfies it; an absent invalidator means
+ * no mirror is configured and there is nothing to invalidate.
+ */
+export interface MirrorInvalidator {
+  markPageStale(pageId: string): Promise<void>;
+}
+
 export function createWriteTools(
   write: PageWriteClient,
   layout: PageLayoutReader,
   lookup: WriteLookupStructure,
+  mirror?: MirrorInvalidator,
 ): ToolDefinition[] {
   return [
     {
@@ -166,7 +178,7 @@ export function createWriteTools(
         const pageId = requiredString(args, 'pageId');
         const htmlFragment = fragmentArgument(args, 'htmlFragment');
 
-        return jsonResult(await append(write, layout, pageId, htmlFragment));
+        return jsonResult(await append(write, layout, pageId, htmlFragment, mirror));
       },
     },
     {
@@ -223,7 +235,7 @@ export function createWriteTools(
         return jsonResult({
           ...resolvedPayload(resolved),
           page: { id: page.id, title: page.title },
-          ...(await append(write, layout, page.id, htmlFragment)),
+          ...(await append(write, layout, page.id, htmlFragment, mirror)),
         });
       },
     },
@@ -377,6 +389,7 @@ export function createWriteTools(
         const newTitle = titleArgument(args, 'newTitle');
 
         await write.updatePageTitle(pageId, newTitle);
+        await invalidate(mirror, pageId);
 
         return jsonResult({
           pageId,
@@ -402,11 +415,13 @@ async function append(
   layout: PageLayoutReader,
   pageId: string,
   htmlFragment: string,
+  mirror?: MirrorInvalidator,
 ): Promise<Record<string, unknown>> {
   const clearance = await inkClearance(layout, pageId);
   const content = clearance === null ? htmlFragment : clearanceHtml(clearance, htmlFragment);
 
   await write.appendToPage(pageId, content);
+  await invalidate(mirror, pageId);
 
   return {
     pageId,
@@ -549,4 +564,37 @@ export function titleArgument(args: Readonly<Record<string, unknown>>, name: str
 /** One JSON text block, the shape every other tool in this server answers with. */
 function jsonResult(payload: unknown): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+}
+
+/**
+ * Tell the mirror its copy of this page is superseded.
+ *
+ * Called after a successful write and never before one: a page whose write failed still
+ * matches what the mirror holds. `create_page` deliberately does not call this — the page
+ * is not in the mirror, so a read is already a miss and already goes to Graph.
+ *
+ * **A failure here never fails the write.** The write is the thing that mattered and it
+ * has already happened; turning a successful append into a reported error would send the
+ * caller to retry a change that is already made. The damage from a lost invalidation is
+ * bounded and self-healing: reads serve pre-write content until the next sync, and the
+ * write moved the page's `lastModifiedDateTime`, so the next incremental run picks it up
+ * whatever happens here.
+ *
+ * No re-fetch from Graph either. That would cost a request on every write — on top of the
+ * one `append_to_page` already pays for ink clearance — and `api-overview.md` records
+ * that page metadata read immediately after a write can come back wrong.
+ */
+async function invalidate(mirror: MirrorInvalidator | undefined, pageId: string): Promise<void> {
+  if (mirror === undefined) return;
+
+  try {
+    await mirror.markPageStale(pageId);
+  } catch (err) {
+    logEvent('mirror-invalidate-failed', { pageId, reason: reasonOf(err) });
+  }
+}
+
+/** A reason string for a log line. Never a message, which can carry a request body. */
+function reasonOf(err: unknown): string {
+  return err instanceof Error ? err.name : 'unknown';
 }
