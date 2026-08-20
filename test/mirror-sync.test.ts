@@ -58,6 +58,7 @@ import {
   splitByActivity,
   activeSelectionHashOf,
   structureHashOf,
+  withLiveMtimes,
   type ResyncDeps,
   type SyncDeps,
   type SyncStore,
@@ -541,6 +542,37 @@ test('the overlap window is applied, so a section on the boundary is not skipped
   assert.deepEqual(pickCandidates(sections, state, true).map((s) => s.id), ['just-before']);
 });
 
+test('withLiveMtimes takes the observed timestamp, and keeps the stored one when there is none', () => {
+  // The overlay is what stops `pickCandidates` reading a frozen stored value. Each of the
+  // three cases below is a different wrong answer if it is written carelessly.
+  const sections = [
+    section({ id: 'seen', graphLastModifiedDateTime: '2020-01-01T00:00:00Z' }),
+    section({ id: 'unseen', graphLastModifiedDateTime: '2020-01-01T00:00:00Z' }),
+    section({ id: 'cleared', graphLastModifiedDateTime: '2020-01-01T00:00:00Z' }),
+  ];
+
+  const live = new Map<string, string | null>([
+    ['seen', '2026-08-19T11:00:00Z'],
+    ['cleared', null],
+  ]);
+
+  const byId = new Map(withLiveMtimes(sections, live).map((s) => [s.id, s]));
+
+  assert.equal(byId.get('seen')?.graphLastModifiedDateTime, '2026-08-19T11:00:00Z');
+
+  // Only reachable when the tree read failed, which is also when `timestampsAreFresh` is
+  // false — but dropping the stored value here would make the section look never-stamped
+  // to anything else that reads it.
+  assert.equal(byId.get('unseen')?.graphLastModifiedDateTime, '2020-01-01T00:00:00Z');
+
+  // A live `null` is Graph saying the section carries no timestamp, not "no observation".
+  // Falling back to the stored value here would keep filtering on a frozen timestamp,
+  // which is the bug the overlay exists to fix.
+  assert.equal(byId.get('cleared')?.graphLastModifiedDateTime, null);
+
+  assert.equal(sections[0]?.graphLastModifiedDateTime, '2020-01-01T00:00:00Z', 'and nothing is mutated');
+});
+
 test('an edit is still noticed after the structure has stopped changing', async () => {
   // The failure this guards: `graphLastModifiedDateTime` is written only by
   // `putStructure`, which runs only when the tree hash moves — and the hash excludes
@@ -979,16 +1011,20 @@ test('changing the active set nulls sectionsScannedThrough, so a re-activation i
   // completed run. Without the reset, a notebook re-activated after three months would
   // have every section older than the cutoff and would never be re-checked at all.
   const h = harness(
-    { tree: TREE, changed: { 'sec-1': [] } },
+    // No scripted tree, so the account agrees with the mirror and `sec-1` really was last
+    // touched in 2020. A tree carrying a recent timestamp instead would make the section a
+    // candidate through `withLiveMtimes` whether or not the reset ran, and the second
+    // assertion below would hold with the reset deleted.
+    //
+    // The harness seeds a matching `structureHash`, so a structure rewrite is not what
+    // widens this run either: an unchanged hash makes the timestamps trusted, and the reset
+    // is then the only thing that can turn a section last touched in 2020 into a candidate.
+    { changed: { 'sec-1': [] } },
     {
       selection: sel([NB, NB2], [NB]),
       sections: [section({ graphLastModifiedDateTime: '2020-01-01T00:00:00Z' })],
       state: {
         ...initialSyncState(),
-        // Set, so a structure rewrite is not what widens this run: an unchanged hash
-        // makes the timestamps trusted, and the reset is then the only thing that can
-        // turn a section last touched in 2020 into a candidate.
-        structureHash: structureHashOf(buildStructure(TREE, sel([NB, NB2], [NB]))),
         sectionsScannedThrough: '2026-08-19T11:55:00.000Z',
         activeSelectionHash: activeSelectionHashOf(sel([NB, NB2], [NB2])),
       },
