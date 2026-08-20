@@ -258,6 +258,15 @@ gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" \
 # the idempotent outcome and not a failure. The `|| true` is that, and only
 # that -- a real failure still prints its own error above it.
 #
+# --async is not optional here. Without it gcloud submits the operation and
+# then blocks polling until the index has finished BUILDING, which takes
+# minutes per index and looks exactly like a hung script -- it did, on the
+# first real run. The build continues server-side either way; the state is
+# visible in `gcloud firestore indexes composite list`, and the next section
+# of this script prints the command. An index that is still CREATING when the
+# service queries it fails that query with FAILED_PRECONDITION, so wait for
+# READY before turning the mirror on.
+#
 # Collection ids are the last segment of MIRROR_ROOT_DOC's subcollections, so
 # they are fixed strings rather than derived: a collection-group index is
 # keyed by the collection id alone, and every deployment uses the same three.
@@ -270,7 +279,7 @@ gcloud firestore indexes composite create \
   --collection-group=pages \
   --field-config=field-path=sectionId,order=ascending \
   --field-config=field-path=lastModified,order=descending \
-  --database='(default)' --project="$PROJECT" --quiet >/dev/null 2>&1 || true
+  --database='(default)' --project="$PROJECT" --async --quiet >/dev/null 2>&1 || true
 
 # Sections to visit this sync run, least recently synced first. A
 # budget-bounded run round-robins on this rather than starving the tail.
@@ -278,7 +287,7 @@ gcloud firestore indexes composite create \
   --collection-group=sections \
   --field-config=field-path=mirrored,order=ascending \
   --field-config=field-path=pagesSyncedThrough,order=ascending \
-  --database='(default)' --project="$PROJECT" --quiet >/dev/null 2>&1 || true
+  --database='(default)' --project="$PROJECT" --async --quiet >/dev/null 2>&1 || true
 
 # Children of one container, by name. Two collections, same shape, because
 # Graph exposes sections and section groups as separate relationships and
@@ -288,7 +297,7 @@ for collection in sections sectionGroups; do
     --collection-group="$collection" \
     --field-config=field-path=parentId,order=ascending \
     --field-config=field-path=displayName,order=ascending \
-    --database='(default)' --project="$PROJECT" --quiet >/dev/null 2>&1 || true
+    --database='(default)' --project="$PROJECT" --async --quiet >/dev/null 2>&1 || true
 done
 
 # An index exemption on the one big string. Page HTML is stored untrimmed and
@@ -299,7 +308,12 @@ done
 gcloud firestore indexes fields update html \
   --collection-group=pageContent \
   --disable-indexes \
-  --database='(default)' --project="$PROJECT" --quiet >/dev/null 2>&1 || true
+  --database='(default)' --project="$PROJECT" --async --quiet >/dev/null 2>&1 || true
+
+log "indexes submitted; they build in the background. Check with:"
+log "  gcloud firestore indexes composite list --database='(default)' --project=$PROJECT"
+log "Every one must read READY before MIRROR_READ_ENABLED is turned on -- a query"
+log "against a CREATING index fails with FAILED_PRECONDITION."
 
 # ---------------------------------------------------------------------------
 # Workload Identity Federation

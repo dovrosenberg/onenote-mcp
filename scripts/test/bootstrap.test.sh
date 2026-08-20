@@ -150,6 +150,19 @@ assert_logged "firestore indexes composite create --collection-group=sectionGrou
   "the sectionGroups-by-parent index is created"
 assert_logged "firestore indexes fields update html --collection-group=pageContent --disable-indexes" \
   "raw page HTML is exempted from indexing"
+# --async on every one of them. Without it gcloud blocks polling until the
+# index has finished building, which is minutes per index and looks exactly
+# like a hung script -- it did, on the first real run against the project.
+for line in \
+  "indexes composite create --collection-group=pages" \
+  "indexes composite create --collection-group=sections --field-config=field-path=mirrored" \
+  "indexes composite create --collection-group=sections --field-config=field-path=parentId" \
+  "indexes composite create --collection-group=sectionGroups" \
+  "indexes fields update html"; do
+  assert_logged "$line" "submitted: $line"
+done
+assert_not_logged "indexes composite create --collection-group=pages --field-config=field-path=sectionId,order=ascending --field-config=field-path=lastModified,order=descending --database=(default) --project=test-project --quiet" \
+  "no index create runs without --async"
 
 echo "--- Phase 3: service accounts and IAM grants ---"
 
