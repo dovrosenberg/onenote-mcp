@@ -133,6 +133,11 @@ function fakeStore(fx: Partial<Fixture> = {}): { store: MirrorReadStore; data: F
     listSectionGroupsUnder: (parentId) =>
       guard('listSectionGroupsUnder', data.groups.filter((g) => g.parentId === parentId)),
     listAllSections: () => guard('listAllSections', data.sections),
+    listHeldSections: () =>
+      guard(
+        'listHeldSections',
+        data.sections.filter((s) => (s.pendingWrites ?? 0) > 0),
+      ),
     listAllSectionGroups: () => guard('listAllSectionGroups', data.groups),
     getNotebook: (id) => guard('getNotebook', data.notebooks.find((n) => n.id === id) ?? null),
     getSection: (id) => guard('getSection', data.sections.find((s) => s.id === id) ?? null),
@@ -229,6 +234,60 @@ test('a section the mirror does not hold pages for is a miss', async () => {
   const { reader: r } = reader({ sections: [section({ mirrored: false })] });
   assert.equal(await r.listPagesInSection('sec-1', 10), null);
   assert.equal(await r.listPagesInSection('sec-nope', 10), null);
+});
+
+test('a section with a write in flight is a miss for its whole page listing', async () => {
+  // What the hold covers that a stale page marker cannot: `create_page` adds a page the
+  // mirror has no document for, and `update_page_title` changes the title every listing
+  // and by-name lookup matches on. Serving the stored listing through either window is a
+  // confident wrong answer -- "the page was not created", or the old title.
+  const held = section({ pendingWrites: 1, pendingWritesSince: new Date().toISOString() });
+
+  const { reader: r } = reader({ sections: [held] });
+  assert.equal(await r.listPagesInSection('sec-1', 10), null);
+  assert.equal(await r.searchTitles(() => true, { sectionId: 'sec-1' }), null);
+  assert.equal(await r.searchTitles(() => true), null, 'an unscoped search covers it too');
+  assert.equal(
+    await r.searchTitles(() => true, { notebookId: NB }),
+    null,
+    'and so does a search scoped to the notebook holding it',
+  );
+});
+
+test('a hold in another notebook does not spoil a search scoped away from it', async () => {
+  // Precision is worth a query here: an unscoped search_pages answered by Graph costs up
+  // to 61 requests, a seventh of the hourly budget.
+  const { reader: r } = reader({
+    notebooks: [notebook(), notebook({ id: 'nb-2' })],
+    sections: [
+      section(),
+      section({
+        id: 'sec-2',
+        notebookId: 'nb-2',
+        parentId: 'nb-2',
+        pendingWrites: 1,
+        pendingWritesSince: new Date().toISOString(),
+      }),
+    ],
+  });
+
+  assert.notEqual(await r.searchTitles(() => true, { notebookId: NB }), null);
+  assert.notEqual(await r.listPagesInSection('sec-1', 10), null, 'sec-1 holds nothing back');
+  assert.equal(await r.listPagesInSection('sec-2', 10), null, 'sec-2 does');
+});
+
+test('a hold a dead process left behind expires rather than wedging the section', async () => {
+  // endWrite runs in a `finally`, so a hold outlives its write only when the process
+  // stops between the two. Nothing runs after that to lower the count, and a hold nothing
+  // can clear would send every listing for that section to Graph forever.
+  const stale = section({
+    pendingWrites: 1,
+    pendingWritesSince: new Date(Date.now() - 3_600_000).toISOString(),
+  });
+
+  const { reader: r } = reader({ sections: [stale] });
+  assert.notEqual(await r.listPagesInSection('sec-1', 10), null);
+  assert.notEqual(await r.searchTitles(() => true), null);
 });
 
 test('list_pages reports an exact total, not a >= heuristic', async () => {

@@ -288,6 +288,33 @@ export interface MirrorSection {
    */
   readonly pagesSyncedThrough: string | null;
   readonly pageCount: number;
+  /**
+   * How many writes are in flight against this section's *page listing*.
+   *
+   * A page listing served from the mirror reports which pages a section holds and what
+   * they are called. Two writes change that and cannot be repaired by marking a page
+   * stale: `create_page` adds a page the mirror has no document for, and
+   * `update_page_title` changes the title every listing and by-name lookup matches on.
+   * Both raise this before they call Graph and lower it after the resync, so the whole
+   * window answers `list_pages`, `list_pages_by_name`, `find_page_by_name` and
+   * `search_pages` from Graph rather than from a copy that is provably behind.
+   *
+   * A count rather than a flag because two writes against one section can overlap: the
+   * first to finish must not clear the second's hold.
+   *
+   * An append does not raise it. It changes the page's content, which
+   * `contentState: 'stale'` already covers, and its `lastModifiedDateTime`, which only
+   * moves the page within an ordering — no listing becomes wrong about what exists or
+   * what it is called.
+   *
+   * A structure replacement clears it, because `putStructure` writes each section
+   * document whole. That runs only when the tree hash moves — someone added or renamed a
+   * notebook — so it is a rare race with an in-flight write, and it fails in the same
+   * direction as the expiry below rather than in a new one.
+   */
+  readonly pendingWrites?: number;
+  /** When the most recent hold was taken, so a hold a dead process left expires. */
+  readonly pendingWritesSince?: string;
 }
 
 export type ContentState = 'present' | 'stale' | 'missing';
@@ -491,6 +518,45 @@ export function leaseIsHeld(
   if (Number.isNaN(since)) return false;
 
   return now - since < expiryMs;
+}
+
+/**
+ * How long a section's page-listing hold survives without being released.
+ *
+ * `endWrite` in ./write-tools.ts runs in a `finally`, so a hold outlives its write only
+ * when the process stops between the two — Cloud Run cutting the request at 300 seconds,
+ * or the instance being reclaimed. Nothing runs after that to lower the count, and a hold
+ * that nothing can clear would send every listing for that section to Graph forever: one
+ * request for a `list_pages`, and up to 61 for an unscoped `search_pages`.
+ *
+ * So the hold expires on age, and the expiry is longer than any request may live. Ten
+ * minutes against Cloud Run's 300-second ceiling.
+ */
+export const LISTING_HOLD_EXPIRY_MS = 600_000;
+
+/**
+ * Is this section's page listing held back from being answered by the mirror?
+ *
+ * A count without a timestamp is not a document this code writes — both fields go in one
+ * operation — and it is read as *expired* rather than as held, for the reason
+ * `leaseIsHeld` reads an unparseable `runningSince` as expired: the alternative is a
+ * state nothing can ever clear.
+ */
+export function listingIsHeld(
+  section: Pick<MirrorSection, 'pendingWrites' | 'pendingWritesSince'>,
+  now: number,
+  expiryMs: number = LISTING_HOLD_EXPIRY_MS,
+): boolean {
+  const pending = section.pendingWrites;
+  if (typeof pending !== 'number' || !(pending > 0)) return false;
+
+  const since = section.pendingWritesSince;
+  if (typeof since !== 'string') return false;
+
+  const at = Date.parse(since);
+  if (Number.isNaN(at)) return false;
+
+  return now - at < expiryMs;
 }
 
 function stringOrNull(value: unknown): string | null {

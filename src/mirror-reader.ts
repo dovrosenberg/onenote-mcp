@@ -38,6 +38,7 @@ import { fitInkToByteBudget, type InkImage } from './ink.ts';
 import { logEvent } from './logging.ts';
 import type { MirrorBlobReader } from './mirror-blobs.ts';
 import {
+  listingIsHeld,
   timestampToIso,
   type MirrorNotebook,
   type MirrorPage,
@@ -92,6 +93,7 @@ export interface MirrorReadStore {
   listSectionsUnder(parentId: string): Promise<MirrorSection[]>;
   listSectionGroupsUnder(parentId: string): Promise<MirrorSectionGroup[]>;
   listAllSections(): Promise<MirrorSection[]>;
+  listHeldSections(): Promise<MirrorSection[]>;
   listAllSectionGroups(): Promise<MirrorSectionGroup[]>;
   getNotebook(notebookId: string): Promise<MirrorNotebook | null>;
   getSection(sectionId: string): Promise<MirrorSection | null>;
@@ -206,6 +208,12 @@ export class MirrorReader {
     const section = await this.#store.getSection(sectionId);
     if (section === null || !section.mirrored) return null;
 
+    // A create or a rename is in flight against this section, or one died before its
+    // resync landed. Either way the stored listing is behind by a page or by a title,
+    // and the failure is silent: `find_page_by_name` matches the old title, and
+    // `list_pages` reports a section that does not contain the page just created.
+    if (listingIsHeld(section, Date.now())) return null;
+
     // One more than asked for, so "there are exactly top" and "there are more" are
     // distinguishable without a second query.
     const pages = await this.#store.listPagesInSection(sectionId, top + 1);
@@ -269,7 +277,8 @@ export class MirrorReader {
     if (scope.sectionId !== undefined) {
       const section = await this.#store.getSection(scope.sectionId);
       if (section === null || !section.mirrored) return null;
-    }
+      if (listingIsHeld(section, Date.now())) return null;
+    } else if (await this.#heldInScope(scope.notebookId)) return null;
 
     const notebooks = await this.#store.listNotebooks();
     if (notebooks.length === 0) return null;
@@ -285,6 +294,25 @@ export class MirrorReader {
       notebooksSearched: notebooks.filter((notebook) => notebook.mirrored).length,
       notebooksInAccount: notebooks.length,
     };
+  }
+
+  /**
+   * Is any section in scope holding its page listing back?
+   *
+   * One query against a collection that is normally empty, and it carries `notebookId`,
+   * so a notebook-scoped search is not made to miss by a write in a different notebook.
+   * That precision is worth the query: an unscoped `search_pages` answered by Graph costs
+   * up to 61 requests, a seventh of the hourly budget.
+   */
+  async #heldInScope(notebookId: string | undefined): Promise<boolean> {
+    const now = Date.now();
+    const held = await this.#store.listHeldSections();
+
+    return held.some(
+      (section) =>
+        listingIsHeld(section, now) &&
+        (notebookId === undefined || section.notebookId === notebookId),
+    );
   }
 
   /**

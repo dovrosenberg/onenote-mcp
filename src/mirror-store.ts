@@ -296,6 +296,40 @@ export class MirrorStore {
     );
   }
 
+  /** Every section whose page listing is currently held. Normally none. */
+  async listHeldSections(): Promise<MirrorSection[]> {
+    // A single-field range filter, so Firestore's automatic index serves it and
+    // scripts/gcp-bootstrap.sh needs no composite index for it.
+    return this.#query(
+      'listing sections with writes in flight',
+      this.#sections().where('pendingWrites', '>', 0),
+    );
+  }
+
+  /**
+   * Raise this section's page-listing hold, before a write Graph has not seen yet.
+   *
+   * `update`, not `set({merge:true})`, for the reason `markPageStale` gives and with a
+   * worse failure if it were ignored: a merging set would *create* the section document,
+   * and the write tools reach the whole account while only the selection is mirrored — so
+   * a create in an unmirrored section would leave a section stub carrying nothing but a
+   * counter, which `listAllSections` then feeds to `expandedTree` as a section with no
+   * name. NOT_FOUND means there is no listing to hold back.
+   */
+  async holdSectionListing(sectionId: string, sinceIso: string): Promise<void> {
+    await this.#updateSection('holding a section page listing', sectionId, {
+      pendingWrites: FieldValue.increment(1),
+      pendingWritesSince: sinceIso,
+    });
+  }
+
+  /** Lower it again, after the write's resync has landed. */
+  async releaseSectionListing(sectionId: string): Promise<void> {
+    await this.#updateSection('releasing a section page listing', sectionId, {
+      pendingWrites: FieldValue.increment(-1),
+    });
+  }
+
   async setChildGroupsKnown(groupId: string, known: boolean): Promise<void> {
     await this.#run('recording nested section groups', () =>
       this.#sectionGroups()
@@ -413,13 +447,22 @@ export class MirrorStore {
   async markPageStale(pageId: string): Promise<void> {
     await this.#run('marking a mirrored page stale', async () => {
       const batch = this.#firestoreOf(this.#root).batch();
-      batch.set(
-        this.#pages().doc(encodeMirrorId(pageId)),
-        { contentState: 'stale' },
-        { merge: true },
-      );
+      // `update`, not `set({merge:true})`. A merging set *creates* the document when it
+      // is absent, and the write tools reach the whole account while only the selection
+      // is mirrored — so every write to an unmirrored page would leave a stub carrying
+      // nothing but `contentState: 'stale'`. Harmless to read, but it fills the queried
+      // collection with rows for pages the mirror does not hold.
+      batch.update(this.#pages().doc(encodeMirrorId(pageId)), { contentState: 'stale' });
       batch.delete(this.#pageContent().doc(encodeMirrorId(pageId)));
-      await batch.commit();
+
+      try {
+        await batch.commit();
+      } catch (err) {
+        // NOT_FOUND means there was no copy to invalidate, which is the ordinary answer
+        // for a page outside the mirrored set. Anything else is a real failure.
+        if (isNotFound(err)) return;
+        throw err;
+      }
     });
   }
 
@@ -468,6 +511,21 @@ export class MirrorStore {
 
   #tombstones(): CollectionReference {
     return this.#root.collection(TOMBSTONES_COLLECTION);
+  }
+
+  async #updateSection(
+    operation: string,
+    sectionId: string,
+    fields: Record<string, unknown>,
+  ): Promise<void> {
+    await this.#run(operation, async () => {
+      try {
+        await this.#sections().doc(encodeMirrorId(sectionId)).update(fields);
+      } catch (err) {
+        if (isNotFound(err)) return;
+        throw err;
+      }
+    });
   }
 
   #firestoreOf(ref: DocumentReference): Firestore {
@@ -553,6 +611,11 @@ export class MirrorStore {
       throw new MirrorUnavailableError(operation, { cause: err });
     }
   }
+}
+
+/** Firestore's gRPC status for a document that is not there. */
+function isNotFound(err: unknown): boolean {
+  return (err as { code?: unknown }).code === 5;
 }
 
 /** A reason string for a log line. Never a message, which can carry a request body. */

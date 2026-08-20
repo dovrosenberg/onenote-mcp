@@ -137,6 +137,10 @@ export interface MirrorWriteSync {
     hint: { title?: string; sectionId?: string },
   ): Promise<ResyncOutcome>;
   markPageStale(pageId: string): Promise<void>;
+  /** The section a mirrored page sits in, or null when the mirror does not hold it. */
+  sectionOfPage(pageId: string): Promise<string | null>;
+  holdSectionListing(sectionId: string): Promise<void>;
+  releaseSectionListing(sectionId: string): Promise<void>;
 }
 
 /**
@@ -284,28 +288,35 @@ export function createWriteTools(
         const title = titleArgument(args, 'title');
         const htmlFragment = fragmentArgument(args, 'htmlFragment');
 
-        const page = await write.createPage(sectionId, title, htmlFragment);
-        // sectionId is passed because the page is not in the mirror yet, so there is no
-        // stored placement to read it from. The title comes from the create response,
-        // which carries the right one — a metadata read here would not.
-        await resync(
-          mirror,
-          page.id,
-          { title: page.title === '' ? title : page.title, sectionId },
-          true,
-        );
+        // The section's page listing is held back first: a create has no page to mark
+        // stale, and the listing is the thing it makes wrong. See `beginWrite`.
+        await beginWrite(mirror, { sectionId });
+        try {
+          const page = await write.createPage(sectionId, title, htmlFragment);
+          // sectionId is passed because the page is not in the mirror yet, so there is no
+          // stored placement to read it from. The title comes from the create response,
+          // which carries the right one — a metadata read here would not.
+          await resync(
+            mirror,
+            page.id,
+            { title: page.title === '' ? title : page.title, sectionId },
+            true,
+          );
 
-        return jsonResult({
-          pageId: page.id,
-          title: page.title === '' ? title : page.title,
-          webUrl: page.webUrl,
-          clientUrl: page.clientUrl,
-          note:
-            'The page was created. Use pageId with get_page_content to read it back or ' +
-            'append_to_page to add to it. Do not confirm the page by looking for its ' +
-            'title in a listing straight away: page metadata can take a few seconds to ' +
-            'catch up, and the title above is the one the service accepted.',
-        });
+          return jsonResult({
+            pageId: page.id,
+            title: page.title === '' ? title : page.title,
+            webUrl: page.webUrl,
+            clientUrl: page.clientUrl,
+            note:
+              'The page was created. Use pageId with get_page_content to read it back ' +
+              'or append_to_page to add to it. Do not confirm the page by looking for ' +
+              'its title in a listing straight away: page metadata can take a few ' +
+              'seconds to catch up, and the title above is the one the service accepted.',
+          });
+        } finally {
+          await endWrite(mirror, { sectionId });
+        }
       },
     },
     {
@@ -353,32 +364,39 @@ export function createWriteTools(
         const htmlFragment = fragmentArgument(args, 'htmlFragment');
 
         const resolved = await resolveSection(lookup, path);
-        const page = await write.createPage(resolved.section.id, title, htmlFragment);
-        await resync(
-          mirror,
-          page.id,
-          { title: page.title === '' ? title : page.title, sectionId: resolved.section.id },
-          true,
-        );
+        const sectionId = resolved.section.id;
 
-        return jsonResult({
-          ...resolvedPayload(resolved),
-          pageId: page.id,
-          title: page.title === '' ? title : page.title,
-          webUrl: page.webUrl,
-          clientUrl: page.clientUrl,
-          note:
-            'The page was created in the section named above. Check section and ' +
-            'matchedBy if the names you gave were approximate. Use pageId with ' +
-            'get_page_content to read it back or append_to_page to add to it. Do not ' +
-            'confirm the page by looking for its title in a listing straight away: page ' +
-            'metadata can take a few seconds to catch up, and the title above is the ' +
-            'one the service accepted.' +
-            (resolved.deepSearchUsed
-              ? ' The section sits below the section group named, and was found by an ' +
-                'account-wide search on its name.'
-              : ''),
-        });
+        await beginWrite(mirror, { sectionId });
+        try {
+          const page = await write.createPage(sectionId, title, htmlFragment);
+          await resync(
+            mirror,
+            page.id,
+            { title: page.title === '' ? title : page.title, sectionId },
+            true,
+          );
+
+          return jsonResult({
+            ...resolvedPayload(resolved),
+            pageId: page.id,
+            title: page.title === '' ? title : page.title,
+            webUrl: page.webUrl,
+            clientUrl: page.clientUrl,
+            note:
+              'The page was created in the section named above. Check section and ' +
+              'matchedBy if the names you gave were approximate. Use pageId with ' +
+              'get_page_content to read it back or append_to_page to add to it. Do not ' +
+              'confirm the page by looking for its title in a listing straight away: ' +
+              'page metadata can take a few seconds to catch up, and the title above ' +
+              'is the one the service accepted.' +
+              (resolved.deepSearchUsed
+                ? ' The section sits below the section group named, and was found by ' +
+                  'an account-wide search on its name.'
+                : ''),
+          });
+        } finally {
+          await endWrite(mirror, { sectionId });
+        }
       },
     },
     {
@@ -412,18 +430,29 @@ export function createWriteTools(
         const pageId = requiredString(args, 'pageId');
         const newTitle = titleArgument(args, 'newTitle');
 
-        await write.updatePageTitle(pageId, newTitle);
-        // The title comes from here rather than from a read-back: measured 2026-08-19,
-        // page metadata read immediately after a write can come back empty.
-        await resync(mirror, pageId, { title: newTitle }, false);
+        // A rename is the one write that changes what a *listing* says, so it holds the
+        // section's page listing back as well as marking the page stale. The section is
+        // read from the mirror rather than taken as an argument: this tool names only a
+        // page, and a page the mirror does not hold appears in no listing to be wrong.
+        const sectionId = await sectionOfPage(mirror, pageId);
 
-        return jsonResult({
-          pageId,
-          title: newTitle,
-          note:
-            'The page title was replaced and the page content was left alone. A ' +
-            'listing may report the old title for a few seconds afterwards.',
-        });
+        await beginWrite(mirror, { pageId, ...(sectionId === null ? {} : { sectionId }) });
+        try {
+          await write.updatePageTitle(pageId, newTitle);
+          // The title comes from here rather than from a read-back: measured 2026-08-19,
+          // page metadata read immediately after a write can come back empty.
+          await resync(mirror, pageId, { title: newTitle }, false);
+
+          return jsonResult({
+            pageId,
+            title: newTitle,
+            note:
+              'The page title was replaced and the page content was left alone. A ' +
+              'listing may report the old title for a few seconds afterwards.',
+          });
+        } finally {
+          await endWrite(mirror, { ...(sectionId === null ? {} : { sectionId }) });
+        }
       },
     },
   ];
@@ -446,6 +475,7 @@ async function append(
   const clearance = await inkClearance(layout, pageId);
   const content = clearance === null ? htmlFragment : clearanceHtml(clearance, htmlFragment);
 
+  await beginWrite(mirror, { pageId });
   await write.appendToPage(pageId, content);
   // No title hint: an append cannot change one.
   await resync(mirror, pageId, {}, true);
@@ -591,6 +621,114 @@ export function titleArgument(args: Readonly<Record<string, unknown>>, name: str
 /** One JSON text block, the shape every other tool in this server answers with. */
 function jsonResult(payload: unknown): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+}
+
+/**
+ * Invalidate what this write is about to make wrong, *before* the Graph write.
+ *
+ * Every one of the five writing tools calls this first, then writes to OneNote, then
+ * resyncs. That ordering is what makes the window between the two safe, and it covers a
+ * case the fallback inside `resync` cannot. Between the PATCH succeeding and the resync
+ * completing, the mirror holds a copy that OneNote no longer agrees with. If the process
+ * merely errors, `resync` catches it and marks the page stale. If the process *stops* —
+ * Cloud Run cutting the request at 300 seconds, or the instance being reclaimed after an
+ * idle period — nothing catches anything: the resync is sitting in the request gate's
+ * queue, the queue is wiped with the instance, and no `catch` ever runs because nothing
+ * threw. The mirror would then keep serving superseded data as `present`, reporting
+ * `source: "mirror"` and a recent `mirroredAt`, until the next scheduled sync noticed the
+ * page's `lastModifiedDateTime` had moved. Marking first makes the whole window
+ * pessimistic instead: a death anywhere in it leaves a miss, and a miss goes to Graph,
+ * which cannot be wrong.
+ *
+ * **There are two things to invalidate, and which ones apply is per tool.**
+ *
+ * `pageId` marks the page's stored *content* stale, so `get_page_content` misses. Every
+ * write that names an existing page passes it: both appends and the rename.
+ *
+ * `sectionId` holds the section's *page listing* back, so `list_pages`,
+ * `list_pages_by_name`, `find_page_by_name` and `search_pages` miss. `create_page` passes
+ * it because there is no page document to mark and the listing is exactly what a create
+ * makes wrong — without this, a create whose resync never ran leaves `list_pages`
+ * answering from the mirror with a section that does not contain the page, which reads to
+ * a model as "the page was not created". `update_page_title` passes it because the title
+ * is what every listing and by-name lookup matches on. An append passes neither a section
+ * nor anything else: it changes content, which `pageId` covers, and
+ * `lastModifiedDateTime`, which only reorders a listing.
+ *
+ * The cost is one Firestore write per tool write, and — if the Graph write then fails —
+ * a discarded cached copy that the next read re-fetches. Both are cheap against serving
+ * data the user can see is wrong.
+ */
+async function beginWrite(
+  mirror: MirrorWriteSync | undefined,
+  target: { pageId?: string; sectionId?: string },
+): Promise<void> {
+  if (mirror === undefined) return;
+
+  const { pageId, sectionId } = target;
+
+  if (pageId !== undefined) {
+    try {
+      await mirror.markPageStale(pageId);
+    } catch (err) {
+      // Never fails the write. This is a narrowing of an existing window, not a
+      // precondition for writing.
+      logEvent('mirror-invalidate-failed', { pageId, reason: reasonOf(err) });
+    }
+  }
+
+  if (sectionId !== undefined) {
+    try {
+      await mirror.holdSectionListing(sectionId);
+    } catch (err) {
+      logEvent('mirror-listing-hold-failed', { sectionId, reason: reasonOf(err) });
+    }
+  }
+}
+
+/**
+ * Release the listing hold `beginWrite` took, after the resync has landed.
+ *
+ * Called from a `finally`, so a Graph write that failed releases too — the listing it
+ * was going to invalidate is still correct. A hold that outlives its process is not
+ * leaked forever: `listingIsHeld` in ./mirror-schema.ts expires one on age.
+ */
+async function endWrite(
+  mirror: MirrorWriteSync | undefined,
+  target: { sectionId?: string },
+): Promise<void> {
+  if (mirror === undefined || target.sectionId === undefined) return;
+
+  try {
+    await mirror.releaseSectionListing(target.sectionId);
+  } catch (err) {
+    logEvent('mirror-listing-release-failed', {
+      sectionId: target.sectionId,
+      reason: reasonOf(err),
+    });
+  }
+}
+
+/**
+ * Where the mirror thinks this page lives, or null.
+ *
+ * Null covers both "the mirror does not hold it" and "Firestore did not answer", and both
+ * mean the same thing to the caller: there is no stored listing to hold back. A failure
+ * here must not fail the write, which has not happened yet and is the thing the caller
+ * asked for.
+ */
+async function sectionOfPage(
+  mirror: MirrorWriteSync | undefined,
+  pageId: string,
+): Promise<string | null> {
+  if (mirror === undefined) return null;
+
+  try {
+    return await mirror.sectionOfPage(pageId);
+  } catch (err) {
+    logEvent('mirror-invalidate-failed', { pageId, reason: reasonOf(err) });
+    return null;
+  }
 }
 
 /**

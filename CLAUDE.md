@@ -187,6 +187,14 @@ forced refresh actually slides Microsoft's window — that is a property of Entr
 nothing confirms it until an operator watches the scheduler job run for longer than the
 window.
 
+`test/mirror-reader.test.ts` also covers the listing hold, and its three cases fail in
+different directions: a held section is a miss for `listPagesInSection` *and* for a search
+scoped to it *and* for an unscoped search; a hold in another notebook does not spoil a
+search scoped away from it, which is the precision that keeps an unscoped `search_pages`
+from paying 61 Graph requests over an unrelated write; and a hold older than
+`LISTING_HOLD_EXPIRY_MS` answers from the mirror again, because a hold a dead process left
+behind must not wedge a section permanently.
+
 `test/mirror-reader.test.ts` and `test/mirror-tools.test.ts` cover the read path, and
 they are separate from `test/structure-tools.test.ts` and `test/page-tools.test.ts` on
 purpose: those two build their tools with no mirror argument, and every assertion in them
@@ -884,10 +892,12 @@ and spreads `source` and `mirroredAt` into its JSON.
 the mirror does not hold, a write-marked-stale page, a Firestore outage, and a caller that
 passed `useLiveData` all end in the same place. Refusing a tool call because a cache is
 down would be strictly worse than the behaviour before the mirror existed, which is the
-bar. Three misses look like hits if you write them carelessly: a page whose stored ink
+bar. Four misses look like hits if you write them carelessly: a page whose stored ink
 object is gone (answering `ink: null` claims the page has no handwriting), a section group
-whose `childGroupsKnown` is false (answering a short list that looks complete), and an
-empty structure collection (answering "no notebooks" rather than "never synced").
+whose `childGroupsKnown` is false (answering a short list that looks complete), an
+empty structure collection (answering "no notebooks" rather than "never synced"), and a
+section whose `pendingWrites` is held (answering a page listing that a create or a rename
+has already made wrong).
 
 **`list_notebooks` and unscoped `search_pages` cannot miss, which is why structure is
 mirrored for the whole account.** Neither takes an argument the mirror could fail to find,
@@ -909,7 +919,8 @@ exists nowhere still raises.
 **Every write resyncs its page immediately, and that costs one Graph request.** All five
 writing tools call `resyncPage` after a successful write — including `create_page`, whose
 page the mirror has never seen and which would otherwise be a miss until the next
-scheduled run. The alternative, marking the page stale and letting the next sync repair
+scheduled run. The resync is also what ends the section's listing hold with the listing
+correct rather than merely un-held. The alternative, marking the page stale and letting the next sync repair
 it, leaves every read falling through to Graph for up to a whole poll interval, which in
 the middle of a conversation is the window that matters most.
 
@@ -945,6 +956,67 @@ second copy that skipped the ink render, or spilled to GCS at a different thresh
 make a page's stored form depend on which path last touched it — and the difference would
 only surface as a wrong answer to a model days later. `test/mirror-sync.test.ts` asserts
 both paths build the same document from the same response.
+
+**Every write is three steps in this order: invalidate the mirror, write to OneNote,
+resync the mirror.** All five writing tools call `beginWrite` before they touch Graph.
+That ordering closes a window nothing else can. Between the PATCH succeeding and the
+resync completing, OneNote and the mirror disagree. If the process merely errors, the
+resync's `catch` marks the page stale. If the process **stops** — Cloud Run cutting the
+request at 300 seconds, or the instance being reclaimed after an idle period — nothing
+catches anything: the resync is sitting in the request gate's queue, the queue goes with
+the instance, and no `catch` runs because nothing threw. The mirror would keep serving
+superseded data as `present`, reporting `source: "mirror"` and a recent `mirroredAt`,
+until the next scheduled sync noticed the page's `lastModifiedDateTime` had moved.
+Invalidating first makes the whole window pessimistic: a death anywhere in it leaves a
+miss, and a miss goes to Graph.
+
+**There are two things to invalidate, and which ones a tool marks follows from what it can
+make wrong.** `beginWrite` takes a `pageId`, a `sectionId`, or both.
+
+| | page content (`markPageStale`) | section page listing (`holdSectionListing`) |
+|---|---|---|
+| `append_to_page`, `append_to_page_by_name` | yes | no |
+| `update_page_title` | yes | yes |
+| `create_page`, `create_page_by_name` | n/a — no page document to mark | yes |
+
+The page marker covers `get_page_content`. The listing hold covers `list_pages`,
+`list_pages_by_name`, `find_page_by_name` and `search_pages`, every one of which answers
+from stored page documents rather than from page *content*. A create has no page to mark
+and the listing is exactly what it makes wrong: without the hold, a create whose resync
+never ran leaves `list_pages` answering from the mirror with a section that does not
+contain the page just created, which reads to a model as "the page was not created". A
+rename holds the listing because the title is what every listing and by-name lookup
+matches on — this is the same failure `writePageFromRaw`'s title comparison exists to
+prevent, reached through a different door. An append holds nothing extra: it changes
+content, which the page marker covers, and `lastModifiedDateTime`, which only moves a page
+within an ordering. Keeping appends out of the hold is what keeps the common write from
+sending an unscoped `search_pages` to Graph at 61 requests.
+
+**The listing hold is a count, and it expires on age.** A count, `pendingWrites` on the
+section document, because two writes against one section can overlap and the first to
+finish must not clear the second's hold. `endWrite` lowers it from a `finally`, so a Graph
+write that failed releases too — the listing it was going to invalidate is still correct.
+It expires because a `finally` does not run when the process stops, and a hold nothing can
+lower would send every listing for that section to Graph forever. `LISTING_HOLD_EXPIRY_MS`
+is ten minutes, longer than Cloud Run's 300-second request ceiling, so it can never fire
+on a write still in progress. `listingIsHeld` reads a count with no timestamp as *expired*
+rather than as held, for the reason `leaseIsHeld` reads an unparseable `runningSince` that
+way: the alternative is a state nothing can ever clear.
+
+**`markPageStale` and both listing-hold writes use `update`, not a merging `set`.** A
+merging set creates the document when it is absent, and the write tools reach the whole
+account while only the selection is mirrored — so every write to an unmirrored page would
+leave a stub in the queried collection carrying nothing but `contentState: 'stale'`. On
+the section it is worse: a stub section document carrying nothing but a counter is what
+`listAllSections` then feeds to `expandedTree` as a section with no name. `NOT_FOUND` is
+swallowed in both, because "there was no copy to invalidate" is the ordinary answer for a
+page or section outside the selection.
+
+**A failed invalidation never fails the write.** `beginWrite` and `endWrite` log
+`mirror-invalidate-failed`, `mirror-listing-hold-failed` or `mirror-listing-release-failed`
+and carry on. Both narrow an existing window; neither is a precondition for writing, and a
+tool that refused to write because Firestore was down would be strictly worse than the
+behaviour before the mirror existed.
 
 **Two failure levels below a write, and neither fails the write.** A resync that throws
 falls back to `markPageStale`, which makes the next read a miss — correct, just slower. If
