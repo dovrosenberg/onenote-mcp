@@ -75,6 +75,23 @@ export const MIN_INTERVAL_MS = 500;
 export const MAX_RETRIES = 3;
 export const BASE_BACKOFF_MS = 2_000;
 
+/**
+ * The longest a single retry will wait before giving up instead.
+ *
+ * Graph decides how long a 429 lasts and says so in `Retry-After`, and OneNote's answer
+ * can be minutes — CLAUDE.md records five retries spanning three minutes all refused
+ * after one burst. Honouring that verbatim is correct for the account and wrong for the
+ * process: Cloud Run cuts a request at 300 seconds, and the mirror sync budgets 240, both
+ * checked *before* an operation starts. One request that sleeps for three minutes inside
+ * the gate blows through both and the run is killed mid-flight.
+ *
+ * So a wait longer than this is not shortened — that would hammer a service which has
+ * just asked for room — it is declined. The caller sees the 429, the sync leaves that
+ * section's watermark where it is, and the next scheduled run picks it up. Waiting is the
+ * thing being given up on, not the work.
+ */
+export const MAX_RETRY_WAIT_MS = 30_000;
+
 /** Runs everything immediately. The default for a directly constructed client. */
 export const UNGATED: RequestGate = { run: (operation) => operation() };
 
@@ -154,15 +171,20 @@ export function retryWait(
   if (status === 500) {
     // No Retry-After branch: the service sends none on this, and the doubling backoff is
     // what carried a request through the seven-minute window that motivated the rule.
-    return isTransientServerError(failure) ? baseBackoffMs * 2 ** attempt : null;
+    return isTransientServerError(failure) ? capped(baseBackoffMs * 2 ** attempt) : null;
   }
 
   if (status !== 429 && status !== 503) return null;
 
   const retryAfterMs = failure.retryAfterMs;
-  if (typeof retryAfterMs === 'number' && retryAfterMs > 0) return retryAfterMs;
+  if (typeof retryAfterMs === 'number' && retryAfterMs > 0) return capped(retryAfterMs);
 
-  return baseBackoffMs * 2 ** attempt;
+  return capped(baseBackoffMs * 2 ** attempt);
+}
+
+/** A wait this long is declined rather than shortened. See MAX_RETRY_WAIT_MS. */
+function capped(waitMs: number): number | null {
+  return waitMs > MAX_RETRY_WAIT_MS ? null : waitMs;
 }
 
 /**

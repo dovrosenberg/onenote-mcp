@@ -102,7 +102,7 @@ export interface SyncStore {
   getSyncState(): Promise<MirrorSyncState>;
   patchSyncState(patch: Partial<MirrorSyncState>): Promise<void>;
   acquireLease(mode: SyncMode, nowIso: string): Promise<void>;
-  releaseLease(): Promise<void>;
+  releaseLease(heldSince: string): Promise<void>;
   putStructure(structure: {
     notebooks: readonly MirrorNotebook[];
     sectionGroups: readonly MirrorSectionGroup[];
@@ -410,10 +410,10 @@ async function runMode(
     outcome = 'failed';
     tally.done = false;
     logEvent('sync-failed', { mode, reason: reasonOf(err) });
-    await deps.store.releaseLease();
+    await deps.store.releaseLease(startedAtIso);
     throw err;
   } finally {
-    if (outcome !== 'failed') await deps.store.releaseLease();
+    if (outcome !== 'failed') await deps.store.releaseLease(startedAtIso);
   }
 
   const report: SyncReport = {

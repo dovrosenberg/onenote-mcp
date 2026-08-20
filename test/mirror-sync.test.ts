@@ -165,7 +165,7 @@ interface StoreCalls {
   deletes: MirrorTombstone[];
   structures: number;
   leases: SyncMode[];
-  releases: number;
+  releases: string[];
   childGroupsKnown: string[];
   sweepResults: string[];
 }
@@ -192,7 +192,7 @@ function fakeStore(initial: Partial<StoreState> = {}): {
     deletes: [],
     structures: 0,
     leases: [],
-    releases: 0,
+    releases: [],
     childGroupsKnown: [],
     sweepResults: [],
   };
@@ -209,8 +209,8 @@ function fakeStore(initial: Partial<StoreState> = {}): {
       calls.leases.push(mode);
       return Promise.resolve();
     },
-    releaseLease: () => {
-      calls.releases += 1;
+    releaseLease: (heldSince) => {
+      calls.releases.push(heldSince);
       return Promise.resolve();
     },
     putStructure: () => {
@@ -716,7 +716,10 @@ test('the lease is taken before any work and released after', async () => {
   await runIncremental(h.deps, BUDGET);
 
   assert.deepEqual(h.storeCalls.leases, ['incremental']);
-  assert.equal(h.storeCalls.releases, 1);
+  // Released with the timestamp it took the lease with, so a run that has been superseded
+  // -- frozen past Cloud Run's 300s cut, resumed after the lease expired on age -- cannot
+  // clear whichever run holds it now.
+  assert.deepEqual(h.storeCalls.releases, [NOW_ISO]);
 });
 
 // ---------------------------------------------------------------------------

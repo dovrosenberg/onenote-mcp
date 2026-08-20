@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 
 import {
   MAX_CONCURRENT,
+  MAX_RETRY_WAIT_MS,
   MIN_INTERVAL_MS,
   UNGATED,
   createGate,
@@ -264,6 +265,35 @@ test('retryWait covers what the gate decides', () => {
   assert.equal(retryWait({ status: 500, method: 'GET' }, 0, 3, 1_000), null);
   // Retry-After has no meaning on a 500 here; the doubling backoff is what applies.
   assert.equal(retryWait({ ...transient, retryAfterMs: 250 }, 0, 3, 1_000), 1_000);
+});
+
+test('a retry longer than the ceiling is declined, not shortened', async () => {
+  // Graph decides how long a 429 lasts and OneNote's answer can be minutes. Shortening
+  // it would hammer a service that has just asked for room; honouring it verbatim blows
+  // through Cloud Run's 300s request timeout and the sync's 240s budget, both of which
+  // are checked before an operation starts rather than during. So the wait is declined
+  // and the work is retried by whatever scheduled it.
+  assert.equal(retryWait({ status: 429, retryAfterMs: MAX_RETRY_WAIT_MS }, 0, 3, 1_000), MAX_RETRY_WAIT_MS);
+  assert.equal(retryWait({ status: 429, retryAfterMs: MAX_RETRY_WAIT_MS + 1 }, 0, 3, 1_000), null);
+  assert.equal(retryWait({ status: 429, retryAfterMs: 180_000 }, 0, 3, 1_000), null);
+
+  // The doubling backoff is capped by the same ceiling, so a large baseBackoffMs cannot
+  // walk past it either.
+  assert.equal(retryWait({ status: 503 }, 5, 99, 20_000), null);
+
+  const clock = fakeClock();
+  const gate = createGate({ maxConcurrent: 2, minIntervalMs: 0, ...clock });
+  let attempts = 0;
+  await assert.rejects(() =>
+    gate.run(() => {
+      attempts += 1;
+      return Promise.reject(
+        Object.assign(new Error('too many requests'), { status: 429, retryAfterMs: 180_000 }),
+      );
+    }),
+  );
+  assert.equal(attempts, 1, 'the request is not repeated');
+  assert.deepEqual(clock.slept, [], 'and nothing sleeps for three minutes');
 });
 
 test('Retry-After is read as seconds or as an HTTP date', () => {

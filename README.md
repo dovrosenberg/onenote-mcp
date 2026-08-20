@@ -747,6 +747,7 @@ shared request gate, which is the failure that gets the whole account throttled.
 | 401 | The secret is absent or wrong | Fix the job; the route did no work |
 | 404 | `MIRROR_SYNC_SECRET` is not set on the service | Set it and redeploy |
 | 409 | Another run holds the lease | Nothing; it expires after 15 minutes |
+| 504 | The run passed Cloud Run's 300s request timeout | Nothing; see below |
 | 503, `reason: silent-failed` | The Microsoft refresh token is gone | Re-run `npm run bootstrap` |
 | 503, `reason: cache-unavailable` | Firestore did not answer | Retry; the credential is fine |
 
@@ -787,6 +788,24 @@ walks sections and stops at 60 of them or 25 seconds, so it reports `sectionsSea
 bound — but page content is held only for the notebooks in your selection, so it reports
 `notebooksSearched` against `notebooksInAccount` instead, and says so in its note when
 they differ. A model reading "no matches" needs to know which of those it got.
+
+### When a run overruns
+
+`MIRROR_SYNC_REQUEST_BUDGET` and the 240-second wall-clock budget both stop a run well
+inside Cloud Run's 300-second request timeout, so the ordinary answer is a 200 with
+`"done": false`. A 504 means something took longer than expected — almost always a 429
+from OneNote with a long `Retry-After`.
+
+What happens then is worth knowing, because the service is deployed with CPU throttling:
+the request is cut and the container is **suspended**, not killed. It resumes when the
+next request arrives. So the run does not finish, its lease is not released, and every
+retry answers 409 until the lease expires 15 minutes later. The next scheduled run then
+proceeds normally, and nothing is lost — watermarks advance per section and only after
+that section's pages are stored, so a cut run keeps everything it committed.
+
+The one thing to check if you see repeated 504s is the request log for 429s. A sustained
+throttle is the only realistic way to reach the timeout, and the cure is a smaller
+`MIRROR_SYNC_REQUEST_BUDGET` or a longer interval, not a longer Cloud Run timeout.
 
 ### Recovering from a bad mirror
 

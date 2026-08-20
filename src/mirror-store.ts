@@ -169,16 +169,36 @@ export class MirrorStore {
   }
 
   /**
-   * Release the lease.
+   * Release the lease, but only if this run still holds it.
    *
-   * Never allowed to fail the run. The slice's work is already committed by the time
-   * this is called, and an exception here would turn a successful sync into a reported
-   * failure — and then the scheduler would retry it. A lease that fails to clear expires
-   * on age instead, which costs one skipped run at worst.
+   * The conditional part is not defensive. Cloud Run cuts a request at 300 seconds and
+   * throttles CPU outside a request, so an overrunning run is *frozen* rather than
+   * killed: it resumes whenever the next request arrives, possibly many minutes later.
+   * By then the lease has expired on age and another run has taken it. An unconditional
+   * clear would then release the live run's lease and let a third start alongside it,
+   * both spending the same hourly Graph budget — which is the exact failure the lease
+   * exists to prevent, reached by way of the lease itself.
+   *
+   * `runningSince` is the discriminator: it is the ISO timestamp this run wrote when it
+   * took the lease, so a run that no longer sees its own value knows it has been
+   * superseded and leaves the document alone.
+   *
+   * Never allowed to fail the run. The slice's work is already committed by the time this
+   * is called, and an exception here would turn a successful sync into a reported failure
+   * that the scheduler then retries. A lease that fails to clear expires on age instead,
+   * which costs one skipped run at worst.
    */
-  async releaseLease(): Promise<void> {
+  async releaseLease(heldSince: string): Promise<void> {
     try {
-      await this.#stateRef().set({ runningMode: null, runningSince: null }, { merge: true });
+      await this.#firestoreOf(this.#stateRef()).runTransaction(async (tx) => {
+        const state = readSyncState((await tx.get(this.#stateRef())).data());
+        if (state.runningSince !== heldSince) {
+          // Superseded. Someone else's lease; not ours to clear.
+          logEvent('mirror-lease-superseded');
+          return;
+        }
+        tx.set(this.#stateRef(), { runningMode: null, runningSince: null }, { merge: true });
+      });
     } catch (err) {
       logEvent('mirror-lease-release-failed', { reason: reasonOf(err) });
     }

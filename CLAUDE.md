@@ -961,6 +961,17 @@ client with the read tools, so a resync passes through the same process-wide req
 as everything else — a burst of writes cannot outrun the per-user rate limit through this
 path.
 
+**Cloud Run freezes an overrunning request rather than killing it, and the lease release
+is written for that.** The service runs with CPU throttling — the default, and unset in
+the deploy — so a request cut at the 300-second timeout does not finish: the process is
+suspended and resumes whenever the next request arrives, possibly many minutes later. By
+then the sync lease has expired on age and another run has taken it. An unconditional
+`releaseLease` would then clear the *live* run's lease and let a third start alongside it,
+both spending the same hourly Graph budget — the exact failure the lease exists to
+prevent, reached by way of the lease itself. `releaseLease(heldSince)` therefore runs in a
+transaction and clears nothing unless `runningSince` still matches the value this run
+wrote. A superseded run logs `mirror-lease-superseded` and leaves the document alone.
+
 **`POST /sync` is the page mirror's way in, on the same terms as `/keepalive` and for the
 same reason.** Its own secret rather than the keepalive one, because the two reach
 different things and a credential should reach one of them. Unmounted when
@@ -1173,6 +1184,17 @@ burns quota to fail again. 429 and 503 are worth retrying after a wait; 400 with
 `20266`, 400 with code `20112` "invalid entity id", and 404 are not. `retryWait` in
 `src/graph-throttle.ts` is the one place that decides, and every client runs through
 `PRODUCTION_GATE`, so nothing here retries on its own.
+
+**A retry longer than `MAX_RETRY_WAIT_MS` is declined, not shortened.** Graph decides how
+long a 429 lasts and OneNote's answer can be minutes — the `Graph request budget` section
+below records five retries spanning three minutes all refused after one burst. Shortening
+that would hammer a service which has just asked for room. Honouring it verbatim is worse
+in a different way: Cloud Run cuts a request at 300 seconds and the mirror sync budgets
+240, and **both are checked before an operation starts rather than during**, so one
+request sleeping for three minutes inside the gate blows through both and the run is
+killed mid-flight. So the wait is declined: the caller sees the 429, the sync leaves that
+section's watermark where it is, and the next scheduled run picks it up. Waiting is what
+is given up on, not the work.
 
 **One 500 is retried, and the rule is deliberately narrow.** Measured 2026-08-19 and
 recorded in `api-overview.md`: every `$expand` on `/me/onenote/notebooks` answered 500
