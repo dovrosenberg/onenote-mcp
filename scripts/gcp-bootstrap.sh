@@ -310,6 +310,17 @@ gcloud firestore indexes fields update html \
   --disable-indexes \
   --database='(default)' --project="$PROJECT" --async --quiet >/dev/null 2>&1 || true
 
+# Confirming the exemption applied is not obvious, so the recipe is here.
+# `indexes fields describe html --collection-group=pageContent` prints an
+# ANCESTOR_FIELD row whether or not the exemption took, so that row says
+# nothing. The discriminator is the INDEXES list: an un-exempted field carries
+# three entries (ASCENDING, DESCENDING, CONTAINS) and an exempted one carries
+# none. Verified 2026-08-19 against this project by describing pageContent.html
+# beside pageContent.bytes, tokencache.cache and pages.title -- the three
+# un-exempted fields all showed the three entries and html showed an absent
+# `indexes` key. Use --format=json; the table view renders an empty list as a
+# blank row, which reads like a rendering glitch.
+
 log "indexes submitted; they build in the background. Check with:"
 log "  gcloud firestore indexes composite list --database='(default)' --project=$PROJECT"
 log "Every one must read READY before MIRROR_READ_ENABLED is turned on -- a query"
