@@ -620,60 +620,124 @@ read tools can answer without spending OneNote's request budget. `POST /sync` is
 gets filled. Nothing about it is automatic: the route is not mounted without a secret, and
 the read tools do not consult the mirror without `MIRROR_READ_ENABLED`.
 
+### What keeps it current
+
+Three mechanisms. Only two are on a schedule, and one of those is temporary.
+
+| | What runs it | What it covers |
+|---|---|---|
+| Initial backfill | A `POST /sync` scheduler job, deleted when it finishes | Every mirrored notebook, active or not, filled once |
+| Ongoing catch-up | Every covered read, inline, before it answers | Pages created and edited in active notebooks |
+| Deletion sweep | One nightly scheduler job | Pages deleted out of active notebooks |
+
+**There is no scheduled incremental sync in steady state, because the reads do it.** Each
+covered read runs `runIncremental` itself before it answers, at 12 requests and 15 seconds
+at most and no more than once per 30 seconds — see **Reading from it** below. The mirror is
+therefore refreshed when someone is about to look at it and not otherwise. A scheduled
+incremental run beside that would spend the same 400 requests an hour refreshing data
+nobody asked for, and the next read would refresh again regardless.
+
+**A read cannot notice a deletion, which is the whole reason the nightly sweep exists.**
+The incremental pass keys on the parent section's `lastModifiedDateTime` — a create, an
+edit and a delete each move it — and then asks that section for its *changed* pages. A page
+that has been deleted appears in no listing, so nothing in that answer says it is gone.
+Finding out means enumerating the section's page ids and reconciling them against the
+mirror, because Graph has no `/delta` on any OneNote resource and no tombstone for a
+deleted page. That is a sweep, it is far too expensive to put in front of a read, and until
+one runs the mirror keeps serving a page that no longer exists. One night is the staleness
+this accepts.
+
+**The backfill is neither, so it gets a schedule of its own until it is done.** It is one
+listing per section from the epoch plus one content fetch per page — thousands of requests
+on this account — and the inline refresh's 12-request budget would take weeks to cover it.
+Delete the job once `sync/state.backfillComplete` is true, which is when every mirrored
+section has a non-null `pagesSyncedThrough`. Nothing else calls `POST /sync`.
+
+**An inactive notebook is backfilled once and then frozen.** `activeNotebookIds` in the
+selection document is what draws that line — see **Choosing what to mirror**. A selected
+notebook that is not active is filled by the backfill and served from the mirror for ever
+after; no inline refresh and no sweep visits it again. That is what makes a 55-notebook
+account affordable to mirror: an archive is listed and fetched once and never again.
+
+### The four routes
+
+```
+POST /sync             incremental, active notebooks only
+POST /sync/sweep       scoped sweep, active notebooks only
+POST /sync/sweep/full  every section of every active notebook
+POST /sync/sweep/all   every section of every mirrored notebook, active or not
+```
+
+Two of these are on a schedule: `/sync` while the backfill runs, and `/sync/sweep/full`
+nightly. `/sync/sweep` is the cheaper scoped variant, useful by hand. `/sync/sweep/all` is
+the only mode with no activity filter and the only way to notice a deletion inside an
+inactive notebook; it costs one request per mirrored section, so run it deliberately rather
+than on a timer.
+
 ### What it costs
 
-OneNote allows a delegated app 400 requests an hour. The sync is sized to stay well under
-that and to stop rather than overrun.
+OneNote allows a delegated app 400 requests an hour, and every interactive tool call comes
+out of the same 400. The account this runs against holds 55 notebooks and 568 sections; 4
+notebooks and 202 sections are mirrored, and 2 notebooks and 70 sections are active.
 
 | Run | Requests |
 |---|---|
-| Incremental, nothing changed | 1 — the expanded tree, and nothing else |
-| Incremental, a busy day (2 sections, 8 pages) | about 11 |
-| Incremental, degraded (tree read failed, or the section roll-up distrusted) | 1 + one per mirrored section + one per changed page |
-| Nightly sweep, scoped to sections whose timestamp moved | about 18 on 40 sections |
-| Weekly full sweep | about 53 on 40 sections |
-| First backfill | one per page, spread across runs |
+| Inline refresh, nothing changed | 1 — the expanded tree, and nothing else |
+| Inline refresh, a few edited pages | 3–12; 12 is a hard budget |
+| Nightly `/sync/sweep/full` over the active notebooks | ~70 here, plus one per changed page |
+| `/sync/sweep` over sections whose timestamp moved | one per section visited |
+| `/sync/sweep/all` over every mirrored notebook | ~202 here — half the hourly budget |
+| One backfill run | 49–120 measured; it stops on whichever budget binds first |
 
 `MIRROR_SYNC_REQUEST_BUDGET` (default 120) is a hard stop. A run that reaches it commits
 what it did, answers 200 with `"done": false`, and resumes on the next schedule. That is
 what makes the first backfill possible at all.
 
-**The schedule and the budget multiply, and the product has to stay under 400.** This is
-the one arithmetic mistake here that gets the account throttled, and a throttle outlasts a
-short backoff — see the `Graph request budget` section of `CLAUDE.md`. Every run during a
-backfill spends its whole budget, so:
+**Which of the two stops binds varies, so size the cadence against the request budget
+rather than against an observed average.** Measured across six runs on 2026-08-20: 49, 57,
+60, 63, 120 and 120 requests. The first four ended on the 240-second clock with budget to
+spare — a page costs a Graph fetch, a resvg ink render and two blob writes, and the renders
+are what fill the clock on a 1-CPU instance. The last two spent the full budget well inside
+the clock, on sections whose pages were cheaper to render.
 
-| Schedule | Budget | Requests/hour | |
-|---|---|---|---|
-| `*/15` | 120 | 480 | **over the limit** |
-| `*/20` | 120 | 360 | leaves 40/hour for tools |
-| `*/20` | 100 | 300 | leaves 100/hour for tools — use this while backfilling |
-| `*/15` | 120 | ~4–45 | fine *after* the backfill, when runs are near-empty |
+| Cadence | Requests/hour at budget 120 | |
+|---|---|---|
+| `*/20` | up to 360 | the fastest cadence that cannot exceed the limit |
+| `*/10` | up to 720 | over the limit whenever runs are request-bound |
+| `*/5` | up to 1440 | **over the limit** — what is running today, by explicit choice |
 
-Backfill on this account — 180 mirrored sections — is roughly one request per section plus
-one per page, so a notebook set holding a few thousand pages is ten hours or more of
-slices. Start on `*/20`, and move to `*/15` once `sync/state.backfillComplete` is true and
-runs are answering `outcome: complete` in a couple of requests.
+Past 400 an hour Graph answers 429 with OData code `10007`. A refused request does no work
+and still spends the attempt, the section's watermark does not advance, and the penalty
+outlasts a short backoff — five retries spanning three minutes were all refused after one
+burst, recorded in the `Graph request budget` section of `CLAUDE.md`. Exceeding the limit
+therefore does not finish the backfill sooner. Halving `MIRROR_SYNC_REQUEST_BUDGET` buys a
+halved interval at the same hourly spend, at the cost of one extra tree read per run.
 
-**With `MIRROR_READ_ENABLED=true` the read tools add a third term to that product.** Each
-one refreshes the mirror before it reads — see **Reading from it** below — at up to 12
-requests per refresh and no more than one refresh per 30 seconds, so a continuously busy
-conversation adds roughly 120 requests an hour on a quiet account and up to 144 while the
-mirror is behind. Leave headroom for it: during a backfill that means `*/20` with a budget
-of 100, not `*/15` with 120.
+Backfill size on this account is roughly one request per section plus one per page. 202
+sections at about 24 pages each — estimated from the first four sections whose listing
+completed, not measured — is roughly 4,800 pages and 5,000 requests, so the floor is around
+12.5 hours of slices whatever the cadence.
+
+**With `MIRROR_READ_ENABLED=false` there is no ongoing catch-up at all.** That is the
+deployed setting today, so the backfill job and the nightly sweep are the only things
+touching the mirror. Turning reads on is what makes the read-driven design above real, and
+it adds up to 12 requests per refresh at no more than one per 30 seconds — roughly 120
+requests an hour from a continuously busy conversation, and up to 144 while the mirror is
+behind. That term fits under 400 beside the nightly sweep once the backfill job is gone.
 
 ### Setting it up
 
 ```bash
-# 1. The secret. Never printed; both commands below read it from disk.
+# 1. The secret. Never printed; the commands below read it from disk.
 umask 077
 openssl rand -hex 32 > sync.secret
 
 gh secret set MIRROR_SYNC_SECRET < sync.secret
 gh workflow run deploy.yml --ref main
 
-# 2. The jobs. --attempt-deadline sits just above Cloud Run's 300s request timeout, so
-#    the platform's cut is the one that happens and the scheduler records it.
+# 2. The backfill job. Temporary — delete it when sync/state.backfillComplete is true.
+#    --attempt-deadline sits just above Cloud Run's 300s request timeout, so the
+#    platform's cut is the one that happens and the scheduler records it.
 gcloud scheduler jobs create http onenote-mcp-sync \
   --project="$GCP_PROJECT" --location="$GCP_REGION" \
   --schedule="*/20 * * * *" --time-zone=UTC \
@@ -681,27 +745,32 @@ gcloud scheduler jobs create http onenote-mcp-sync \
   --headers="X-Sync-Secret=$(cat sync.secret)" \
   --attempt-deadline=330s --max-retry-attempts=2
 
-gcloud scheduler jobs create http onenote-mcp-sync-sweep \
-  --project="$GCP_PROJECT" --location="$GCP_REGION" \
-  --schedule="25 8 * * *" --time-zone=UTC \
-  --uri="$MCP_PUBLIC_URL/sync/sweep" --http-method=POST \
-  --headers="X-Sync-Secret=$(cat sync.secret)" \
-  --attempt-deadline=330s --max-retry-attempts=1
-
+# 3. The nightly deletion sweep. This one is permanent: it is the only thing that
+#    notices a page deleted out of an active notebook.
 gcloud scheduler jobs create http onenote-mcp-sync-sweep-full \
   --project="$GCP_PROJECT" --location="$GCP_REGION" \
-  --schedule="40 9 * * 0" --time-zone=UTC \
+  --schedule="0 0 * * *" --time-zone=America/New_York \
   --uri="$MCP_PUBLIC_URL/sync/sweep/full" --http-method=POST \
   --headers="X-Sync-Secret=$(cat sync.secret)" \
   --attempt-deadline=330s --max-retry-attempts=1
 
 rm sync.secret
+
+# 4. When the backfill finishes.
+gcloud scheduler jobs delete onenote-mcp-sync \
+  --project="$GCP_PROJECT" --location="$GCP_REGION"
 ```
 
-Retries are safe on all three: every mode is idempotent, and a retry after a
-budget-exhausted run is actively useful during the backfill. `25 8` and `40 9` rather than
-the hour mark keep the sweeps out of an incremental run's minute — and the run lease makes
-an overlap a 409 rather than a double spend of the Graph budget.
+The backfill job on the deployed account is at `*/5` rather than the `*/20` above, which
+puts it over the hourly limit deliberately — see **What it costs** for what that trades.
+
+Retries are safe on both: every mode is idempotent, and a retry after a budget-exhausted
+run is actively useful during the backfill. While both jobs exist, the run lease makes an
+overlap a 409 rather than a double spend of the Graph budget.
+
+`/sync/sweep/all` gets no job. Run it by hand after editing `activeNotebookIds`, or when a
+notebook has been reorganised outside this server and the mirror needs reconciling against
+what OneNote actually holds.
 
 ### Choosing what to mirror
 
@@ -711,6 +780,7 @@ The selection is one hand-edited Firestore document, `MIRROR_ROOT_DOC`, default
 | Field | Type | Meaning |
 |---|---|---|
 | `notebookIds` | array of string | Notebook ids whose **pages** are mirrored |
+| `activeNotebookIds` | array of string, optional | Which of those are still being edited. Absent or `null` means all of them. |
 | `note` | string | Free text for you. Never read. |
 
 Get the ids from `list_notebooks`. Structure — every notebook and section name in the
@@ -718,13 +788,28 @@ account — is mirrored regardless, because the tree read returns it all for the
 request and a partial structure would make `list_notebooks` and an unscoped `search_pages`
 answer confidently and partially. Only page *content* follows the selection.
 
-An id matching no notebook is reported as `unknownNotebookIds` in every run report. Check
-it after editing: the ids are opaque strings and a typo is otherwise a notebook that
-silently never syncs.
+`activeNotebookIds` narrows the ongoing work and nothing else. An inactive notebook's
+pages, content and ink are stored exactly as an active one's are, writes through this
+server still reach it and still update the mirror, and a read still answers from it. What
+changes is that no incremental pass and no sweep re-checks it once its backfill is done, so
+an edit made in the OneNote client to an inactive notebook does not reach the mirror until
+the notebook is made active again or `/sync/sweep/all` is run by hand.
+
+Moving a notebook back into `activeNotebookIds` is safe: the next run notices the active set
+changed, clears `sectionsScannedThrough`, and re-lists every active section against its own
+per-section watermark. Only pages that genuinely changed are fetched.
+
+An id in `notebookIds` matching no notebook is reported as `unknownNotebookIds` in every run
+report. An id in `activeNotebookIds` naming no *mirrored* notebook — a typo, or a real
+notebook never added to `notebookIds` — is reported as `unknownActiveNotebookIds` and logged
+as `mirror-selection-unknown-active`. Check both after editing: the ids are opaque strings,
+and a typo is otherwise a notebook that silently never syncs.
 
 ### Proving it works
 
 ```bash
+# While the backfill job exists. Once it is deleted, the sweep job is the one to force,
+# and a covered read is what exercises the incremental path.
 gcloud scheduler jobs run onenote-mcp-sync --project="$GCP_PROJECT" --location="$GCP_REGION"
 
 # The report the run returned, in the service log.
@@ -733,19 +818,24 @@ gcloud logging read \
   --project="$GCP_PROJECT" --limit=3 --freshness=30m --format='value(jsonPayload)'
 ```
 
-A 200 is not proof on its own. The two things that are:
+A 200 is not proof on its own. The three things that are:
 
 - **`sections/{id}.pagesSyncedThrough` moved** in Firestore. A run that answered 200 and
   advanced no watermark did nothing.
 - **The bucket holds an object per inked page**, and its byte count matches the page
   document's `ink.bytes`.
+- **`sectionsSkippedInactive` is the number you expect.** A count covering every mirrored
+  section means the active set is empty or mistyped; `unknownActiveNotebookIds` in the same
+  report says which.
 
 Watch the backfill by re-running the job and reading `done` in successive reports: `false`
 with a rising `pagesUpdated`, then `true`. `sync/state.backfillComplete` says the same
-thing.
+thing, and it is the signal to delete the `onenote-mcp-sync` job.
 
-Watch for a 429 in the request log during a run. One means something is bypassing the
-shared request gate, which is the failure that gets the whole account throttled.
+Watch for a 429 in the request log during a run. While the backfill job runs above 400
+requests an hour, a 429 is the expected consequence of that choice and the cure is a longer
+cadence. At any other time it means something is bypassing the shared request gate, which
+is the failure that gets the whole account throttled.
 
 | Status | Meaning | What to do |
 |---|---|---|
@@ -767,8 +857,9 @@ tools go through the local copy: `list_notebooks`, `list_sections`, `list_pages`
 
 **Each of those reads is three steps, in this order.**
 
-1. **Refresh.** The tool runs an incremental sync itself — the same `runIncremental` the
-   scheduled `POST /sync` runs, with smaller budgets: 12 OneNote requests and 15 seconds.
+1. **Refresh.** The tool runs an incremental sync itself — the same `runIncremental` that
+   `POST /sync` runs, with smaller budgets: 12 OneNote requests and 15 seconds. Once the
+   backfill job is deleted this is the only thing that runs an incremental pass at all.
 2. **Read the local copy.** A hit costs no OneNote request. A miss falls through to
    Microsoft Graph, exactly as before.
 3. **Report the source.** `source` is `onenote` when the answer equals what OneNote holds,
@@ -810,8 +901,8 @@ and the mirror keeps filling in the background.
 OneNote after a successful write and store it, so a `get_page_content` straight after an
 `append_to_page` answers from the local copy with the text that was just added. That
 costs one extra OneNote request per write. If the resync fails the page is marked stale
-instead, which sends the next read to OneNote — slower, but never wrong — and the next
-scheduled sync repairs it either way. A failed resync never fails the write.
+instead, which sends the next read to OneNote — slower, but never wrong — and the refresh
+in front of a later read repairs it either way. A failed resync never fails the write.
 
 Two things to check before turning it on:
 
@@ -842,7 +933,8 @@ minimum instance count, so a cut request meets one of two fates and Cloud Run pr
 neither: if the instance is still warm the process is **suspended** and resumes when the
 next request arrives, and if it has scaled to zero the work is simply gone. Either way the
 run does not finish, its lease is not released, and retries answer 409 until the lease
-expires 15 minutes later. The next scheduled run then proceeds normally.
+expires 15 minutes later. The next run — the backfill job, the nightly sweep, or the
+refresh in front of the next covered read — then proceeds normally.
 
 Nothing is lost in either case. Watermarks advance per section and only after that
 section's pages are stored, so a cut run keeps everything it committed and the next run
@@ -859,10 +951,11 @@ throttle is the only realistic way to reach the timeout, and the cure is a small
 
 Delete the `notebooks`, `sectionGroups`, `sections`, `pages`, `pageContent` and
 `tombstones` subcollections of `MIRROR_ROOT_DOC`, and clear `structureHash` and
-`sectionsScannedThrough` in `sync/state`. The next run backfills from nothing. The
+`sectionsScannedThrough` in `sync/state`. Then re-create the `onenote-mcp-sync` job from
+**Setting it up** and leave it until `backfillComplete` is true again: the inline refresh
+in front of a read has a 12-request budget and will not rebuild a mirror from nothing. The
 selection document and the token cache are untouched by this, and no Graph write is
 involved — the mirror is a copy, and Microsoft Graph stays the source of truth.
-
 
 ## Alerting
 
@@ -1076,7 +1169,7 @@ and the process exits 1 without a stack trace.
 | `GOOGLE_CLOUD_PROJECT` | server: no · bootstrap: **yes** | — | GCP project; inferred automatically on Cloud Run |
 | `PORT` | no | `8080` | Bind port. Cloud Run sets this; the server never hardcodes one. |
 | `MCP_KEEPALIVE_SECRET` | no | — | At least 32 characters. Set it and `POST /keepalive` is mounted; leave it unset and the path 404s. See **Keepalive**. |
-| `MIRROR_ROOT_DOC` | no | `onenoteMirror/default` | Firestore document holding the hand-edited list of notebook ids to mirror. Its subcollections are the mirror. Document path, even segment count, same rule as `FIRESTORE_CACHE_DOC`. |
+| `MIRROR_ROOT_DOC` | no | `onenoteMirror/default` | Firestore document holding the hand-edited `notebookIds` and `activeNotebookIds` lists. Its subcollections are the mirror. Document path, even segment count, same rule as `FIRESTORE_CACHE_DOC`. |
 | `MIRROR_SYNC_SECRET` | no | — | At least 32 characters. Set it and `POST /sync` is mounted; leave it unset and the path 404s. |
 | `MIRROR_BUCKET` | conditionally | — | Cloud Storage bucket for rendered ink and oversized page HTML. Required once `MIRROR_SYNC_SECRET` or `MIRROR_READ_ENABLED` is set; see below. |
 | `MIRROR_READ_ENABLED` | no | `false` | `true` or `false`, nothing else. When true the read tools refresh the mirror, answer from it, and fall back to Graph on a miss. |
