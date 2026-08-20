@@ -612,6 +612,137 @@ below. That refresh token lives in Claude's connector store, and only Claude can
 it or receive its replacement, so nothing running here can keep it alive. Losing it costs
 one click on the Approve button; losing the Microsoft one costs a device-code sign-in.
 
+
+## Page mirror sync
+
+The mirror keeps Firestore copies of the pages in a hand-picked set of notebooks, so the
+read tools can answer without spending OneNote's request budget. `POST /sync` is how it
+gets filled. Nothing about it is automatic: the route is not mounted without a secret, and
+the read tools do not consult the mirror without `MIRROR_READ_ENABLED`.
+
+### What it costs
+
+OneNote allows a delegated app 400 requests an hour. The sync is sized to stay well under
+that and to stop rather than overrun.
+
+| Run | Requests |
+|---|---|
+| Incremental, nothing changed | 1 — the expanded tree, and nothing else |
+| Incremental, a busy day (2 sections, 8 pages) | about 11 |
+| Incremental, degraded (tree read failed, or the section roll-up distrusted) | 1 + one per mirrored section + one per changed page |
+| Nightly sweep, scoped to sections whose timestamp moved | about 18 on 40 sections |
+| Weekly full sweep | about 53 on 40 sections |
+| First backfill | one per page, spread across runs |
+
+`MIRROR_SYNC_REQUEST_BUDGET` (default 120) is a hard stop. A run that reaches it commits
+what it did, answers 200 with `"done": false`, and resumes on the next schedule. That is
+what makes the first backfill possible: 2000 pages at four runs an hour drains in about
+five hours without ever spending more than half the hourly limit.
+
+### Setting it up
+
+```bash
+# 1. The secret. Never printed; both commands below read it from disk.
+umask 077
+openssl rand -hex 32 > sync.secret
+
+gh secret set MIRROR_SYNC_SECRET < sync.secret
+gh workflow run deploy.yml --ref main
+
+# 2. The jobs. --attempt-deadline sits just above Cloud Run's 300s request timeout, so
+#    the platform's cut is the one that happens and the scheduler records it.
+gcloud scheduler jobs create http onenote-mcp-sync \
+  --project="$GCP_PROJECT" --location="$GCP_REGION" \
+  --schedule="*/15 * * * *" --time-zone=UTC \
+  --uri="$MCP_PUBLIC_URL/sync" --http-method=POST \
+  --headers="X-Sync-Secret=$(cat sync.secret)" \
+  --attempt-deadline=330s --max-retry-attempts=2
+
+gcloud scheduler jobs create http onenote-mcp-sync-sweep \
+  --project="$GCP_PROJECT" --location="$GCP_REGION" \
+  --schedule="25 8 * * *" --time-zone=UTC \
+  --uri="$MCP_PUBLIC_URL/sync/sweep" --http-method=POST \
+  --headers="X-Sync-Secret=$(cat sync.secret)" \
+  --attempt-deadline=330s --max-retry-attempts=1
+
+gcloud scheduler jobs create http onenote-mcp-sync-sweep-full \
+  --project="$GCP_PROJECT" --location="$GCP_REGION" \
+  --schedule="40 9 * * 0" --time-zone=UTC \
+  --uri="$MCP_PUBLIC_URL/sync/sweep/full" --http-method=POST \
+  --headers="X-Sync-Secret=$(cat sync.secret)" \
+  --attempt-deadline=330s --max-retry-attempts=1
+
+rm sync.secret
+```
+
+Retries are safe on all three: every mode is idempotent, and a retry after a
+budget-exhausted run is actively useful during the backfill. `25 8` and `40 9` rather than
+the hour mark keep the sweeps out of an incremental run's minute — and the run lease makes
+an overlap a 409 rather than a double spend of the Graph budget.
+
+### Choosing what to mirror
+
+The selection is one hand-edited Firestore document, `MIRROR_ROOT_DOC`, default
+`onenoteMirror/default`. It is the only document the service never writes.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `notebookIds` | array of string | Notebook ids whose **pages** are mirrored |
+| `note` | string | Free text for you. Never read. |
+
+Get the ids from `list_notebooks`. Structure — every notebook and section name in the
+account — is mirrored regardless, because the tree read returns it all for the same one
+request and a partial structure would make `list_notebooks` and an unscoped `search_pages`
+answer confidently and partially. Only page *content* follows the selection.
+
+An id matching no notebook is reported as `unknownNotebookIds` in every run report. Check
+it after editing: the ids are opaque strings and a typo is otherwise a notebook that
+silently never syncs.
+
+### Proving it works
+
+```bash
+gcloud scheduler jobs run onenote-mcp-sync --project="$GCP_PROJECT" --location="$GCP_REGION"
+
+# The report the run returned, in the service log.
+gcloud logging read \
+  'resource.type="cloud_run_revision" AND jsonPayload.event="sync-completed"' \
+  --project="$GCP_PROJECT" --limit=3 --freshness=30m --format='value(jsonPayload)'
+```
+
+A 200 is not proof on its own. The two things that are:
+
+- **`sections/{id}.pagesSyncedThrough` moved** in Firestore. A run that answered 200 and
+  advanced no watermark did nothing.
+- **The bucket holds an object per inked page**, and its byte count matches the page
+  document's `ink.bytes`.
+
+Watch the backfill by re-running the job and reading `done` in successive reports: `false`
+with a rising `pagesUpdated`, then `true`. `sync/state.backfillComplete` says the same
+thing.
+
+Watch for a 429 in the request log during a run. One means something is bypassing the
+shared request gate, which is the failure that gets the whole account throttled.
+
+| Status | Meaning | What to do |
+|---|---|---|
+| 200, `outcome: complete` | The run finished its work | Nothing |
+| 200, `outcome: budget-exhausted` | It stopped on the request or time budget | Nothing; the next run resumes |
+| 401 | The secret is absent or wrong | Fix the job; the route did no work |
+| 404 | `MIRROR_SYNC_SECRET` is not set on the service | Set it and redeploy |
+| 409 | Another run holds the lease | Nothing; it expires after 15 minutes |
+| 503, `reason: silent-failed` | The Microsoft refresh token is gone | Re-run `npm run bootstrap` |
+| 503, `reason: cache-unavailable` | Firestore did not answer | Retry; the credential is fine |
+
+### Recovering from a bad mirror
+
+Delete the `notebooks`, `sectionGroups`, `sections`, `pages`, `pageContent` and
+`tombstones` subcollections of `MIRROR_ROOT_DOC`, and clear `structureHash` and
+`sectionsScannedThrough` in `sync/state`. The next run backfills from nothing. The
+selection document and the token cache are untouched by this, and no Graph write is
+involved — the mirror is a copy, and Microsoft Graph stays the source of truth.
+
+
 ## Alerting
 
 Two failures are invisible without a log-based metric, because both show up only as a

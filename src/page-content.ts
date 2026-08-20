@@ -185,6 +185,26 @@ export function renderPageInk(
   return null;
 }
 
+/**
+ * The rendered ink *and* the InkML it came from.
+ *
+ * `renderPageInk` answers the question the read path asks — "what does this look like" —
+ * and throws the source away. The mirror needs the source too: it stores the InkML
+ * beside the PNG so a change to MAX_INK_PNG_BYTES can be applied by re-rendering
+ * locally instead of re-fetching every inked page from Graph. See the note in
+ * ./mirror-blobs.ts.
+ */
+export function renderPageInkWithSource(
+  content: RawPageContent,
+  width: number = DEFAULT_RENDER_WIDTH,
+): { image: InkImage; inkml: string } | null {
+  for (const candidate of inkCandidates(content)) {
+    const image = renderInk(candidate.text, width);
+    if (image !== null) return { image, inkml: candidate.text };
+  }
+  return null;
+}
+
 /** The HTML part of a content response, or null if the response carries none. */
 export function htmlPart(content: RawPageContent): MultipartPart | null {
   return findPart(content.parts, /html/i);

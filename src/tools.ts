@@ -10,13 +10,18 @@
 // every time — see the note on `createGraphAuth` in ./graph-auth.ts.
 
 import type { Config } from './config.ts';
+import { firestoreFor } from './firestore.ts';
 import { createGraphAuth, type GraphAuth } from './graph-auth.ts';
 import { createGraphStructure } from './graph-structure.ts';
 import type { ToolDefinition } from './mcp-tools.ts';
+import { createMirrorBlobStore } from './mirror-blobs.ts';
+import { createMirrorStore } from './mirror-store.ts';
+import { runFullSweep, runIncremental, runSweep, type SyncDeps } from './mirror-sync.ts';
 import { createGraphPageContent } from './page-content.ts';
 import { createPageTools } from './page-tools.ts';
 import { createGraphPageWrite } from './page-write.ts';
 import { createStructureTools } from './structure-tools.ts';
+import type { SyncTarget } from './sync-route.ts';
 import { createWriteTools } from './write-tools.ts';
 
 /**
@@ -66,4 +71,40 @@ export function createTools(auth: GraphAuth): ToolDefinition[] {
     ...createPageTools(content),
     ...createWriteTools(createGraphPageWrite(auth), content, structure),
   ];
+}
+
+/**
+ * Bind the page mirror's sync to the route, or answer undefined.
+ *
+ * Undefined whenever the mirror is not configured to sync, which is what keeps
+ * `POST /sync` unmounted and the path a 404. A 404 tells an operator the service is
+ * unconfigured; a 401 would read as a mistyped secret.
+ *
+ * The bucket is required by `loadConfig`'s cross-field rule whenever the sync secret is
+ * set, so the check here cannot fail in practice — it is a type narrowing, and a throw
+ * rather than a silent skip because a sync with nowhere to put a rendered PNG should not
+ * start.
+ */
+export function createSyncTargetFor(config: Config, auth: GraphAuth): SyncTarget | undefined {
+  const mirror = config.mirror;
+  const firestore = config.firestore;
+  if (mirror?.syncSecret === undefined || firestore === undefined) return undefined;
+
+  if (mirror.bucket === undefined) {
+    throw new Error("internal: MIRROR_SYNC_SECRET is set without MIRROR_BUCKET");
+  }
+
+  const deps: SyncDeps = {
+    graph: createGraphStructure(auth),
+    content: createGraphPageContent(auth),
+    store: createMirrorStore(firestoreFor(firestore), mirror.rootDocumentPath),
+    blobs: createMirrorBlobStore(mirror.bucket, firestore.projectId),
+  };
+  const options = { requestBudget: mirror.syncRequestBudget };
+
+  return {
+    runIncremental: () => runIncremental(deps, options),
+    runSweep: () => runSweep(deps, options),
+    runFullSweep: () => runFullSweep(deps, options),
+  };
 }

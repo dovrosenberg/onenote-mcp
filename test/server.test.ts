@@ -9,7 +9,9 @@ import type { Config } from '../src/config.ts';
 import { MCP_PATH } from '../src/mcp-server.ts';
 import { CONSENT_PATH } from '../src/oauth-provider.ts';
 import { AUTHORIZATION_SERVER_METADATA_PATH } from '../src/oauth-router.ts';
+import { KEEPALIVE_PATH } from '../src/keepalive.ts';
 import { createApp, HEALTH_PATHS } from '../src/server.ts';
+import { SYNC_PATH } from '../src/sync-route.ts';
 
 const STUB_CONFIG: Config = {
   graph: { clientId: 'client-id', authority: 'https://login.microsoftonline.com/common' },
@@ -20,7 +22,17 @@ const STUB_CONFIG: Config = {
     tokenSigningKey: 'x'.repeat(32),
     publicUrl: 'https://onenote-mcp.example.run.app',
   },
-  server: { port: 0 },
+  server: { port: 0, keepaliveSecret: 'k'.repeat(32) },
+  // Configured so the route-enumeration test below actually sees POST /sync. Both
+  // secret-authenticated routes were invisible to it until this landed, because an
+  // unconfigured secret means the route is never mounted — see SECRET_AUTH_PATHS.
+  mirror: {
+    rootDocumentPath: 'onenoteMirror/default',
+    syncSecret: 'y'.repeat(32),
+    bucket: 'a-bucket',
+    readEnabled: false,
+    syncRequestBudget: 120,
+  },
 };
 
 // Port 0 asks the OS for an ephemeral port, so the test cannot collide with a dev
@@ -322,6 +334,46 @@ function joinPath(prefix: string, path: string): string {
   return joined === '' ? '/' : joined;
 }
 
+/**
+ * The routes closed by a shared secret rather than by a bearer token.
+ *
+ * Both are called by Cloud Scheduler, which has no browser and nowhere to keep a refresh
+ * token, so neither can ever satisfy the bearer gate. They are not "open": each compares
+ * its own secret in constant time before doing any work, and the assertions below check
+ * that — a 401 with **no** `WWW-Authenticate` header, which is what distinguishes "this
+ * route refused you" from "the bearer gate refused you".
+ *
+ * They were invisible to the fail-closed test until STUB_CONFIG configured them, because
+ * an unconfigured secret means the route is never mounted.
+ */
+const SECRET_AUTH_PATHS = [KEEPALIVE_PATH, SYNC_PATH, `${SYNC_PATH}/sweep`, `${SYNC_PATH}/sweep/full`];
+
+/**
+ * A prefix rule rather than a list, because the sync router owns three paths and may
+ * grow a fourth. Everything mounted under SYNC_PATH is secret-authenticated by
+ * construction — the check runs in the router before any handler.
+ */
+function isSecretAuthenticated(path: string): boolean {
+  return path === KEEPALIVE_PATH || path === SYNC_PATH || path.startsWith(`${SYNC_PATH}/`);
+}
+
+test('a secret-authenticated route refuses on its own terms, not the bearer gate\'s', async () => {
+  await ready;
+  const { port } = server.address() as AddressInfo;
+
+  for (const path of SECRET_AUTH_PATHS) {
+    const res = await fetch(`http://127.0.0.1:${port}${path}`, { method: 'POST' });
+    const body = (await res.json()) as Record<string, unknown>;
+
+    assert.equal(res.status, 401, path);
+    assert.equal(body['status'], 'unauthorized', path);
+    // The discriminator. A challenge here would mean the request never reached the
+    // route, and a scheduler presenting a secret would be told to go and get a token it
+    // has no way to obtain.
+    assert.equal(res.headers.get('www-authenticate'), null, path);
+  }
+});
+
 test('every route the exempt list does not name requires a bearer token', async () => {
   await ready;
   const { port } = server.address() as AddressInfo;
@@ -336,7 +388,16 @@ test('every route the exempt list does not name requires a bearer token', async 
     );
   }
 
-  const closed = routes.filter((route) => !EXEMPT_PATHS.has(route.path));
+  for (const path of SECRET_AUTH_PATHS) {
+    assert.ok(
+      routes.some((route) => route.path === path),
+      `${path} is not a registered route — STUB_CONFIG no longer configures its secret, so the test above proves nothing`,
+    );
+  }
+
+  const closed = routes.filter(
+    (route) => !EXEMPT_PATHS.has(route.path) && !isSecretAuthenticated(route.path),
+  );
   assert.ok(closed.length > 0, 'no closed route was found — the gate is not mounted');
 
   for (const route of closed) {

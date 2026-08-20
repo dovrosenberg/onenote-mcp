@@ -187,6 +187,25 @@ forced refresh actually slides Microsoft's window — that is a property of Entr
 nothing confirms it until an operator watches the scheduler job run for longer than the
 window.
 
+`test/mirror-sync.test.ts` drives the sync through fakes that count their calls, with no
+`fetch` anywhere in it — every URL the sync builds is already asserted in
+`test/graph-structure.test.ts` against an exact-URL fake. What it asserts is the
+algorithm, and most of the properties worth having are about what does *not* happen. In
+order of how much damage the absence would do: a failed sweep enumeration deletes
+**nothing**, because an auth failure or a 500 would otherwise empty the mirror one
+section at a time; a section whose page listing failed keeps its old watermark, so the
+next run retries it rather than skipping every page it never reached; a budget-exhausted
+run keeps the advances it earned, because the backfill is five hours of slices; and an
+unchanged content hash writes nothing and renders no ink, which is what makes the hour of
+watermark overlap nearly free. What no test there covers is whether Graph's timestamps
+behave as the algorithm assumes — that a page create, edit and delete each move the
+section's `lastModifiedDateTime` is measured in `api-overview.md`, not checked here.
+
+`test/sync-route.test.ts` is `test/keepalive.test.ts`'s shape: its own router with a fake
+target for everything the route decides, plus `createApp` for the two facts a fake router
+cannot show. It asserts that each of the three paths reaches its own mode and no other,
+which is the point of there being three paths — see the convention below.
+
 `test/mirror-schema.test.ts` covers `src/mirror-schema.ts`, which touches no backend.
 That split is forced rather than stylistic: `src/mirror-store.ts` and
 `src/mirror-blobs.ts` have **no automated test at all** and cannot get one on this
@@ -838,6 +857,36 @@ Microsoft's refresh token does not slide. That is fine for a tool call and usele
 keepalive: the whole point of `GraphAuth.refresh()` is the side effect, a replacement
 refresh token with a fresh inactivity window written back to Firestore. Do not add it to
 the tool path — every forced refresh is a token-endpoint round trip and a Firestore write.
+
+**`POST /sync` is the page mirror's way in, on the same terms as `/keepalive` and for the
+same reason.** Its own secret rather than the keepalive one, because the two reach
+different things and a credential should reach one of them. Unmounted when
+`MIRROR_SYNC_SECRET` is unset, so the path 404s and an operator learns the service is
+unconfigured rather than that they mistyped a secret.
+
+**The sync's mode is the path — `/sync`, `/sync/sweep`, `/sync/sweep/full` — not a body
+field or a query parameter.** `src/logging.ts` records the method, the path and the
+status, and deliberately records no query string and no body. A mode carried in either
+would appear in no log line, and "which job ran, and did it answer?" is the first
+question when the mirror looks wrong. A body would also need a JSON parser on a route
+outside the bearer gate. A time-based rule would be worse than both: it makes behaviour
+depend on the container's clock and removes the ability to force a sweep on demand, which
+is the move the keepalive runbook documents as the way to prove a job works.
+
+**A budget-exhausted sync run answers 200, not 503.** It is a normal outcome with
+committed work behind it and a report attached. A 503 makes the scheduler retry
+immediately and spend the next hour's Graph budget inside this one, which is the failure
+the budget exists to prevent. 503 is reserved for a run that could not start; a held
+lease is 409.
+
+**`KEEPALIVE_PATH` and `SYNC_PATH` are a third category, neither exempt nor gated.** Both
+are called by Cloud Scheduler, which has no browser and nowhere to keep a refresh token,
+so neither can ever satisfy a bearer challenge. `test/server.test.ts` asserts they answer
+401 with **no** `WWW-Authenticate` header — the discriminator between "this route refused
+you" and "the bearer gate refused you" — and separately asserts both are registered
+routes, so a `STUB_CONFIG` that stopped configuring their secrets could not make that
+proof vacuous. It was vacuous until 2026-08-19: the stub set neither secret, so neither
+route was mounted and the enumeration never saw them.
 
 **`POST /keepalive` is authenticated by a shared secret, not by a bearer token.** A
 scheduler cannot run the OAuth flow: no browser, nowhere to keep a refresh token. So

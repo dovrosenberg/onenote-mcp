@@ -7,7 +7,8 @@ import { requestLogger } from './logging.ts';
 import { MCP_PATH, mcpRouter } from './mcp-server.ts';
 import { createOAuthProvider } from './oauth-provider.ts';
 import { oauthRouter, protectedResourceMetadataUrl } from './oauth-router.ts';
-import { createGraphAuthFor, createTools } from './tools.ts';
+import { SYNC_PATH, syncRouter } from './sync-route.ts';
+import { createGraphAuthFor, createSyncTargetFor, createTools } from './tools.ts';
 import { SERVICE_NAME, VERSION } from './version.ts';
 
 /**
@@ -77,6 +78,17 @@ export function createApp(config: Config): Application {
   const keepaliveSecret = config.server?.keepaliveSecret;
   if (keepaliveSecret !== undefined) {
     app.use(KEEPALIVE_PATH, keepaliveRouter(keepaliveSecret, auth));
+  }
+
+  // The page mirror's sync, on the same terms and for the same reason: the caller is a
+  // scheduler, which presents a shared secret rather than running the OAuth flow. Its own
+  // secret rather than the keepalive one, because the two reach different things.
+  // Unconfigured, the route is not mounted and the path 404s, which tells an operator the
+  // service is not set up rather than that they mistyped a secret.
+  const syncSecret = config.mirror?.syncSecret;
+  const syncTarget = createSyncTargetFor(config, auth);
+  if (syncSecret !== undefined && syncTarget !== undefined) {
+    app.use(SYNC_PATH, syncRouter(syncSecret, syncTarget));
   }
 
   // Everything below this line needs a bearer token. The middleware reads the
