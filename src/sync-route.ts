@@ -7,7 +7,7 @@
 // rather than the keepalive secret because the two do different things and a credential
 // should reach one of them, not both.
 //
-// **Three paths rather than one path with a mode.** `src/logging.ts` records the method,
+// **Four paths rather than one path with a mode.** `src/logging.ts` records the method,
 // the path and the status, and deliberately records no query string and no body. A mode
 // carried in either would appear nowhere in the request log, and "which job ran, and did
 // it answer?" is the first question when the mirror looks wrong. A body would also need
@@ -38,6 +38,7 @@ export interface SyncTarget {
   runIncremental(): Promise<SyncReport>;
   runSweep(): Promise<SyncReport>;
   runFullSweep(): Promise<SyncReport>;
+  runSweepAll(): Promise<SyncReport>;
 }
 
 export function syncRouter(secret: string, target: SyncTarget): Router {
@@ -85,10 +86,11 @@ export function syncRouter(secret: string, target: SyncTarget): Router {
   router.post('/', run('runIncremental'));
   router.post('/sweep', run('runSweep'));
   router.post('/sweep/full', run('runFullSweep'));
+  router.post('/sweep/all', run('runSweepAll'));
 
   // Only POST. A GET would let a link preview, or anything that crawls a URL, spend a
   // slice of the hourly Graph budget.
-  for (const path of ['/', '/sweep', '/sweep/full']) {
+  for (const path of ['/', '/sweep', '/sweep/full', '/sweep/all']) {
     router.all(path, (_req: Request, res: Response) => {
       res.setHeader('Allow', 'POST');
       res.status(405).json({ status: 'method-not-allowed' });

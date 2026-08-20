@@ -102,6 +102,26 @@ export function encodeMirrorId(graphId: string): string {
 export interface NotebookSelection {
   /** Graph notebook ids whose *pages* are mirrored. */
   readonly notebookIds: readonly string[];
+  /**
+   * Graph notebook ids a sync re-checks after the first backfill.
+   *
+   * `null` means "every selected notebook is active", which is what a document that has
+   * never heard of this field reads as. An empty array is a different thing — a
+   * deliberate "freeze everything" — and the two cannot be told apart by a
+   * `readonly string[]` that happened to be empty, which is why this is nullable.
+   */
+  readonly activeNotebookIds: readonly string[] | null;
+}
+
+/**
+ * Is this notebook one a sync re-checks?
+ *
+ * True when the operator named no active set at all, or named this notebook in it. It
+ * deliberately does not consult `notebookIds`: a notebook whose pages are not mirrored
+ * never reaches a code path that asks.
+ */
+export function isActive(selection: NotebookSelection, notebookId: string): boolean {
+  return selection.activeNotebookIds === null || selection.activeNotebookIds.includes(notebookId);
 }
 
 /**
@@ -116,22 +136,40 @@ export interface NotebookSelection {
  *
  * Duplicates are collapsed. Order is preserved, because the sync reports unmatched ids
  * back and matching that against what was typed is easier in the original order.
+ *
+ * `activeNotebookIds` is read by the same rules with one difference: a field that is
+ * absent or not an array becomes `null` rather than `[]`. See `NotebookSelection`.
  */
 export function readSelection(data: Record<string, unknown> | undefined): NotebookSelection {
+  const active = readIdList(data?.['activeNotebookIds']);
   const raw = data?.['notebookIds'];
-  if (!Array.isArray(raw)) return { notebookIds: [] };
+  if (!Array.isArray(raw)) return { notebookIds: [], activeNotebookIds: active };
+
+  return { notebookIds: readIdList(raw) ?? [], activeNotebookIds: active };
+}
+
+/**
+ * A hand-edited array of ids, or null when the field is not an array at all.
+ *
+ * The null is what `activeNotebookIds` needs and `notebookIds` discards. A malformed
+ * active list must read as "every selected notebook is active" rather than as "none":
+ * failing open costs Graph requests, and failing closed would freeze the mirror with
+ * nothing saying so.
+ */
+function readIdList(raw: unknown): string[] | null {
+  if (!Array.isArray(raw)) return null;
 
   const seen = new Set<string>();
-  const notebookIds: string[] = [];
+  const ids: string[] = [];
   for (const entry of raw) {
     if (typeof entry !== 'string') continue;
     const trimmed = entry.trim();
     if (trimmed === '' || seen.has(trimmed)) continue;
     seen.add(trimmed);
-    notebookIds.push(trimmed);
+    ids.push(trimmed);
   }
 
-  return { notebookIds };
+  return ids;
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +441,7 @@ export interface MirrorTombstone {
   readonly reason: TombstoneReason;
 }
 
-export type SyncMode = 'incremental' | 'sweep' | 'sweep-full';
+export type SyncMode = 'incremental' | 'sweep' | 'sweep-full' | 'sweep-all';
 export type SyncOutcome = 'complete' | 'budget-exhausted' | 'failed';
 
 export interface MirrorSyncState {
@@ -437,6 +475,17 @@ export interface MirrorSyncState {
   readonly runningSince: string | null;
   /** How many selected notebook ids matched no notebook. A mistyped id is silent otherwise. */
   readonly unknownNotebookIds: number;
+  /**
+   * sha256 over the active notebook ids, so a change to them is detectable.
+   *
+   * It is not folded into `structureHash`, and that is deliberate: `putStructure`
+   * replaces documents wholesale and `buildStructure` emits `pagesSyncedThrough: null`,
+   * so anything entering that hash resets every section's watermark when it changes. An
+   * activation edit would then trigger a full re-backfill of the whole selection.
+   */
+  readonly activeSelectionHash: string | null;
+  /** How many *active* ids matched no notebook. Same failure as `unknownNotebookIds`. */
+  readonly unknownActiveNotebookIds: number;
 }
 
 /** The state a document that has never been written reads as. */
@@ -457,6 +506,8 @@ export function initialSyncState(): MirrorSyncState {
     runningMode: null,
     runningSince: null,
     unknownNotebookIds: 0,
+    activeSelectionHash: null,
+    unknownActiveNotebookIds: 0,
   };
 }
 
@@ -492,6 +543,8 @@ export function readSyncState(data: Record<string, unknown> | undefined): Mirror
     runningMode: syncModeOrNull(data['runningMode']),
     runningSince: stringOrNull(data['runningSince']),
     unknownNotebookIds: numberOr(data['unknownNotebookIds'], 0),
+    activeSelectionHash: stringOrNull(data['activeSelectionHash']),
+    unknownActiveNotebookIds: numberOr(data['unknownActiveNotebookIds'], 0),
   };
 }
 
@@ -572,7 +625,12 @@ function booleanOr(value: unknown, fallback: boolean): boolean {
 }
 
 function syncModeOrNull(value: unknown): SyncMode | null {
-  return value === 'incremental' || value === 'sweep' || value === 'sweep-full' ? value : null;
+  return value === 'incremental' ||
+    value === 'sweep' ||
+    value === 'sweep-full' ||
+    value === 'sweep-all'
+    ? value
+    : null;
 }
 
 function syncOutcomeOrNull(value: unknown): SyncOutcome | null {

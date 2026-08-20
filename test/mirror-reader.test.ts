@@ -29,11 +29,14 @@ import type {
   MirrorSectionGroup,
 } from '../src/mirror-schema.ts';
 import {
+  ACTIVITY_MEMO_MS,
   MirrorReader,
   MirrorStructureEmptyError,
   mirrorLookupStructure,
   readSourced,
+  type InactiveCoverage,
   type MirrorReadStore,
+  type MirrorSource,
 } from '../src/mirror-reader.ts';
 import type { ScanResult } from '../src/mirror-store.ts';
 import type { ReadFreshness, ReadSync } from '../src/read-sync.ts';
@@ -110,6 +113,8 @@ interface Fixture {
   pages: MirrorPage[];
   content: Map<string, MirrorPageContent>;
   scanTruncated: boolean;
+  /** null is what an unedited selection document reads as: every notebook active. */
+  activeNotebookIds: string[] | null;
   throwOn?: string;
 }
 
@@ -121,6 +126,7 @@ function fakeStore(fx: Partial<Fixture> = {}): { store: MirrorReadStore; data: F
     pages: [page()],
     content: new Map([['p-1', { pageId: 'p-1', html: '<p>hi</p>', bytes: 9, contentHash: 'abc' }]]),
     scanTruncated: false,
+    activeNotebookIds: null,
     ...fx,
   };
 
@@ -128,6 +134,11 @@ function fakeStore(fx: Partial<Fixture> = {}): { store: MirrorReadStore; data: F
     data.throwOn === name ? Promise.reject(new Error('firestore down')) : Promise.resolve(value);
 
   const store: MirrorReadStore = {
+    getSelection: () =>
+      guard('getSelection', {
+        notebookIds: data.notebooks.filter((n) => n.mirrored).map((n) => n.id),
+        activeNotebookIds: data.activeNotebookIds,
+      }),
     listNotebooks: () => guard('listNotebooks', data.notebooks),
     listSectionsUnder: (parentId) =>
       guard('listSectionsUnder', data.sections.filter((s) => s.parentId === parentId)),
@@ -196,8 +207,8 @@ test('list_notebooks reports every notebook, flagging which have their pages hel
 
   return r.listNotebooks().then((notebooks) => {
     assert.deepEqual(notebooks, [
-      { id: NB, displayName: '2026', pagesMirrored: true },
-      { id: 'nb-2', displayName: 'Other', pagesMirrored: false },
+      { id: NB, displayName: '2026', pagesMirrored: true, pagesActive: true },
+      { id: 'nb-2', displayName: 'Other', pagesMirrored: false, pagesActive: false },
     ]);
   });
 });
@@ -726,4 +737,190 @@ test('a failure reading mirroredAt does not lose the answer', async () => {
   assert.equal(answer.origin, 'mirror');
   assert.equal(answer.data, 'held');
   assert.equal(answer.mirroredAt, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Activity, and the source label it produces
+//
+// The truth table is the whole contract: nine combinations, and every one of them is a
+// claim a model acts on. The row worth staring at is `all` with `confirmed` false, which
+// reports `best-available` — a refresh that failed was never going to check a frozen
+// notebook, so reporting `mirror` there would describe a failure that could not have
+// changed the answer.
+// ---------------------------------------------------------------------------
+
+test('the source truth table, all nine combinations', async () => {
+  const expected: Record<string, [MirrorSource, MirrorSource]> = {
+    // coverage: [confirmed, not confirmed]
+    none: ['onenote', 'mirror'],
+    some: ['best-available', 'mirror'],
+    all: ['best-available', 'best-available'],
+  };
+
+  for (const [coverage, [whenConfirmed, whenNot]] of Object.entries(expected)) {
+    for (const [confirmed, want] of [
+      [true, whenConfirmed],
+      [false, whenNot],
+    ] as const) {
+      const counts: Counts = { mirror: 0, graph: 0, refresh: 0 };
+      const { fromMirror, fromGraph } = counting(counts, 'from mirror');
+      const { reader: r } = reader();
+
+      const answer = await readSourced({
+        tool: 'a_tool',
+        mirror: r,
+        sync: fakeSync(counts, confirmed ? 'current' : 'behind'),
+        fromMirror,
+        fromGraph,
+        inactiveCoverage: () => Promise.resolve(coverage as InactiveCoverage),
+      });
+
+      assert.equal(answer.source, want, `${coverage} / confirmed=${confirmed}`);
+      assert.equal(answer.origin, 'mirror');
+      assert.equal(counts.graph, 0, 'none of the nine is a fallback');
+    }
+  }
+});
+
+test('a coverage lookup that throws is pessimistic, not fatal', async () => {
+  // 'some' is the only safe value: it cannot produce `onenote`, and it cannot produce
+  // `mirror` on an answer whose refresh was fine. Failing the read outright would make a
+  // Firestore blip worse than the behaviour before any of this existed.
+  const counts: Counts = { mirror: 0, graph: 0, refresh: 0 };
+  const { fromMirror, fromGraph } = counting(counts, 'from mirror');
+  const { reader: r } = reader();
+
+  const answer = await readSourced({
+    tool: 'a_tool',
+    mirror: r,
+    sync: fakeSync(counts, 'current'),
+    fromMirror,
+    fromGraph,
+    inactiveCoverage: () => Promise.reject(new Error('firestore down')),
+  });
+
+  assert.equal(answer.source, 'best-available');
+  assert.equal(counts.graph, 0);
+});
+
+test('a Graph answer is onenote whatever the activity, and never asks', async () => {
+  const counts: Counts = { mirror: 0, graph: 0, refresh: 0 };
+  const { fromGraph } = counting(counts, 'from graph');
+  const { reader: r } = reader();
+  let asked = 0;
+
+  const answer = await readSourced({
+    tool: 'a_tool',
+    mirror: r,
+    sync: fakeSync(counts, 'behind'),
+    fromMirror: () => Promise.resolve(null),
+    fromGraph,
+    inactiveCoverage: () => {
+      asked += 1;
+      return Promise.resolve('all' as InactiveCoverage);
+    },
+  });
+
+  assert.equal(answer.source, 'onenote');
+  assert.equal(answer.origin, 'graph');
+  assert.equal(asked, 0, 'nothing about the mirror can weaken an answer OneNote gave');
+});
+
+test('staleTracked reports best-available for a page in a frozen notebook', async () => {
+  // This is get_page_content's case. The copy is un-superseded by any write through this
+  // server, which is what `staleTracked` asserts — but nothing re-checks it against
+  // OneNote, so an edit made in the OneNote client is invisible and the claim has to be
+  // the weaker one.
+  const counts: Counts = { mirror: 0, graph: 0, refresh: 0 };
+  const { fromMirror, fromGraph } = counting(counts, 'from mirror');
+  const { reader: r } = reader({ activeNotebookIds: [] });
+
+  const answer = await readSourced({
+    tool: 'get_page_content',
+    mirror: r,
+    sync: fakeSync(counts, 'behind'),
+    staleTracked: true,
+    fromMirror,
+    fromGraph,
+    inactiveCoverage: (reader) => reader.coverageOfPage('p-1'),
+  });
+
+  assert.equal(answer.source, 'best-available');
+});
+
+test('coverage is none for an active notebook and all for a frozen one', async () => {
+  const active = reader().reader;
+  assert.equal(await active.coverageOfSection('sec-1'), 'none');
+  assert.equal(await active.coverageOfPage('p-1'), 'none');
+  assert.equal(await active.accountActivity(), 'none');
+
+  const frozen = reader({ activeNotebookIds: [] }).reader;
+  assert.equal(await frozen.coverageOfSection('sec-1'), 'all');
+  assert.equal(await frozen.coverageOfPage('p-1'), 'all');
+  assert.equal(await frozen.accountActivity(), 'all');
+});
+
+test('a container the mirror cannot identify is some, not none', async () => {
+  // Answering 'none' would report `onenote` for a document whose notebook this cannot
+  // name. A claim the data does not support must not be the stronger one.
+  const r = reader().reader;
+  assert.equal(await r.coverageOfSection('sec-nowhere'), 'some');
+  assert.equal(await r.coverageOfPage('p-nowhere'), 'some');
+});
+
+test('an account with both frozen and active notebooks is some', async () => {
+  const r = reader({
+    notebooks: [notebook(), notebook({ id: 'nb-2', displayName: 'Other' })],
+    activeNotebookIds: [NB],
+  }).reader;
+  assert.equal(await r.accountActivity(), 'some');
+});
+
+test('a notebook whose pages were never mirrored is not something an answer skipped', async () => {
+  // accountActivity is measured against the mirrored notebooks. An unmirrored notebook is
+  // already reported by notebooksSearched against notebooksInAccount, and counting it
+  // here would label every answer `best-available` for ever on this account.
+  const r = reader({
+    notebooks: [notebook(), notebook({ id: 'nb-2', displayName: 'Other', mirrored: false })],
+    activeNotebookIds: [NB],
+  }).reader;
+  assert.equal(await r.accountActivity(), 'none');
+});
+
+test('the selection is read once per window, not once per question', async () => {
+  // Every covered tool call asks about activity. Without the memo each would add a
+  // Firestore document read to a request a person is waiting on.
+  let clock = 1_000_000;
+  const { store, data } = fakeStore();
+  const r = new MirrorReader(store, fakeBlobs(), undefined, () => clock);
+  let reads = 0;
+  const inner = store.getSelection;
+  data.activeNotebookIds = null;
+  store.getSelection = () => {
+    reads += 1;
+    return inner.call(store);
+  };
+
+  await r.accountActivity();
+  await r.accountActivity();
+  await r.coverageOfSection('sec-1');
+  assert.equal(reads, 1);
+
+  clock += ACTIVITY_MEMO_MS;
+  await r.accountActivity();
+  assert.equal(reads, 2, 'and it does expire, so an operator edit is not pinned for ever');
+});
+
+test('a failed selection read is not cached', async () => {
+  // A cached rejection would pin every later answer to the pessimistic label for the
+  // whole window over one Firestore blip.
+  let fail = true;
+  const { store } = fakeStore();
+  const inner = store.getSelection;
+  store.getSelection = () => (fail ? Promise.reject(new Error('firestore down')) : inner.call(store));
+  const r = new MirrorReader(store, fakeBlobs());
+
+  await assert.rejects(() => r.accountActivity());
+  fail = false;
+  assert.equal(await r.accountActivity(), 'none');
 });

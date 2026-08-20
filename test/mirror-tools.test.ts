@@ -175,7 +175,7 @@ interface MirrorCalls {
 
 function fakeMirror(
   calls: MirrorCalls,
-  options: { broken?: boolean; empty?: boolean } = {},
+  options: { broken?: boolean; empty?: boolean; inactive?: string[] } = {},
 ): MirrorReader {
   const count = <T>(value: T): Promise<T> => {
     calls.total += 1;
@@ -189,6 +189,18 @@ function fakeMirror(
   ]);
 
   const store: MirrorReadStore = {
+    // `inactive` names the notebooks the operator froze; absent means the selection
+    // document names no active set at all, which is every mirrored notebook active.
+    getSelection: () =>
+      count({
+        notebookIds: MIRROR_NOTEBOOKS.filter((n) => n.mirrored).map((n) => n.id),
+        activeNotebookIds:
+          options.inactive === undefined
+            ? null
+            : MIRROR_NOTEBOOKS.filter(
+                (n) => n.mirrored && !options.inactive?.includes(n.id),
+              ).map((n) => n.id),
+      }),
     listNotebooks: () => count(options.empty === true ? [] : MIRROR_NOTEBOOKS),
     listSectionsUnder: (parentId) =>
       count(MIRROR_SECTIONS.filter((s) => s.parentId === parentId)),
@@ -288,6 +300,8 @@ interface RunOptions {
   empty?: boolean;
   noMirror?: boolean;
   freshness?: ReadFreshness;
+  /** Mirrored notebooks the operator marked inactive. */
+  inactive?: string[];
 }
 
 interface SyncCounter {
@@ -466,8 +480,18 @@ test('with no mirror configured every tool is Graph-only, and refreshes nothing'
 test('list_notebooks reports every notebook and which have their pages held', async () => {
   const { body } = await run('list_notebooks', {});
   assert.deepEqual(body['notebooks'], [
-    { id: 'nb-2026', displayName: '2026', pagesMirrored: true },
-    { id: 'nb-2025', displayName: '2025', pagesMirrored: false },
+    { id: 'nb-2026', displayName: '2026', pagesMirrored: true, pagesActive: true },
+    { id: 'nb-2025', displayName: '2025', pagesMirrored: false, pagesActive: false },
+  ]);
+});
+
+test('pagesActive is false for a mirrored notebook the operator froze', async () => {
+  // pagesMirrored says a local copy exists; pagesActive says whether anything keeps it
+  // current. A model choosing where to look needs both, and they are not the same fact.
+  const { body } = await run('list_notebooks', {}, { inactive: ['nb-2026'] });
+  assert.deepEqual(body['notebooks'], [
+    { id: 'nb-2026', displayName: '2026', pagesMirrored: true, pagesActive: false },
+    { id: 'nb-2025', displayName: '2025', pagesMirrored: false, pagesActive: false },
   ]);
 });
 
@@ -494,6 +518,74 @@ test('an unscoped search from the mirror reports its scope, not a walk that neve
   // The escape hatch is naming a section, not an argument: a scoped search misses in the
   // mirror and walks that one section in OneNote.
   assert.match(String(body['note']), /sectionId/);
+});
+
+// ---------------------------------------------------------------------------
+// Frozen notebooks, per tool
+//
+// The point of these is which tools ask and which do not. `list_notebooks` and
+// `list_sections` answer about *structure*, which every sync run rewrites whatever the
+// active set says, so weakening their label would report a staleness that does not exist.
+// ---------------------------------------------------------------------------
+
+const FROZEN = { inactive: ['nb-2026'] };
+
+test('every page-reading tool reports best-available from a frozen notebook', async () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ['list_pages', { sectionId: 'sec-daily' }],
+    ['search_pages', { query: 'held', sectionId: 'sec-daily' }],
+    ['search_pages', { query: 'held' }],
+    ['get_page_content', { pageId: 'p-held' }],
+    ['list_pages_by_name', { notebookName: '2026', sectionName: 'Daily' }],
+    ['find_page_by_name', { notebookName: '2026', sectionName: 'Daily', pageTitle: 'Held Monday' }],
+  ];
+
+  for (const [name, args] of cases) {
+    const { body, graph } = await run(name, args, FROZEN);
+    assert.equal(body['source'], 'best-available', name);
+    assert.equal(graph, 0, `${name} still answered from the mirror`);
+  }
+});
+
+test('the structure tools are unaffected by activity', async () => {
+  // Structure is stored for the whole account on every run, active or not — the tree read
+  // returns it all for the same one request. Reporting best-available here would describe
+  // a staleness these two do not have.
+  for (const [name, args] of [
+    ['list_notebooks', {}],
+    ['list_sections', { containerType: 'notebook', containerId: 'nb-2026' }],
+  ] as const) {
+    const { body } = await run(name, args, FROZEN);
+    assert.equal(body['source'], 'onenote', name);
+  }
+});
+
+test('a frozen notebook stays best-available when the refresh fails too', async () => {
+  // The row that looks wrong and is not: that refresh was never going to check this
+  // notebook, so reporting `mirror` would describe a failure that could not have changed
+  // the answer.
+  const { body } = await run('list_pages', { sectionId: 'sec-daily' }, {
+    ...FROZEN,
+    freshness: 'behind',
+  });
+  assert.equal(body['source'], 'best-available');
+});
+
+test('an unscoped search says how many notebooks are frozen', async () => {
+  // best-available says a skip happened; the count says how large it was.
+  const { body } = await run('search_pages', { query: 'held' }, FROZEN);
+  assert.equal(body['inactiveNotebooks'], 1);
+  assert.equal(body['notebooksSearched'], 1);
+
+  const active = await run('search_pages', { query: 'held' });
+  assert.equal(active.body['inactiveNotebooks'], 0);
+  assert.equal(active.body['source'], 'onenote');
+});
+
+test('get_page_content warns in prose that a frozen notebook is not re-checked', async () => {
+  const { body } = await run('get_page_content', { pageId: 'p-held' }, FROZEN);
+  assert.equal(body['source'], 'best-available');
+  assert.match(String(body['note']), /not re-checked/);
 });
 
 test('the Graph search path keeps its own vocabulary', async () => {

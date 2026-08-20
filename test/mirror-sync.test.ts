@@ -52,7 +52,10 @@ import {
   runFullSweep,
   runIncremental,
   runSweep,
+  runSweepAll,
   resyncPage,
+  splitByActivity,
+  activeSelectionHashOf,
   structureHashOf,
   type ResyncDeps,
   type SyncDeps,
@@ -149,6 +152,16 @@ function fakeGraph(script: GraphScript): { graph: SyncDeps['graph']; calls: Grap
   };
 }
 
+/**
+ * A selection, with "every selected notebook is active" as the default.
+ *
+ * `activeNotebookIds: null` is what a document written before this feature existed reads
+ * as, so it is what every test that is not about activity should use.
+ */
+function sel(notebookIds: string[], activeNotebookIds: string[] | null = null): NotebookSelection {
+  return { notebookIds, activeNotebookIds };
+}
+
 interface StoreState {
   selection: NotebookSelection;
   state: MirrorSyncState;
@@ -176,7 +189,7 @@ function fakeStore(initial: Partial<StoreState> = {}): {
   data: StoreState;
 } {
   const data: StoreState = {
-    selection: { notebookIds: [NB] },
+    selection: sel([NB]),
     state: initialSyncState(),
     sections: [section()],
     groups: [],
@@ -342,7 +355,7 @@ test('every notebook is stored, and only the selected ones are marked mirrored',
   // selected notebooks would make list_notebooks — which takes no arguments — answer
   // confidently and partially, and a partial answer that cannot be detected as partial is
   // the failure CLAUDE.md names about truncated searches.
-  const built = buildStructure(TREE, { notebookIds: [NB] });
+  const built = buildStructure(TREE, sel([NB]));
 
   assert.deepEqual(
     built.notebooks.map((n) => [n.id, n.mirrored]),
@@ -353,7 +366,7 @@ test('every notebook is stored, and only the selected ones are marked mirrored',
 });
 
 test('a section inside a section group gets the group in its path and as its parent', () => {
-  const built = buildStructure(TREE, { notebookIds: [NB] });
+  const built = buildStructure(TREE, sel([NB]));
   const nested = built.sections.find((s) => s.id === 'sec-2');
 
   assert.equal(nested?.parentId, 'grp-1');
@@ -365,38 +378,36 @@ test('a section inside a section group gets the group in its path and as its par
 test('childGroupsKnown is false on every group the expanded tree produced', () => {
   // $expand nests two levels, so a first-level group's nested groups are absent from the
   // response rather than known to be empty. The read path treats false as a mirror miss.
-  const built = buildStructure(TREE, { notebookIds: [NB] });
+  const built = buildStructure(TREE, sel([NB]));
   assert.deepEqual(built.sectionGroups.map((g) => g.childGroupsKnown), [false]);
 });
 
 test('a selected notebook id matching nothing is reported rather than ignored', () => {
   // A mistyped id is a notebook that silently never syncs, and the ids are opaque strings
   // nobody can eyeball. This count is the only thing that says so.
-  const built = buildStructure(TREE, { notebookIds: [NB, 'nb-typo'] });
+  const built = buildStructure(TREE, sel([NB, 'nb-typo']));
   assert.deepEqual(built.unknownNotebookIds, ['nb-typo']);
 });
 
 test('the structure hash ignores timestamps and notices everything else', () => {
   // Timestamps move constantly and are read from the live tree rather than the stored
   // copy. Including them would make the hash differ on every run and defeat the skip.
-  const base = structureHashOf(buildStructure(TREE, { notebookIds: [NB] }));
+  const base = structureHashOf(buildStructure(TREE, sel([NB])));
 
   const restamped = structureHashOf(
     buildStructure(
       TREE.map((n) => ({ ...n, lastModifiedDateTime: '2099-01-01T00:00:00Z' })),
-      { notebookIds: [NB] },
+      sel([NB]),
     ),
   );
   assert.equal(restamped, base, 'a moved timestamp is not a structure change');
 
   const renamed = structureHashOf(
-    buildStructure(TREE.map((n) => ({ ...n, displayName: `${n.displayName}!` })), {
-      notebookIds: [NB],
-    }),
+    buildStructure(TREE.map((n) => ({ ...n, displayName: `${n.displayName}!` })), sel([NB])),
   );
   assert.notEqual(renamed, base, 'a rename is');
 
-  const reselected = structureHashOf(buildStructure(TREE, { notebookIds: [NB, 'nb-2'] }));
+  const reselected = structureHashOf(buildStructure(TREE, sel([NB, 'nb-2'])));
   assert.notEqual(reselected, base, 'and so is a change to the selection');
 });
 
@@ -475,7 +486,7 @@ test('the overlap window is applied, so a section on the boundary is not skipped
 test('an empty selection costs no Graph request at all', async () => {
   // The selection document is hand-edited and may legitimately be empty. That is a real
   // state, not an error, and it should not walk the account to discover it.
-  const h = harness({}, { selection: { notebookIds: [] } });
+  const h = harness({}, { selection: sel([]) });
 
   const report = await runIncremental(h.deps, BUDGET);
 
@@ -485,7 +496,7 @@ test('an empty selection costs no Graph request at all', async () => {
 });
 
 test('a quiet run reads the tree, writes no structure, and visits nothing', async () => {
-  const built = buildStructure(TREE, { notebookIds: [NB] });
+  const built = buildStructure(TREE, sel([NB]));
   const h = harness(
     { tree: TREE },
     {
@@ -720,6 +731,211 @@ test('the lease is taken before any work and released after', async () => {
   // -- frozen past Cloud Run's 300s cut, resumed after the lease expired on age -- cannot
   // clear whichever run holds it now.
   assert.deepEqual(h.storeCalls.releases, [NOW_ISO]);
+});
+
+
+// ---------------------------------------------------------------------------
+// Active notebooks
+//
+// The rule in one line: a section in an inactive notebook is visited exactly once, by
+// the backfill, and never again by an incremental or a scoped or full sweep. Every test
+// below is about something that does *not* happen, because a filter that silently
+// stopped filtering costs Graph requests against a 400-per-hour budget and nothing in a
+// report would look wrong.
+// ---------------------------------------------------------------------------
+
+const NB2 = 'nb-2';
+
+/** A section in the second notebook, which the tests below mark inactive. */
+function otherSection(overrides: Partial<MirrorSection> = {}): MirrorSection {
+  return section({
+    id: 'sec-other',
+    notebookId: NB2,
+    parentId: NB2,
+    path: 'Other / Daily',
+    ...overrides,
+  });
+}
+
+test('splitByActivity backfills an inactive section once and then leaves it alone', () => {
+  const never = otherSection({ pagesSyncedThrough: null });
+  const filled = otherSection({ id: 'sec-filled', pagesSyncedThrough: '2026-08-19T10:00:00Z' });
+  const selection = sel([NB, NB2], [NB]);
+
+  const first = splitByActivity([section(), never, filled], selection, true);
+  assert.deepEqual(first.eligible.map((s) => s.id), ['sec-1', 'sec-other']);
+  assert.equal(first.skippedInactive, 1);
+
+  // A sweep never backfills, so it declines both.
+  const swept = splitByActivity([section(), never, filled], selection, false);
+  assert.deepEqual(swept.eligible.map((s) => s.id), ['sec-1']);
+  assert.equal(swept.skippedInactive, 2);
+});
+
+test('a null active list makes every section eligible, which is the rollback', () => {
+  const split = splitByActivity([section(), otherSection()], sel([NB, NB2]), false);
+  assert.equal(split.eligible.length, 2);
+  assert.equal(split.skippedInactive, 0);
+});
+
+test('an incremental run backfills an inactive notebook and then stops listing it', async () => {
+  const inactive = { selection: sel([NB, NB2], [NB]) };
+
+  const first = harness(
+    { tree: TREE, changed: { 'sec-other': [] } },
+    { ...inactive, sections: [otherSection({ pagesSyncedThrough: null })] },
+  );
+  await runIncremental(first.deps, BUDGET);
+  assert.deepEqual(first.graphCalls.changedSince, ['sec-other'], 'the backfill runs');
+
+  const second = harness(
+    { tree: TREE },
+    { ...inactive, sections: [otherSection({ pagesSyncedThrough: '2026-08-19T10:00:00Z' })] },
+  );
+  const report = await runIncremental(second.deps, BUDGET);
+  assert.deepEqual(second.graphCalls.changedSince, [], 'and never runs again');
+  assert.equal(report.sectionsSkippedInactive, 1);
+});
+
+test('the activity filter still applies when the timestamps cannot be trusted', async () => {
+  // pickCandidates returns early on !sectionRollUpTrusted, so a filter folded into it
+  // would have to be applied on both sides of that branch. This is the side a fold would
+  // most likely miss, and missing it means visiting every archived section every run.
+  const h = harness(
+    { tree: TREE },
+    {
+      selection: sel([NB, NB2], [NB]),
+      sections: [otherSection({ pagesSyncedThrough: '2026-08-19T10:00:00Z' })],
+      state: { ...initialSyncState(), sectionRollUpTrusted: false },
+    },
+  );
+
+  await runIncremental(h.deps, BUDGET);
+  assert.deepEqual(h.graphCalls.changedSince, []);
+});
+
+test('a scoped and a full sweep skip inactive sections; sweep-all visits them', async () => {
+  const init = {
+    selection: sel([NB, NB2], [NB]),
+    sections: [otherSection()],
+    state: { ...initialSyncState(), sectionsScannedThrough: '2020-01-01T00:00:00.000Z' },
+  };
+  const script = { tree: TREE, ids: { 'sec-other': [] } };
+
+  const scoped = harness(script, structuredClone(init));
+  await runSweep(scoped.deps, BUDGET);
+  assert.deepEqual(scoped.graphCalls.pageIds, []);
+
+  const full = harness(script, structuredClone(init));
+  await runFullSweep(full.deps, BUDGET);
+  assert.deepEqual(full.graphCalls.pageIds, []);
+
+  // The only thing that reaches a frozen notebook, which is what it is for: nothing else
+  // would ever notice a page deleted there in the OneNote client.
+  const all = harness(script, structuredClone(init));
+  const report = await runSweepAll(all.deps, BUDGET);
+  assert.deepEqual(all.graphCalls.pageIds, ['sec-other']);
+  assert.equal(report.mode, 'sweep-all');
+  assert.equal(report.sectionsSkippedInactive, 0);
+});
+
+test('changing the active set nulls sectionsScannedThrough, so a re-activation is seen', async () => {
+  // Tier 1 skips a section older than that cutoff, and the cutoff advances on every
+  // completed run. Without the reset, a notebook re-activated after three months would
+  // have every section older than the cutoff and would never be re-checked at all.
+  const h = harness(
+    { tree: TREE, changed: { 'sec-1': [] } },
+    {
+      selection: sel([NB, NB2], [NB]),
+      sections: [section({ graphLastModifiedDateTime: '2020-01-01T00:00:00Z' })],
+      state: {
+        ...initialSyncState(),
+        // Set, so a structure rewrite is not what widens this run: an unchanged hash
+        // makes the timestamps trusted, and the reset is then the only thing that can
+        // turn a section last touched in 2020 into a candidate.
+        structureHash: structureHashOf(buildStructure(TREE, sel([NB, NB2], [NB]))),
+        sectionsScannedThrough: '2026-08-19T11:55:00.000Z',
+        activeSelectionHash: activeSelectionHashOf(sel([NB, NB2], [NB2])),
+      },
+    },
+  );
+
+  await runIncremental(h.deps, BUDGET);
+
+  assert.equal(
+    h.storeCalls.patches.some((p) => p.sectionsScannedThrough === null),
+    true,
+    'the watermark is cleared so every active section is a candidate on this run',
+  );
+  assert.deepEqual(
+    h.graphCalls.changedSince,
+    ['sec-1'],
+    'and the widening applies to the run that noticed, not the one after it',
+  );
+});
+
+test('a state document that predates the field records the hash and widens nothing', async () => {
+  // Null is "written before this existed", not "the set changed". Treating it as a change
+  // would make the first run after every deploy a full-width scan.
+  const h = harness(
+    { tree: TREE },
+    {
+      selection: sel([NB]),
+      sections: [section({ graphLastModifiedDateTime: '2020-01-01T00:00:00Z' })],
+      state: {
+        ...initialSyncState(),
+        structureHash: structureHashOf(buildStructure(TREE, sel([NB]))),
+        sectionsScannedThrough: '2026-08-19T11:55:00.000Z',
+      },
+    },
+  );
+
+  await runIncremental(h.deps, BUDGET);
+
+  assert.deepEqual(h.graphCalls.changedSince, []);
+  assert.equal(
+    h.storeCalls.patches.some((p) => p.activeSelectionHash === 'all'),
+    true,
+    'the hash is recorded, so the next real change is detectable',
+  );
+});
+
+test('the structure hash does not move when only the active set changed', () => {
+  // If it did, putStructure would rewrite every section with pagesSyncedThrough null and
+  // an activation edit would trigger a full re-backfill — hours of the request budget.
+  const base = structureHashOf(buildStructure(TREE, sel([NB])));
+  assert.equal(structureHashOf(buildStructure(TREE, sel([NB], []))), base);
+  assert.equal(structureHashOf(buildStructure(TREE, sel([NB], [NB]))), base);
+
+  assert.notEqual(activeSelectionHashOf(sel([NB], [])), activeSelectionHashOf(sel([NB], [NB])));
+  assert.equal(
+    activeSelectionHashOf(sel([NB], ['a', 'b'])),
+    activeSelectionHashOf(sel([NB], ['b', 'a'])),
+    'the order an operator typed them in is not a change',
+  );
+});
+
+test('an active id naming no mirrored notebook is counted rather than ignored', () => {
+  // Two ways to get here and both are silent: a typo, and a real id never added to
+  // notebookIds, whose pages are not mirrored so marking it active reaches nothing.
+  const built = buildStructure(TREE, sel([NB], [NB, 'nb-typo', 'nb-2']));
+  assert.deepEqual(built.unknownActiveNotebookIds, ['nb-typo', 'nb-2']);
+  assert.deepEqual(built.unknownNotebookIds, []);
+});
+
+test('a resync writes a page in an inactive notebook', async () => {
+  // Activity gates the sync, never the write path. Someone adding a symmetrical check to
+  // resyncPage would leave every write to a frozen notebook serving pre-write content
+  // until a sweep-all ran, which may be never.
+  const h = resyncDeps({
+    selection: sel([NB, NB2], [NB]),
+    sections: [otherSection()],
+  });
+
+  const outcome = await resyncPage(h.deps, 'p-1', { title: 'Written', sectionId: 'sec-other' });
+
+  assert.equal(outcome, 'updated');
+  assert.equal(h.storeCalls.puts[0]?.page.title, 'Written');
 });
 
 // ---------------------------------------------------------------------------

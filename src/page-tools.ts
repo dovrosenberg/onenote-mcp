@@ -25,6 +25,11 @@
 // a mirror hit here is a page nothing has superseded, and it is reported as OneNote's
 // content whether or not the account-wide refresh finished. `mirroredAt` still says when
 // the copy was taken.
+//
+// A page in a notebook the operator marked inactive reports `best-available` instead.
+// The copy is still the best there is and still un-superseded by any write through this
+// server; what it is not is re-checked, so an edit made in the OneNote client to a frozen
+// notebook is invisible here.
 
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 
@@ -37,7 +42,12 @@ import {
 } from './ink.ts';
 import type { PageContent } from './page-content.ts';
 import { requiredString, type ToolDefinition } from './mcp-tools.ts';
-import { readSourced, type MirrorReader, type MirrorSource } from './mirror-reader.ts';
+import {
+  SOURCE_NOTE,
+  readSourced,
+  type MirrorReader,
+  type MirrorSource,
+} from './mirror-reader.ts';
 import type { ReadSync } from './read-sync.ts';
 
 /** This tool reads; it does not write. */
@@ -82,7 +92,7 @@ export function createPageTools(
         'typed rather than written comes back with inkImage null and no image block, ' +
         'which is normal and not an error. All of the page\'s ink is cropped into one ' +
         'image, so the strokes keep no positional relationship to the HTML. pageId ' +
-        'comes from list_pages or search_pages.',
+        'comes from list_pages or search_pages.' + SOURCE_NOTE,
       inputSchema: {
         type: 'object',
         properties: {
@@ -115,6 +125,10 @@ export function createPageTools(
           fromMirror: (reader) => reader.getPageContent(pageId),
           fromGraph: () => content.fetchContent(pageId),
           mirroredAt: (reader) => reader.syncedAt(pageId),
+          // `staleTracked` alone would report `onenote` here. A page in a notebook the
+          // operator froze is still the best copy there is, but nothing re-checks it, so
+          // the claim is `best-available` rather than "confirmed current".
+          inactiveCoverage: (reader) => reader.coverageOfPage(pageId),
         });
 
         const page = answer.data;
@@ -145,7 +159,7 @@ export function pageResult(
           inkImage: summary,
           source,
           ...(mirroredAt === undefined ? {} : { mirroredAt }),
-          note: note(html, summary, mirroredAt),
+          note: note(html, summary, mirroredAt, source),
         },
         null,
         2,
@@ -188,6 +202,7 @@ function note(
   html: string | null,
   ink: InkImageSummary | null,
   mirroredAt: string | undefined,
+  source: MirrorSource,
 ): string {
   const parts: string[] = [];
 
@@ -197,6 +212,12 @@ function note(
   // this tool never reports `source: "mirror"`.
   if (mirroredAt !== undefined) {
     parts.push(`Served from this server's local copy of the page, last synced ${mirroredAt}.`);
+    if (source === 'best-available') {
+      parts.push(
+        'That notebook is not re-checked against OneNote, so an edit made in the OneNote ' +
+          'client since then would not appear here.',
+      );
+    }
   }
 
   if (html === null) {

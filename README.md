@@ -863,24 +863,37 @@ tools go through the local copy: `list_notebooks`, `list_sections`, `list_pages`
 2. **Read the local copy.** A hit costs no OneNote request. A miss falls through to
    Microsoft Graph, exactly as before.
 3. **Report the source.** `source` is `onenote` when the answer equals what OneNote holds,
-   and `mirror` when it may be behind.
+   `best-available` when part of it comes from a notebook the operator froze, and `mirror`
+   when it may be behind.
 
-The `source` rule in full:
+The `source` rule in full. "Confirmed" means the refresh in step 1 finished, or the answer
+is a single page no write has marked stale:
 
 | Situation | `source` |
 |---|---|
 | The read fell through to Microsoft Graph | `onenote` |
-| A local hit, and the refresh in step 1 finished | `onenote` |
-| A local hit of a single page that no write has marked stale | `onenote` |
-| A local hit, and the refresh did not finish | `mirror` |
+| A local hit from an active notebook, confirmed | `onenote` |
+| A local hit from an active notebook, not confirmed | `mirror` |
+| A local hit from an inactive notebook, confirmed or not | `best-available` |
+| An unscoped search covering both, confirmed | `best-available` |
+| An unscoped search covering both, not confirmed | `mirror` |
 
 A refresh "finished" means it read the notebook tree, visited every section it needed,
 fetched every page it needed, and ran out of neither budget. Anything else — the request
 or time budget ran out, the tree read 500'd, a page fetch failed, the scheduler held the
 sync lease, Firestore did not answer — is `mirror`, and the answer carries `mirroredAt`
-saying when the copy was taken. `get_page_content` is the exception in the table: a page
-document carries its own staleness flag and every write marks its page stale before it
-touches OneNote, so a hit there is a page nothing has superseded.
+saying when the copy was taken. `get_page_content` is the exception in the first three
+rows: a page document carries its own staleness flag and every write marks its page stale
+before it touches OneNote, so a hit there is a page nothing has superseded.
+
+`best-available` is not a degraded answer and does not become `mirror` when a refresh
+fails: that refresh was never going to check an inactive notebook, so reporting it would
+describe a failure that could not have changed the answer. What it does say is that the
+copy is only re-checked by a write through this server or by `/sync/sweep/all`.
+`list_notebooks` reports `pagesActive` per notebook and an unscoped `search_pages` reports
+`inactiveNotebooks` beside `notebooksSearched`, so a model can see how large the skip was.
+`list_notebooks` and `list_sections` never report `best-available` — structure is stored
+for the whole account on every run whatever the active set says.
 
 **A refresh does not run on every call.** A finished one holds for 30 seconds and an
 unfinished one for 5 minutes, so a burst of tool calls pays for one refresh rather than
