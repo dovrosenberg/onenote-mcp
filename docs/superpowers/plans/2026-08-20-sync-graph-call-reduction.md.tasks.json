@@ -46,7 +46,7 @@
     {
       "id": 5,
       "subject": "Task 6: Measure the clock skew and what the overlap actually catches",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         4
       ],
@@ -55,7 +55,7 @@
     {
       "id": 6,
       "subject": "Task 7: Skip the content fetch for a page whose stamp has not moved",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         5
       ],

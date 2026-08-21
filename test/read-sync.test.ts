@@ -35,6 +35,7 @@ function report(overrides: Partial<SyncReport> = {}): SyncReport {
     pagesUpdated: 0,
     pagesDeleted: 0,
     pagesFailed: 0,
+    pagesSkipped: 0,
     unknownNotebookIds: 0,
     unknownActiveNotebookIds: 0,
     sectionsSkippedInactive: 0,

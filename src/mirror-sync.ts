@@ -73,6 +73,7 @@ import {
   overlapSaveAgeMs,
   pageStampDiffers,
   sectionIdentity,
+  storedPageIsCurrent,
   utf8Bytes,
   type MirrorPage,
   type MirrorPageContent,
@@ -175,6 +176,16 @@ export interface SyncReport {
   readonly pagesUpdated: number;
   readonly pagesDeleted: number;
   readonly pagesFailed: number;
+  /**
+   * Pages the listing named whose stored copy Graph already describes exactly.
+   *
+   * The saving, reported rather than hidden: each one is a content request not spent
+   * against the hourly 400. A run whose `pagesSkipped` collapses to zero while
+   * `sectionsVisited` holds steady is the signature of the skip having stopped working —
+   * a changed field on the page document, or a `contentSyncedAt` that stopped being
+   * written — which nothing else in the report would show.
+   */
+  readonly pagesSkipped: number;
   /** Selected notebook ids matching no notebook. A mistyped id is silent otherwise. */
   readonly unknownNotebookIds: number;
   /** Active notebook ids matching no notebook. */
@@ -446,6 +457,7 @@ interface Tally {
   pagesUpdated: number;
   pagesDeleted: number;
   pagesFailed: number;
+  pagesSkipped: number;
   unknownNotebookIds: number;
   unknownActiveNotebookIds: number;
   sectionsSkippedInactive: number;
@@ -478,6 +490,7 @@ async function runMode(
     pagesUpdated: 0,
     pagesDeleted: 0,
     pagesFailed: 0,
+    pagesSkipped: 0,
     unknownNotebookIds: 0,
     unknownActiveNotebookIds: 0,
     sectionsSkippedInactive: 0,
@@ -518,6 +531,7 @@ async function runMode(
     pagesUpdated: tally.pagesUpdated,
     pagesDeleted: tally.pagesDeleted,
     pagesFailed: tally.pagesFailed,
+    pagesSkipped: tally.pagesSkipped,
     unknownNotebookIds: tally.unknownNotebookIds,
     unknownActiveNotebookIds: tally.unknownActiveNotebookIds,
     sectionsSkippedInactive: tally.sectionsSkippedInactive,
@@ -542,6 +556,7 @@ async function runMode(
     pagesUpdated: report.pagesUpdated,
     pagesDeleted: report.pagesDeleted,
     pagesFailed: report.pagesFailed,
+    pagesSkipped: report.pagesSkipped,
     sectionsSkippedInactive: report.sectionsSkippedInactive,
     durationMs: report.durationMs,
   });
@@ -891,7 +906,13 @@ export function pickCandidates(
 }
 
 /**
- * One section: list what changed, fetch each changed page, then advance the watermark.
+ * One section: list what changed, fetch the pages the mirror is behind on, then advance
+ * the watermark.
+ *
+ * Not every listed page is fetched. The listing carries each page's stamp and title, and
+ * `storedPageIsCurrent` decides from those whether the stored copy already matches — which
+ * is what the watermark overlap costs and what this saves, because the overlap re-lists
+ * every page edited in the last hour on every run.
  *
  * The watermark moves only after the whole changed set landed. A failure part-way leaves
  * it where it was, so the next run retries the section rather than skipping the pages it
@@ -913,12 +934,30 @@ async function syncSection(ctx: PassContext, section: MirrorSection): Promise<vo
 
   for (const summary of changed) {
     // Checked before each page rather than only per section: 120 resvg renders on a
-    // 1-CPU instance is what is most likely to overrun the wall clock.
+    // 1-CPU instance is what is most likely to overrun the wall clock. It is checked
+    // ahead of the skip too, because the budget bounds wall clock as well as requests and
+    // a section left half-visited has to report `done: false` so its watermark stays put.
     if (ctx.budget.exhausted) {
       ctx.tally.done = false;
       return;
     }
-    const written = await syncPage(ctx, section, summary);
+
+    // The saving this pass exists for. The listing already carried the stamp and the
+    // title, so a page Graph describes exactly as the mirror already holds it needs no
+    // content request — and the content request is the resource under the hourly 400,
+    // where the write, the blob and the resvg render that `writePageFromRaw`'s
+    // short-circuit already saves are not. With an hour of watermark overlap, every page
+    // edited in the last hour was otherwise re-fetched by every run for the next hour.
+    //
+    // The document read here is handed to `writePageFromRaw`, so a page that is *not*
+    // skipped is still read from Firestore exactly once.
+    const stored = await ctx.deps.store.getPage(summary.id);
+    if (stored !== null && storedPageIsCurrent(stored, summary, section.id)) {
+      ctx.tally.pagesSkipped += 1;
+      continue;
+    }
+
+    const written = await syncPage(ctx, section, summary, stored);
 
     // Only a page that was *written* counts. One the overlap re-read and found unchanged
     // is what the window costs, not what it saves, and logging it here would produce
@@ -991,6 +1030,7 @@ async function syncPage(
   ctx: PassContext,
   section: MirrorSection,
   summary: PageSummary,
+  stored?: MirrorPage | null,
 ): Promise<boolean> {
   ctx.budget.take();
 
@@ -1011,7 +1051,7 @@ async function syncPage(
     // Only counted when something was actually written. A page re-read because it fell
     // inside the watermark overlap and found unchanged is not an update, and reporting
     // it as one would make every run look busy and hide a sync that had stopped working.
-    if (!(await storePage(ctx, section, summary, raw))) return false;
+    if (!(await storePage(ctx, section, summary, raw, stored))) return false;
     ctx.tally.pagesUpdated += 1;
     return true;
   } catch (err) {
@@ -1027,6 +1067,7 @@ async function storePage(
   section: MirrorSection,
   summary: PageSummary,
   raw: RawPageContent,
+  stored?: MirrorPage | null,
 ): Promise<boolean> {
   const written = await writePageFromRaw(
     { store: ctx.deps.store, blobs: ctx.deps.blobs },
@@ -1036,6 +1077,7 @@ async function storePage(
     () => {
       ctx.tally.pagesFailed += 1;
     },
+    stored,
   );
   return written;
 }
@@ -1079,6 +1121,12 @@ export async function writePageFromRaw(
   summary: PageSummary,
   raw: RawPageContent,
   onInkFailure: () => void = () => {},
+  /**
+   * The stored document, when the caller has already read it. `undefined` means "read it
+   * here"; `null` means "there is none". `syncSection`'s pre-check has always just read
+   * one, and a second read would double the Firestore cost of every page it does not skip.
+   */
+  known?: MirrorPage | null,
 ): Promise<boolean> {
   const html = pageHtml(raw) ?? '';
   const hash = createHash('sha256').update(html).digest('hex');
@@ -1094,7 +1142,7 @@ export async function writePageFromRaw(
   //
   // `lastModifiedDateTime` is deliberately NOT compared. It moves on every write, so
   // including it would rewrite every page the overlap re-read and defeat the whole point.
-  const stored = await deps.store.getPage(summary.id);
+  const stored = known === undefined ? await deps.store.getPage(summary.id) : known;
   if (
     stored !== null &&
     stored.contentState === 'present' &&

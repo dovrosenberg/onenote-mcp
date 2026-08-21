@@ -855,9 +855,97 @@ export interface PageStamp {
  * disagrees like any other value, so such a page is re-fetched once per sweep and the
  * short-circuit declines to store the empty string over a good one. That is the price of
  * never hiding an edit, and no page Graph stamps ever pays it.
+ *
+ * `storedPageIsCurrent` delegates its stamp clause here rather than restating the
+ * comparison. Both callers answer a disagreement by fetching the page, so one rule serves
+ * both, and a change made to this one — a margin, a parse, a direction test — cannot reach
+ * only one of them.
  */
 export function pageStampDiffers(stored: PageStamp, live: PageStamp): boolean {
   return stored.lastModifiedDateTime !== live.lastModifiedDateTime;
+}
+
+/**
+ * How long a stored copy must have been in hand before its stamp is trusted.
+ *
+ * Graph stamps `lastModifiedDateTime` to the whole second — measured 2026-08-21 and
+ * recorded in api-overview.md under "Page timestamps have whole-second resolution". So a
+ * content fetch landing in the same second as a concurrent edit stores the older content
+ * under a stamp that never moves, and `storedPageIsCurrent` would then skip that page on
+ * every later run. Requiring the stored copy to have been fetched well after the stamp
+ * closes that window.
+ *
+ * Unlike the stamp equality, this comparison **does** cross clocks: Firestore's
+ * `serverTimestamp()` on one side, Graph's stamp on the other. That is why it is 30
+ * seconds rather than 2. The size is bounded by measurement rather than chosen blind —
+ * api-overview.md records the Graph-to-service skew as seconds rather than minutes, and
+ * `recordClockSkew` in ./graph-throttle.ts measures it continuously from the deployed
+ * service, so a figure that turns out to be wrong shows up in the logs rather than as a
+ * silent miss.
+ *
+ * Failing the guard only ever forces an extra fetch. It never defers work into a later
+ * window, so it cannot interact with the watermark overlap.
+ */
+export const TIMESTAMP_SETTLE_MS = 30_000;
+
+/**
+ * Does the mirror already hold this page exactly as Graph describes it?
+ *
+ * True means the content fetch can be skipped, which is the point: the changed-page
+ * listing already carried the stamp and the title, so re-reading the content would spend
+ * one of the hourly 400 Graph requests to learn what the listing already said.
+ *
+ * Every clause is a way that answering true carelessly would serve superseded content as
+ * current:
+ *
+ * - `contentState` — a write already marked this stale, or its content was never stored.
+ * - the stamp — exact string equality, delegated to `pageStampDiffers` so the sweep and
+ *   the skip cannot drift into two different rules for one comparison. An empty or
+ *   unparseable live stamp needs no clause of its own: `Date.parse` answers NaN for it and
+ *   every comparison against NaN is false, so the settle guard below refuses the page.
+ * - the title — a rename moves no timestamp, so a stamp-only check goes permanently blind
+ *   to one. Measured 2026-08-21 and recorded in api-overview.md: a `PATCH
+ *   /pages/{id}/content` replacing the title left `lastModifiedDateTime` at its old value,
+ *   still unchanged two minutes later. The title is the field `find_page_by_name` and
+ *   `search_pages` match on, so a mirror that missed a rename answers by the wrong name
+ *   indefinitely. Do not drop this comparison as redundant with the stamp.
+ * - the section — page ids survive a rename of their placement, so only the placement
+ *   changed and the stored `sectionId` is what every listing query filters on.
+ * - the settle guard — see `TIMESTAMP_SETTLE_MS`.
+ *
+ * **There is no tolerance on the stamp, and a future reader must not add one.** The
+ * tempting justification is api-overview.md's record of Graph reporting four unchanged
+ * pages exactly one second later across two reads — a window of a second or two would
+ * absorb that. It would also discard every genuine edit made inside the window, and the
+ * incremental sync advances the section watermark past an edit it did not act on, so such
+ * a page is never listed again. The failure directions are not symmetric: a stamp that
+ * disagrees for no reason costs one Graph request and then agrees, because the re-fetch
+ * writes Graph's own string back.
+ */
+export function storedPageIsCurrent(
+  stored: MirrorPage,
+  live: PageStamp,
+  sectionId: string,
+  settleMs: number = TIMESTAMP_SETTLE_MS,
+): boolean {
+  if (stored.contentState !== 'present') return false;
+  if (pageStampDiffers(stored, live)) return false;
+  if (stored.title !== live.title) return false;
+  if (stored.sectionId !== sectionId) return false;
+
+  // Null for an absent field, which is what a document written before `contentSyncedAt`
+  // existed carries. It cannot prove anything about when the copy was taken.
+  const syncedAt = timestampToIso(stored.contentSyncedAt);
+  if (syncedAt === null) return false;
+
+  // Not `Math.abs`. A copy fetched *before* Graph stamped the edit is not settled by any
+  // margin — it predates the edit outright — and an absolute value would call it current.
+  //
+  // A stamp neither side can parse — `''`, which is `toPageSummary`'s fallback for a field
+  // Graph did not send — makes this NaN, and NaN fails every comparison, so the page is
+  // fetched. That is the wanted answer and it is why there is no separate empty-stamp
+  // clause above; a guard that could never change the result would be untestable code.
+  return Date.parse(syncedAt) - Date.parse(live.lastModifiedDateTime) > settleMs;
 }
 
 export interface MirrorPageContent {

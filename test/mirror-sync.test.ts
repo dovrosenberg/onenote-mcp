@@ -1348,6 +1348,258 @@ test('an overlap save carries a number and nothing that could name the page', as
   }
 });
 
+// ---------------------------------------------------------------------------
+// Skipping the content fetch
+// ---------------------------------------------------------------------------
+
+/** A stored page in the state the skip needs: settled well after Graph's stamp. */
+function settledPage(overrides: Partial<MirrorPage> = {}): MirrorPage {
+  return storedPage({
+    lastModifiedDateTime: '2026-08-19T11:30:00Z',
+    contentSyncedAt: '2026-08-19T11:35:00Z',
+    ...overrides,
+  });
+}
+
+/** A harness whose content client records every page it was asked for. */
+function fetchRecorder(): { fetched: string[]; content: SyncDeps['content'] } {
+  const fetched: string[] = [];
+  return {
+    fetched,
+    content: {
+      fetchRaw: (pageId) => {
+        fetched.push(pageId);
+        return Promise.resolve(rawHtml(TYPED_HTML));
+      },
+    },
+  };
+}
+
+test('an unchanged page inside the overlap window costs no Graph request', async () => {
+  const { fetched, content } = fetchRecorder();
+
+  const h = harness(
+    { changed: { 'sec-1': [summary('p1', '2026-08-19T11:30:00Z')] } },
+    { sections: [section()], pages: new Map([['p1', settledPage()]]) },
+    content,
+  );
+
+  const report = await runIncremental(h.deps, BUDGET);
+
+  assert.deepEqual(fetched, [], 'the stamp did not move, so nothing needs re-reading');
+  assert.deepEqual(h.storeCalls.puts, []);
+  assert.deepEqual(h.storeCalls.metadata, [], 'and no stamp needs correcting either');
+  assert.equal(report.pagesSkipped, 1);
+  assert.equal(report.pagesUpdated, 0, 'a skip is not an update');
+  assert.equal(report.graphRequests, 2, 'the tree and the listing, and nothing else');
+  assert.deepEqual(h.storeCalls.watermarks, [{ sectionId: 'sec-1', watermark: NOW_ISO }]);
+
+  // A skip is work completed, not work outstanding. `freshnessOf` in src/read-sync.ts
+  // requires `outcome === 'complete'` and `done` before a covered read may report
+  // `source: "onenote"`, so a skip that left either unset would downgrade the label on
+  // every tool answer in the account — and nothing else in this file would show it.
+  assert.equal(report.outcome, 'complete');
+  assert.equal(report.done, true);
+  assert.ok(
+    h.storeCalls.patches.some((p) => p.sectionsScannedThrough === NOW_ISO),
+    'and the section scan advances, which only a finished run does',
+  );
+});
+
+test('a skipped page is neither an overlap save nor absent from the report line', async () => {
+  const lines: string[] = [];
+  setEventSink((line) => lines.push(line));
+
+  // The page's stamp predates the watermark, so the overlap window is the only reason it
+  // was listed — and now it is not even fetched. Counting that as a save would produce
+  // evidence arguing to keep a window whose whole cost this pass just removed.
+  const { fetched, content } = fetchRecorder();
+  const h = harness(
+    { changed: { 'sec-1': [summary('p1', '2026-08-19T09:30:00Z')] } },
+    {
+      sections: [section({ pagesSyncedThrough: '2026-08-19T10:00:00Z' })],
+      pages: new Map([
+        ['p1', settledPage({ lastModifiedDateTime: '2026-08-19T09:30:00Z' })],
+      ]),
+    },
+    content,
+  );
+
+  const report = await runIncremental(h.deps, BUDGET);
+  setEventSink(() => {});
+
+  assert.deepEqual(fetched, []);
+  assert.equal(report.pagesSkipped, 1);
+  assert.deepEqual(overlapSaves(lines), []);
+
+  // The count has to reach the log line, not only the returned report: the report is read
+  // by a test and by `POST /sync`'s response body, and the log line is the only thing an
+  // operator watching the scheduler sees. A skip that showed up in neither would make a
+  // run that did all its work look identical to one that did none.
+  const completed = lines
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((entry) => entry['event'] === 'sync-completed');
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0]?.['pagesSkipped'], 1);
+});
+
+test('an unsettled copy is fetched even though the stamps match', async () => {
+  const { fetched, content } = fetchRecorder();
+
+  const h = harness(
+    { changed: { 'sec-1': [summary('p1', '2026-08-19T11:30:00Z')] } },
+    {
+      sections: [section()],
+      // Five seconds after the stamp: Graph stamps whole seconds, so an edit inside the
+      // second it names could have landed after this copy was read and moved nothing.
+      pages: new Map([['p1', settledPage({ contentSyncedAt: '2026-08-19T11:30:05Z' })]]),
+    },
+    content,
+  );
+
+  const report = await runIncremental(h.deps, BUDGET);
+
+  assert.deepEqual(fetched, ['p1']);
+  assert.equal(report.pagesSkipped, 0);
+});
+
+test('a renamed page is fetched even though Graph moved no timestamp', async () => {
+  // Measured 2026-08-21 (api-overview.md): a PATCH replacing a page's title left
+  // `lastModifiedDateTime` at its old value, unchanged two minutes later. So the listing
+  // is the only thing that can report a rename, and a skip that trusted the stamp alone
+  // would leave the mirror answering by the old title for ever — which is the field
+  // `find_page_by_name` and `search_pages` match on.
+  const { fetched, content } = fetchRecorder();
+
+  const h = harness(
+    {
+      changed: {
+        'sec-1': [{ id: 'p1', title: 'Renamed', lastModifiedDateTime: '2026-08-19T11:30:00Z' }],
+      },
+    },
+    { sections: [section()], pages: new Map([['p1', settledPage()]]) },
+    content,
+  );
+
+  const report = await runIncremental(h.deps, BUDGET);
+
+  assert.deepEqual(fetched, ['p1'], 'the title moved, so the page is re-read');
+  assert.equal(report.pagesSkipped, 0);
+  assert.equal(h.data.pages.get('p1')?.title, 'Renamed', 'and the mirror now holds it');
+});
+
+test('a skipped page is read from Firestore once, not twice', async () => {
+  const reads: string[] = [];
+  const h = harness(
+    { changed: { 'sec-1': [summary('p1', '2026-08-19T11:30:00Z')] } },
+    { sections: [section()], pages: new Map([['p1', settledPage()]]) },
+  );
+  const inner = h.deps.store.getPage;
+  h.deps.store.getPage = (pageId) => {
+    reads.push(pageId);
+    return inner(pageId);
+  };
+
+  await runIncremental(h.deps, BUDGET);
+
+  assert.deepEqual(reads, ['p1']);
+});
+
+test('a page the pre-check declines is read from Firestore once too', async () => {
+  // The pre-check has already read the document by the time it decides to fetch, so it
+  // hands it on. Without that, every page the sync does *not* skip costs two Firestore
+  // reads instead of one — the pre-check's and `writePageFromRaw`'s — and the change
+  // would be a regression on the common path rather than a saving. Nothing else in this
+  // file would notice, because both reads return the same document.
+  const reads: string[] = [];
+  const h = harness(
+    // A stamp Graph moved, so the page is fetched rather than skipped.
+    { changed: { 'sec-1': [summary('p1', '2026-08-19T11:45:00Z')] } },
+    { sections: [section()], pages: new Map([['p1', settledPage()]]) },
+  );
+  const inner = h.deps.store.getPage;
+  h.deps.store.getPage = (pageId) => {
+    reads.push(pageId);
+    return inner(pageId);
+  };
+
+  const report = await runIncremental(h.deps, BUDGET);
+
+  assert.equal(report.pagesSkipped, 0, 'this page was fetched');
+  assert.deepEqual(reads, ['p1'], 'and read from Firestore exactly once');
+});
+
+test('a page the mirror has never seen is fetched, whatever its stamp says', async () => {
+  // The skip's guard is that a stored document exists. A create inside the window has
+  // none, and answering "current" for it would leave the page out of the mirror
+  // permanently — the watermark advances past its stamp and no later incremental lists it.
+  const { fetched, content } = fetchRecorder();
+
+  const h = harness(
+    { changed: { 'sec-1': [summary('p1', '2026-08-19T11:30:00Z')] } },
+    { sections: [section()], pages: new Map() },
+    content,
+  );
+
+  const report = await runIncremental(h.deps, BUDGET);
+
+  assert.deepEqual(fetched, ['p1']);
+  assert.equal(report.pagesSkipped, 0);
+  assert.equal(h.storeCalls.puts.length, 1);
+});
+
+test('a page marked stale by a write is fetched, not skipped', async () => {
+  // `beginWrite` marks a page stale before it touches OneNote, and the mirror serves a
+  // stale page as a miss. A skip that ignored `contentState` would leave the page marked
+  // stale for ever: no run would ever re-fetch it, so every read of it would fall through
+  // to Graph, which is the cost the mirror exists to remove.
+  const { fetched, content } = fetchRecorder();
+
+  const h = harness(
+    { changed: { 'sec-1': [summary('p1', '2026-08-19T11:30:00Z')] } },
+    { sections: [section()], pages: new Map([['p1', settledPage({ contentState: 'stale' })]]) },
+    content,
+  );
+
+  const report = await runIncremental(h.deps, BUDGET);
+
+  assert.deepEqual(fetched, ['p1']);
+  assert.equal(report.pagesSkipped, 0);
+  assert.equal(h.data.pages.get('p1')?.contentState, 'present');
+});
+
+test('the budget is still checked before a page that turns out to be skipped', async () => {
+  // The skip costs no Graph request, so a run could in principle keep skipping past an
+  // exhausted budget. It must not: the budget also bounds wall clock, and a section whose
+  // pages were only half visited must report `done: false` so the watermark stays put and
+  // the next run retries it.
+  const { fetched, content } = fetchRecorder();
+
+  const h = harness(
+    {
+      changed: {
+        'sec-1': [summary('p1', '2026-08-19T11:30:00Z'), summary('p2', '2026-08-19T11:30:00Z')],
+      },
+    },
+    {
+      sections: [section()],
+      pages: new Map([
+        ['p1', settledPage()],
+        ['p2', settledPage({ id: 'p2', title: 'Page p2', titleLower: 'page p2' })],
+      ]),
+    },
+    content,
+  );
+
+  // The tree and the listing exhaust it, so no page is reached at all.
+  const report = await runIncremental(h.deps, { requestBudget: 2 });
+
+  assert.deepEqual(fetched, []);
+  assert.equal(report.pagesSkipped, 0);
+  assert.equal(report.done, false);
+  assert.deepEqual(h.storeCalls.watermarks, [], 'and the section keeps its old watermark');
+});
+
 test('a section whose listing failed keeps its old watermark', async () => {
   // The next run has to retry it. Advancing here would skip every page the failed listing
   // never reported, permanently.

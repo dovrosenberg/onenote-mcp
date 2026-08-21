@@ -36,6 +36,8 @@ import {
   overlapSaveAgeMs,
   pageStampDiffers,
   planStructureWrite,
+  storedPageIsCurrent,
+  TIMESTAMP_SETTLE_MS,
   isActive,
   notebooksNeedingWideScan,
   readSelection,
@@ -43,6 +45,8 @@ import {
   sectionIdentity,
   selectionMatchesSeen,
   utf8Bytes,
+  type MirrorPage,
+  type PageStamp,
 } from '../src/mirror-schema.ts';
 
 // A real OneNote page id, shape-wise: two GUID-ish halves joined by an exclamation mark.
@@ -876,5 +880,144 @@ test('a page the old sweep stored unstamped disagrees with every live stamp', ()
   assert.equal(
     pageStampDiffers(stored, { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00Z' }),
     true,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The content-fetch skip
+// ---------------------------------------------------------------------------
+
+/** A stored page document in the state that makes the skip fire. */
+function currentPage(overrides: Partial<MirrorPage> = {}): MirrorPage {
+  return {
+    id: 'p1',
+    title: 'Page',
+    titleLower: 'page',
+    sectionId: 'sec-1',
+    notebookId: 'nb-1',
+    sectionPath: '2026 / Daily',
+    lastModifiedDateTime: '2026-08-19T12:00:00Z',
+    contentState: 'present',
+    contentHash: 'h',
+    htmlLocation: 'firestore',
+    htmlObject: null,
+    htmlBytes: 10,
+    ink: null,
+    contentSyncedAt: '2026-08-19T12:01:00Z',
+    ...overrides,
+  };
+}
+
+const LIVE: PageStamp = { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00Z' };
+
+test('storedPageIsCurrent needs an identical stamp and a settled copy', () => {
+  const stored = currentPage();
+
+  assert.equal(storedPageIsCurrent(stored, LIVE, 'sec-1'), true);
+
+  // Each of these is a way a careless simplification would answer "current" wrongly.
+  assert.equal(
+    storedPageIsCurrent(stored, { ...LIVE, lastModifiedDateTime: '2026-08-19T12:00:01Z' }, 'sec-1'),
+    false,
+    'one second later is a real edit',
+  );
+  assert.equal(
+    storedPageIsCurrent(stored, { ...LIVE, title: 'Renamed' }, 'sec-1'),
+    false,
+    'a rename changes no content and every listing',
+  );
+  assert.equal(storedPageIsCurrent(stored, LIVE, 'sec-2'), false, 'the page moved section');
+  assert.equal(
+    storedPageIsCurrent(currentPage({ contentState: 'stale' }), LIVE, 'sec-1'),
+    false,
+    'a write marked it stale',
+  );
+  assert.equal(
+    storedPageIsCurrent(currentPage({ contentState: 'missing' }), LIVE, 'sec-1'),
+    false,
+    'and a page whose content was never stored has none to serve',
+  );
+  assert.equal(
+    storedPageIsCurrent(currentPage({ contentSyncedAt: '2026-08-19T12:00:05Z' }), LIVE, 'sec-1'),
+    false,
+    'fetched five seconds after the stamp, so an edit inside that second is possible',
+  );
+  assert.equal(
+    storedPageIsCurrent(currentPage({ contentSyncedAt: undefined }), LIVE, 'sec-1'),
+    false,
+    'a document written before the field existed cannot prove it settled',
+  );
+  assert.equal(
+    storedPageIsCurrent(stored, { ...LIVE, lastModifiedDateTime: '' }, 'sec-1'),
+    false,
+    'an absent live stamp proves nothing',
+  );
+  assert.equal(
+    storedPageIsCurrent(
+      currentPage({ lastModifiedDateTime: '' }),
+      { ...LIVE, lastModifiedDateTime: '' },
+      'sec-1',
+    ),
+    false,
+    'and two absent stamps agree as strings without proving anything either',
+  );
+});
+
+test('the stamp equality is a string comparison, never a window', () => {
+  // The tempting simplification is "within a second or two is the same page", because
+  // api-overview.md records Graph reporting one unchanged page exactly one second apart on
+  // two reads. That would be the wrong repair. A window discards every real edit made
+  // inside it, and the incremental sync then advances the section watermark past that edit,
+  // so the page is never listed again and the mirror serves superseded content for ever.
+  // Disagreeing costs one Graph request and self-corrects. Do not widen this.
+  const stored = currentPage();
+
+  for (const drift of ['2026-08-19T12:00:01Z', '2026-08-19T11:59:59Z', '2026-08-19T12:00:00.000Z']) {
+    assert.equal(
+      storedPageIsCurrent(stored, { ...LIVE, lastModifiedDateTime: drift }, 'sec-1'),
+      false,
+      `${drift} is not the stored string, so the page is fetched`,
+    );
+  }
+});
+
+test('the settle guard is a strict margin measured from Graph\'s stamp', () => {
+  const at = (contentSyncedAt: string): boolean =>
+    storedPageIsCurrent(currentPage({ contentSyncedAt }), LIVE, 'sec-1');
+
+  // The stamp is 12:00:00Z, so the boundary is exactly TIMESTAMP_SETTLE_MS after it.
+  const boundary = new Date(Date.parse(LIVE.lastModifiedDateTime) + TIMESTAMP_SETTLE_MS);
+  assert.equal(at(boundary.toISOString()), false, 'the boundary itself is not settled');
+  assert.equal(at(new Date(boundary.getTime() + 1).toISOString()), true, 'one ms past it is');
+
+  // Fetched *before* Graph stamped the edit: the copy in hand predates it outright.
+  assert.equal(at('2026-08-19T11:59:00Z'), false);
+  assert.equal(at('not-a-date'), false, 'an unparseable stamp proves nothing');
+});
+
+test('the settle guard reads the Firestore timestamp shapes, not just strings', () => {
+  // contentSyncedAt is written with FieldValue.serverTimestamp() and comes back as a
+  // Timestamp object. A guard that only understood strings would answer false for every
+  // page in the real mirror, and the skip would never fire in production while every test
+  // here passed.
+  const settled = Date.parse('2026-08-19T12:01:00Z');
+
+  assert.equal(
+    storedPageIsCurrent(
+      currentPage({ contentSyncedAt: { toDate: () => new Date(settled) } }),
+      LIVE,
+      'sec-1',
+    ),
+    true,
+    'a Firestore Timestamp',
+  );
+  assert.equal(
+    storedPageIsCurrent(
+      currentPage({ contentSyncedAt: { _seconds: settled / 1000, _nanoseconds: 0 } }),
+      LIVE,
+      'sec-1',
+    ),
+    true,
+    'and its serialised form',
   );
 });
