@@ -33,6 +33,7 @@ import {
   LISTING_HOLD_EXPIRY_MS,
   notebookIdentity,
   overlapFrom,
+  pageHasDrifted,
   planStructureWrite,
   isActive,
   notebooksNeedingWideScan,
@@ -771,4 +772,40 @@ test('a plan keys its writes by the Firestore document id, not the Graph id', ()
 
   assert.deepEqual(plan.writes, []);
   assert.deepEqual(plan.deletes, [], 'and it is not read as a document the tree dropped');
+});
+
+// ---------------------------------------------------------------------------
+// Content drift
+// ---------------------------------------------------------------------------
+
+test('pageHasDrifted compares Graph against Graph, and only for a present copy', () => {
+  const stored = {
+    id: 'p1',
+    title: 'Page',
+    lastModifiedDateTime: '2026-08-19T12:00:00Z',
+    contentState: 'present' as const,
+  };
+  const live = { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00Z' };
+
+  assert.equal(pageHasDrifted(stored, live), false, 'identical stamps are not drift');
+  assert.equal(
+    pageHasDrifted(stored, { ...live, lastModifiedDateTime: '2026-08-19T12:00:01Z' }),
+    true,
+    "one second later is drift \u2014 both sides are Graph's own string",
+  );
+  assert.equal(
+    pageHasDrifted({ ...stored, contentState: 'stale' }, { ...live, lastModifiedDateTime: 'x' }),
+    false,
+    'a copy already stale has nothing to invalidate',
+  );
+  assert.equal(
+    pageHasDrifted({ ...stored, contentState: 'missing' }, { ...live, lastModifiedDateTime: 'x' }),
+    false,
+    'nor has one recorded as missing',
+  );
+  assert.equal(
+    pageHasDrifted(stored, { ...live, lastModifiedDateTime: '' }),
+    false,
+    'an absent timestamp is not evidence of a change',
+  );
 });

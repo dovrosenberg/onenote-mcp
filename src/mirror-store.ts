@@ -55,6 +55,7 @@ import {
   type MirrorNotebook,
   type MirrorPage,
   type MirrorPageContent,
+  type MirrorPageDigest,
   type MirrorSection,
   type MirrorSectionGroup,
   type MirrorSyncState,
@@ -385,13 +386,14 @@ export class MirrorStore {
     return this.#query('listing mirrored pages', query);
   }
 
-  /** Every mirrored page id in one section, for the sweep's set difference. */
-  async listPageIdsInSection(sectionId: string): Promise<string[]> {
-    const pages = await this.#query<{ id: string }>(
-      'listing mirrored page ids',
-      this.#pages().where('sectionId', '==', sectionId).select('id'),
+  /** Every stored page in one section, projected to what a sweep reconciles on. */
+  async listPageDigestsInSection(sectionId: string): Promise<MirrorPageDigest[]> {
+    return this.#query<MirrorPageDigest>(
+      'listing mirrored page digests',
+      this.#pages()
+        .where('sectionId', '==', sectionId)
+        .select('id', 'title', 'lastModifiedDateTime', 'contentState'),
     );
-    return pages.map((page) => page.id);
   }
 
   /**

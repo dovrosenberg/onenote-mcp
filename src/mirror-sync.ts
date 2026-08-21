@@ -64,10 +64,12 @@ import {
   inkmlObjectName,
   notebookIdentity,
   overlapFrom,
+  pageHasDrifted,
   sectionIdentity,
   utf8Bytes,
   type MirrorPage,
   type MirrorPageContent,
+  type MirrorPageDigest,
   type MirrorSection,
   type MirrorSectionGroup,
   type MirrorSyncState,
@@ -102,7 +104,7 @@ export interface SyncGraph {
   listContainerChildren(kind: ContainerKind, containerId: string): Promise<ContainerChildren>;
   listPagesChangedSince(sectionId: string, sinceIso: string): Promise<PageSummary[]>;
   listPagesInSection(sectionId: string, top?: number): Promise<PageSummary[]>;
-  listPageIds(sectionId: string): Promise<string[]>;
+  listPageSummaries(sectionId: string): Promise<PageSummary[]>;
 }
 
 export interface SyncContent {
@@ -132,7 +134,8 @@ export interface SyncStore {
   getPage(pageId: string): Promise<MirrorPage | null>;
   putPage(page: MirrorPage, content: MirrorPageContent | null): Promise<void>;
   deletePage(tombstone: MirrorTombstone): Promise<void>;
-  listPageIdsInSection(sectionId: string): Promise<string[]>;
+  listPageDigestsInSection(sectionId: string): Promise<MirrorPageDigest[]>;
+  markPageStale(pageId: string): Promise<void>;
 }
 
 export interface SyncDeps {
@@ -158,6 +161,8 @@ export interface SyncReport {
   readonly sectionsVisited: number;
   readonly pagesUpdated: number;
   readonly pagesDeleted: number;
+  /** Pages the sweep found changed in Graph and invalidated without re-reading. */
+  readonly pagesStaled: number;
   readonly pagesFailed: number;
   /** Selected notebook ids matching no notebook. A mistyped id is silent otherwise. */
   readonly unknownNotebookIds: number;
@@ -429,6 +434,7 @@ interface Tally {
   sectionsVisited: number;
   pagesUpdated: number;
   pagesDeleted: number;
+  pagesStaled: number;
   pagesFailed: number;
   unknownNotebookIds: number;
   unknownActiveNotebookIds: number;
@@ -461,6 +467,7 @@ async function runMode(
     sectionsVisited: 0,
     pagesUpdated: 0,
     pagesDeleted: 0,
+    pagesStaled: 0,
     pagesFailed: 0,
     unknownNotebookIds: 0,
     unknownActiveNotebookIds: 0,
@@ -501,6 +508,7 @@ async function runMode(
     sectionsVisited: tally.sectionsVisited,
     pagesUpdated: tally.pagesUpdated,
     pagesDeleted: tally.pagesDeleted,
+    pagesStaled: tally.pagesStaled,
     pagesFailed: tally.pagesFailed,
     unknownNotebookIds: tally.unknownNotebookIds,
     unknownActiveNotebookIds: tally.unknownActiveNotebookIds,
@@ -525,6 +533,7 @@ async function runMode(
     sectionsVisited: report.sectionsVisited,
     pagesUpdated: report.pagesUpdated,
     pagesDeleted: report.pagesDeleted,
+    pagesStaled: report.pagesStaled,
     pagesFailed: report.pagesFailed,
     sectionsSkippedInactive: report.sectionsSkippedInactive,
     durationMs: report.durationMs,
@@ -1272,18 +1281,18 @@ async function learnNestedGroups(ctx: PassContext): Promise<void> {
 }
 
 /**
- * One section's id reconciliation.
+ * One section's page reconciliation: deletions, content drift, and discoveries.
  *
- * **A failed enumeration deletes nothing.** An auth failure or a 500 would otherwise
- * empty the mirror one section at a time, and nothing about a deleted page is
- * recoverable from here. That is the single most important line in this file.
+ * **A failed enumeration deletes nothing and marks nothing.** An auth failure or a 500
+ * would otherwise empty the mirror one section at a time, and nothing about a deleted
+ * page is recoverable from here. That is the single most important line in this file.
  */
 async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<void> {
   ctx.budget.take();
 
-  let live: string[];
+  let live: PageSummary[];
   try {
-    live = await ctx.deps.graph.listPageIds(section.id);
+    live = await ctx.deps.graph.listPageSummaries(section.id);
   } catch (err) {
     logEvent('sync-section-failed', { sectionId: section.id, reason: reasonOf(err) });
     ctx.tally.pagesFailed += 1;
@@ -1292,28 +1301,44 @@ async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<v
 
   ctx.tally.sectionsVisited += 1;
 
-  const liveIds = new Set(live);
-  const mirrored = await ctx.deps.store.listPageIdsInSection(section.id);
+  const liveById = new Map(live.map((page) => [page.id, page]));
+  const mirrored = await ctx.deps.store.listPageDigestsInSection(section.id);
 
-  for (const pageId of mirrored) {
-    if (!liveIds.has(pageId)) await deletePage(ctx, pageId, section, 'sweep');
+  for (const stored of mirrored) {
+    const match = liveById.get(stored.id);
+
+    if (match === undefined) {
+      await deletePage(ctx, stored.id, section, 'sweep');
+      continue;
+    }
+
+    // The sweep's second job, and it costs no Graph request: a page whose stored stamp is
+    // behind Graph's is content the mirror would otherwise serve as current. Marking it
+    // stale sends the next read to Graph, which cannot be wrong. Fetching it here instead
+    // would put a content request per drifted page inside a run already sized against the
+    // hourly budget.
+    if (pageHasDrifted(stored, match)) {
+      try {
+        await ctx.deps.store.markPageStale(stored.id);
+        ctx.tally.pagesStaled += 1;
+      } catch (err) {
+        logEvent('mirror-page-failed', { pageId: stored.id, reason: reasonOf(err) });
+        ctx.tally.pagesFailed += 1;
+      }
+    }
   }
 
-  // Ids Graph has that the mirror lacks — new, or moved in. Fetched now, budget
+  // Pages Graph has that the mirror lacks — new, or moved in. Fetched now, budget
   // permitting; anything left is picked up by the next incremental, because this
   // section's watermark is deliberately not advanced here.
-  const mirroredIds = new Set(mirrored);
-  for (const pageId of live) {
-    if (mirroredIds.has(pageId)) continue;
+  const mirroredIds = new Set(mirrored.map((page) => page.id));
+  for (const page of live) {
+    if (mirroredIds.has(page.id)) continue;
     if (ctx.budget.exhausted) {
       ctx.tally.done = false;
       return;
     }
-    await syncPage(ctx, section, {
-      id: pageId,
-      title: '',
-      lastModifiedDateTime: new Date(0).toISOString(),
-    });
+    await syncPage(ctx, section, page);
   }
 
   await ctx.deps.store.setSectionSweepResult(section.id, {

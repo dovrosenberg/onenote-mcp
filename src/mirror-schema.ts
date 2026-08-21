@@ -780,6 +780,50 @@ export function timestampToIso(value: unknown): string | null {
   return null;
 }
 
+/**
+ * The three fields a page listing carries. `PageSummary` from ./graph-structure.ts
+ * satisfies it.
+ *
+ * Declared structurally rather than imported, so this module keeps its property of having
+ * no imports at all.
+ */
+export interface PageStamp {
+  readonly id: string;
+  readonly title: string;
+  readonly lastModifiedDateTime: string;
+}
+
+/**
+ * A stored page as a sweep reads it back: `PageStamp`'s three fields and the content
+ * state. `MirrorPage` satisfies it, and it is the projection
+ * `listPageDigestsInSection` asks Firestore for.
+ */
+export interface MirrorPageDigest {
+  readonly id: string;
+  readonly title: string;
+  readonly lastModifiedDateTime: string;
+  readonly contentState: ContentState;
+}
+
+/**
+ * Has Graph's copy of this page moved past the mirror's?
+ *
+ * Both sides are Graph's own string, stored verbatim and re-read, so this is a
+ * same-clock comparison and equality is the right test. A tolerance here would swallow a
+ * real edit, and the sweep is the last thing that would ever notice it.
+ *
+ * A copy that is not `present` is already a miss for every read, so there is nothing to
+ * invalidate. An empty live stamp is `toPageSummary`'s fallback for an absent field,
+ * which is not evidence of anything.
+ */
+export function pageHasDrifted(stored: MirrorPageDigest, live: PageStamp): boolean {
+  return (
+    stored.contentState === 'present' &&
+    live.lastModifiedDateTime !== '' &&
+    stored.lastModifiedDateTime !== live.lastModifiedDateTime
+  );
+}
+
 export interface MirrorPageContent {
   readonly pageId: string;
   /** Raw and untrimmed. `trimPageHtml` runs at read time so the trimmer can change. */

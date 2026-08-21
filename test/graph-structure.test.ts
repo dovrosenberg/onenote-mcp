@@ -757,43 +757,62 @@ test('listPagesChangedSince does no date arithmetic of its own', async () => {
   assert.ok(calls[0]!.url.includes(encodeURIComponent(sinceIso)));
 });
 
-test('listPageIds asks for ids only and follows every nextLink to the end', async () => {
+test('listPageSummaries asks for the three fields and follows every nextLink', async () => {
   // A sweep that stopped early would report pages as deleted that are merely past the
   // cutoff, which is the one mistake here that destroys data. So there is no `top`
   // argument and no bound but @odata.nextLink running out.
-  const first = `${GRAPH_ROOT}/me/onenote/sections/s-1/pages?$select=id&$top=100`;
+  const first =
+    `${GRAPH_ROOT}/me/onenote/sections/s-1/pages?$select=id,title,lastModifiedDateTime&$top=100`;
   const next = `${GRAPH_ROOT}/me/onenote/sections/s-1/pages?$skiptoken=abc`;
 
   const { fetchImpl, calls } = fakeFetch({
     [first]: () =>
       json({
-        value: Array.from({ length: 100 }, (_unused, index) => ({ id: `p-${index}` })),
+        value: Array.from({ length: 100 }, (_unused, index) => ({
+          id: `p-${index}`,
+          title: `Page ${index}`,
+          lastModifiedDateTime: '2026-08-19T11:00:00Z',
+        })),
         '@odata.nextLink': next,
       }),
-    [next]: () => json({ value: [{ id: 'p-100' }, { id: 'p-101' }] }),
+    [next]: () =>
+      json({
+        value: [
+          { id: 'p-100', title: 'Hundred', lastModifiedDateTime: '2026-08-19T12:00:00Z' },
+          { id: 'p-101', title: 'Hundred and one', lastModifiedDateTime: '2026-08-19T13:00:00Z' },
+        ],
+      }),
   });
 
-  const ids = await new GraphStructure(tokens, fetchImpl).listPageIds('s-1');
+  const pages = await new GraphStructure(tokens, fetchImpl).listPageSummaries('s-1');
 
   assert.equal(calls.length, 2);
-  assert.equal(ids.length, 102);
-  assert.equal(ids[0], 'p-0');
-  assert.equal(ids[101], 'p-101');
-  // Nothing but the id is asked for: the caller compares id sets and reads no other
-  // field, and a title in this response would be user content the sweep never needs.
-  assert.ok(calls.every((call) => !call.url.includes('title')));
+  assert.equal(pages.length, 102);
+  assert.deepEqual(pages[0], {
+    id: 'p-0',
+    title: 'Page 0',
+    lastModifiedDateTime: '2026-08-19T11:00:00Z',
+  });
+  // The title and the timestamp are why this is not `$select=id`: the sweep has no other
+  // source for a discovered page's title, and no other way to notice content drift.
+  assert.deepEqual(pages[101], {
+    id: 'p-101',
+    title: 'Hundred and one',
+    lastModifiedDateTime: '2026-08-19T13:00:00Z',
+  });
 });
 
-test('listPageIds rejects an item with no usable id rather than dropping it', async () => {
+test('listPageSummaries rejects an item with no usable id rather than dropping it', async () => {
   // A dropped id reads as "this page is gone" and deletes the mirrored copy. Failing the
   // whole sweep for that section is the safe direction.
-  const url = `${GRAPH_ROOT}/me/onenote/sections/s-1/pages?$select=id&$top=100`;
+  const url =
+    `${GRAPH_ROOT}/me/onenote/sections/s-1/pages?$select=id,title,lastModifiedDateTime&$top=100`;
   const { fetchImpl } = fakeFetch({
     [url]: () => json({ value: [{ id: 'p-1' }, { title: 'no id here' }] }),
   });
 
   await assert.rejects(
-    () => new GraphStructure(tokens, fetchImpl).listPageIds('s-1'),
+    () => new GraphStructure(tokens, fetchImpl).listPageSummaries('s-1'),
     GraphResponseError,
   );
 });

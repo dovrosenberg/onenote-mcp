@@ -226,7 +226,9 @@ section at a time; a section whose page listing failed keeps its old watermark, 
 next run retries it rather than skipping every page it never reached; a budget-exhausted
 run keeps the advances it earned, because the backfill is five hours of slices; and an
 unchanged content hash writes nothing and renders no ink, which is what makes the hour of
-watermark overlap nearly free. What no test there covers is whether Graph's timestamps
+watermark overlap nearly free; and a sweep that found a page drifted marks it stale
+without fetching it, so the check that closes the permanent-staleness hole costs no Graph
+request. What no test there covers is whether Graph's timestamps
 behave as the algorithm assumes — that a page create, edit and delete each move the
 section's `lastModifiedDateTime` is measured in `api-overview.md`, not checked here.
 
@@ -1025,6 +1027,25 @@ such section". Both `_by_name` reading tools retry the whole resolve-and-list ag
 Graph before reporting. The retry costs one request and only on a failure, and a name that
 exists nowhere still raises.
 
+**The sweep enumerates page summaries, not page ids, and the extra two fields do two
+jobs.** `listPageSummaries` asks for `$select=id,title,lastModifiedDateTime` on a request
+the sweep was making anyway, so the fields are free. `title` is what a discovered page is
+stored with — before this the sweep synthesized `''` and `1970-01-01T00:00:00.000Z`, and
+both reach the calling model: `lastModifiedDateTime` is printed in every tool result and
+`titleLower` is what by-name matching compares. Neither self-heals, because a page moved
+into a section may not have its own timestamp bumped by the move, so no later incremental
+lists it. `lastModifiedDateTime` is what makes `pageHasDrifted` in `src/mirror-schema.ts`
+possible: a page in both places whose stamps differ is marked stale rather than fetched,
+which is the only thing in this repository that notices an edit made in the OneNote client
+that the incremental pass missed. Marking rather than fetching is the point — a content
+request per drifted page would sit inside a run already sized against the hourly 400,
+where a stale marker sends the next read to Graph and costs nothing here. The comparison
+is equality on two strings Graph itself wrote, so a tolerance would swallow a real edit;
+an empty live stamp is `toPageSummary`'s fallback for an absent field and is not treated
+as a change; and a stored copy that is not `present` is skipped, because it is already a
+miss for every read and re-marking it would be a Firestore write per already-stale page on
+every nightly sweep.
+
 **An inactive notebook is backfilled once and then never re-listed.** `activeNotebookIds`
 in the selection document names which mirrored notebooks a sync still re-checks; absent or
 malformed means all of them, and `[]` means none — which is why `NotebookSelection` holds
@@ -1032,7 +1053,7 @@ malformed means all of them, and `[]` means none — which is why `NotebookSelec
 in `src/mirror-sync.ts` is the one place the filter is written, and `includeBackfill` is
 what makes the backfill run exactly once: a section with `pagesSyncedThrough === null` is
 eligible whatever its notebook's activity. A sweep passes false, because a sweep reconciles
-page ids against a section that is already filled. `sweep-all` skips the filter entirely and
+a section that is already filled rather than filling one. `sweep-all` skips the filter entirely and
 is the only thing that reaches a frozen notebook, which is what it is for.
 
 **`active` stays out of `structureHashOf` and off the section documents, and that is not
@@ -1085,8 +1106,8 @@ stored in `wideScanNotebookIds` rather than held for one run, because a run is
 budget-bounded and may stop with sections outstanding; it is cleared in the same block that
 advances `sectionsScannedThrough` and on exactly that condition, because a run stopped by
 its budget has not visited what it was widened for. `sweepPass` reads the set and never
-clears it — a sweep reconciles page ids rather than resuming a watermark, so it is not what
-the widening is waiting for. A run that read no tree records nothing at all:
+clears it — a sweep reconciles a section's pages rather than resuming a watermark, so it is
+not what the widening is waiting for. A run that read no tree records nothing at all:
 `mirroredNotebookIds` is empty there, so an `activeNotebookIds` of `null` would resolve to
 "nothing is active", widen nothing, and still record `activeNotebookIdsSeen: null` — and
 the next healthy run would diff `null` against `null` and never widen the notebook the

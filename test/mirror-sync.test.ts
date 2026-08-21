@@ -47,6 +47,7 @@ import {
   sectionIdentity,
   type MirrorPage,
   type MirrorPageContent,
+  type MirrorPageDigest,
   type MirrorNotebook,
   type MirrorSection,
   type MirrorSectionGroup,
@@ -138,6 +139,17 @@ function summary(id: string, modified = '2026-08-19T11:30:00Z'): PageSummary {
   return { id, title: `Page ${id}`, lastModifiedDateTime: modified };
 }
 
+/**
+ * A stored page as the sweep reads it back.
+ *
+ * The default timestamp is `summary`'s, so a page seeded in both places is *not* drifted
+ * unless a test says so — every sweep test written before drift existed asserts about
+ * deletion and discovery, and a mismatching default would add a stale mark to all of them.
+ */
+function digest(id: string, modified = '2026-08-19T11:30:00Z'): MirrorPageDigest {
+  return { id, title: `Page ${id}`, lastModifiedDateTime: modified, contentState: 'present' };
+}
+
 // ---------------------------------------------------------------------------
 // Fakes
 // ---------------------------------------------------------------------------
@@ -150,7 +162,7 @@ interface GraphScript {
    */
   tree?: ExpandedNotebook[] | (() => ExpandedNotebook[]);
   changed?: Record<string, PageSummary[] | (() => never)>;
-  ids?: Record<string, string[] | (() => never)>;
+  summaries?: Record<string, PageSummary[] | (() => never)>;
   children?: ContainerChildren;
 }
 
@@ -158,12 +170,18 @@ interface GraphCalls {
   tree: number;
   changedSince: string[];
   unfiltered: string[];
-  pageIds: string[];
+  pageSummaries: string[];
   children: string[];
 }
 
 function fakeGraph(script: GraphScript): { graph: SyncDeps['graph']; calls: GraphCalls } {
-  const calls: GraphCalls = { tree: 0, changedSince: [], unfiltered: [], pageIds: [], children: [] };
+  const calls: GraphCalls = {
+    tree: 0,
+    changedSince: [],
+    unfiltered: [],
+    pageSummaries: [],
+    children: [],
+  };
 
   // A scripted value, or a thunk called for it. A thunk that throws simulates a Graph
   // failure; one that returns lets a test change the answer between runs.
@@ -191,9 +209,9 @@ function fakeGraph(script: GraphScript): { graph: SyncDeps['graph']; calls: Grap
         calls.unfiltered.push(sectionId);
         return Promise.resolve(resolve(script.changed?.[sectionId], []));
       },
-      listPageIds: (sectionId) => {
-        calls.pageIds.push(sectionId);
-        return Promise.resolve(resolve(script.ids?.[sectionId], []));
+      listPageSummaries: (sectionId) => {
+        calls.pageSummaries.push(sectionId);
+        return Promise.resolve(resolve(script.summaries?.[sectionId], []));
       },
     },
   };
@@ -216,7 +234,7 @@ interface StoreState {
   sections: StoredSection[];
   groups: StoredSectionGroup[];
   pages: Map<string, MirrorPage>;
-  pageIdsBySection: Map<string, string[]>;
+  digestsBySection: Map<string, MirrorPageDigest[]>;
 }
 
 interface StoreCalls {
@@ -224,6 +242,7 @@ interface StoreCalls {
   patches: Partial<MirrorSyncState>[];
   puts: { page: MirrorPage; hasContent: boolean }[];
   deletes: MirrorTombstone[];
+  staled: string[];
   structures: number;
   /** One entry per structure document actually written. A skipped one is absent. */
   structureWrites: { id: string }[];
@@ -295,7 +314,7 @@ function fakeStore(initial: Partial<StoreState> = {}): {
     sections: [section()],
     groups: [],
     pages: new Map(),
-    pageIdsBySection: new Map(),
+    digestsBySection: new Map(),
     ...initial,
   };
 
@@ -304,6 +323,7 @@ function fakeStore(initial: Partial<StoreState> = {}): {
     patches: [],
     puts: [],
     deletes: [],
+    staled: [],
     structures: 0,
     structureWrites: [],
     structureResets: [],
@@ -375,8 +395,22 @@ function fakeStore(initial: Partial<StoreState> = {}): {
       calls.deletes.push(tombstone);
       return Promise.resolve();
     },
-    listPageIdsInSection: (sectionId) =>
-      Promise.resolve(data.pageIdsBySection.get(sectionId) ?? []),
+    listPageDigestsInSection: (sectionId) =>
+      Promise.resolve(data.digestsBySection.get(sectionId) ?? []),
+    // The effect is applied, not merely recorded: the digest a later
+    // `listPageDigestsInSection` reads back comes out `contentState: 'stale'`. A fake
+    // that only pushed to `staled` would let "a second sweep does not re-mark a page the
+    // first one staled" pass against a mirror that had forgotten the mark.
+    markPageStale: (pageId) => {
+      calls.staled.push(pageId);
+      for (const [sectionId, digests] of data.digestsBySection) {
+        data.digestsBySection.set(
+          sectionId,
+          digests.map((d) => (d.id === pageId ? { ...d, contentState: 'stale' } : d)),
+        );
+      }
+      return Promise.resolve();
+    },
   };
 
   return { store, calls, data };
@@ -1047,7 +1081,7 @@ test('an edit is still noticed after the structure has stopped changing', async 
     // `graphCalls.tree` still counts. The stored hash matches nothing, so the first run
     // writes the structure and the section's timestamp reaches the store the only way it
     // ever does.
-    { tree, ids: {} },
+    { tree, summaries: {} },
     {
       sections: [],
       state: { ...initialSyncState(), structureHash: 'written-under-an-older-tree' },
@@ -1437,21 +1471,21 @@ test('a scoped and a full sweep skip inactive sections; sweep-all visits them', 
     sections: [otherSection()],
     state: { ...initialSyncState(), sectionsScannedThrough: '2020-01-01T00:00:00.000Z' },
   };
-  const script = { tree: TREE, ids: { 'sec-other': [] } };
+  const script = { tree: TREE, summaries: { 'sec-other': [] } };
 
   const scoped = harness(script, structuredClone(init));
   await runSweep(scoped.deps, BUDGET);
-  assert.deepEqual(scoped.graphCalls.pageIds, []);
+  assert.deepEqual(scoped.graphCalls.pageSummaries, []);
 
   const full = harness(script, structuredClone(init));
   await runFullSweep(full.deps, BUDGET);
-  assert.deepEqual(full.graphCalls.pageIds, []);
+  assert.deepEqual(full.graphCalls.pageSummaries, []);
 
   // The only thing that reaches a frozen notebook, which is what it is for: nothing else
   // would ever notice a page deleted there in the OneNote client.
   const all = harness(script, structuredClone(init));
   const report = await runSweepAll(all.deps, BUDGET);
-  assert.deepEqual(all.graphCalls.pageIds, ['sec-other']);
+  assert.deepEqual(all.graphCalls.pageSummaries, ['sec-other']);
   assert.equal(report.mode, 'sweep-all');
   assert.equal(report.sectionsSkippedInactive, 0);
 });
@@ -1732,7 +1766,7 @@ test('a scoped sweep visits a widened notebook, and does not clear the set', asy
   // the set and never clears it: only a completed incremental run has visited what the
   // widening is for.
   const h = harness(
-    { tree: TWO_NOTEBOOKS, ids: { 'sec-other': [], 'sec-1': [] } },
+    { tree: TWO_NOTEBOOKS, summaries: { 'sec-other': [], 'sec-1': [] } },
     {
       selection: sel([NB, NB2], [NB, NB2]),
       sections: staleSections(),
@@ -1746,7 +1780,7 @@ test('a scoped sweep visits a widened notebook, and does not clear the set', asy
 
   await runSweep(h.deps, BUDGET);
 
-  assert.deepEqual(h.graphCalls.pageIds, ['sec-other']);
+  assert.deepEqual(h.graphCalls.pageSummaries, ['sec-other']);
   assert.equal(
     h.storeCalls.patches.some((p) => p.wideScanNotebookIds !== undefined),
     false,
@@ -1829,8 +1863,8 @@ test('a resync writes a page in an inactive notebook', async () => {
 // ---------------------------------------------------------------------------
 
 test('the sweep deletes exactly the ids Graph no longer returns', async () => {
-  const h = harness({ tree: TREE, ids: { 'sec-1': ['p-1', 'p-2'] } });
-  h.data.pageIdsBySection.set('sec-1', ['p-1', 'p-2', 'p-gone']);
+  const h = harness({ tree: TREE, summaries: { 'sec-1': [summary('p-1'), summary('p-2')] } });
+  h.data.digestsBySection.set('sec-1', [digest('p-1'), digest('p-2'), digest('p-gone')]);
 
   const report = await runSweep(h.deps, BUDGET);
 
@@ -1847,13 +1881,13 @@ test('a failed enumeration deletes NOTHING', async () => {
   for (const status of [401, 429, 500, 503]) {
     const h = harness({
       tree: TREE,
-      ids: {
+      summaries: {
         'sec-1': () => {
           throw graphError(status);
         },
       },
     });
-    h.data.pageIdsBySection.set('sec-1', ['p-1', 'p-2', 'p-3']);
+    h.data.digestsBySection.set('sec-1', [digest('p-1'), digest('p-2'), digest('p-3')]);
 
     const report = await runSweep(h.deps, BUDGET);
 
@@ -1866,8 +1900,8 @@ test('a failed enumeration deletes NOTHING', async () => {
 test('an empty enumeration on a section that really is empty still deletes', async () => {
   // The guard above is on the *failure*, not on emptiness. A section whose pages were all
   // deleted must be reconciled, or the mirror keeps them forever.
-  const h = harness({ tree: TREE, ids: { 'sec-1': [] } });
-  h.data.pageIdsBySection.set('sec-1', ['p-1']);
+  const h = harness({ tree: TREE, summaries: { 'sec-1': [] } });
+  h.data.digestsBySection.set('sec-1', [digest('p-1')]);
 
   const report = await runSweep(h.deps, BUDGET);
 
@@ -1878,8 +1912,8 @@ test('the sweep queues ids Graph has that the mirror lacks', async () => {
   // A page moved *into* a mirrored section may not have its own lastModifiedDateTime
   // bumped by the move — the same class of unknown as the section roll-up — so without
   // this it would be invisible until someone next edited it.
-  const h = harness({ tree: TREE, ids: { 'sec-1': ['p-1', 'p-new'] } });
-  h.data.pageIdsBySection.set('sec-1', ['p-1']);
+  const h = harness({ tree: TREE, summaries: { 'sec-1': [summary('p-1'), summary('p-new')] } });
+  h.data.digestsBySection.set('sec-1', [digest('p-1')]);
 
   const report = await runSweep(h.deps, BUDGET);
 
@@ -1888,10 +1922,105 @@ test('the sweep queues ids Graph has that the mirror lacks', async () => {
   assert.deepEqual(h.storeCalls.deletes, []);
 });
 
+test('the sweep stores a discovered page with its real title and timestamp', async () => {
+  // Before listPageSummaries the sweep synthesized title '' and 1970-01-01 here, and
+  // neither self-heals: both fields reach the calling model, and a page moved into a
+  // section may not have its own timestamp bumped by the move, so no later incremental
+  // lists it.
+  const h = harness(
+    { summaries: { 'sec-1': [summary('new-page', '2026-08-19T11:45:00Z')] } },
+    { sections: [section()] },
+  );
+
+  await runFullSweep(h.deps, BUDGET);
+
+  const written = h.storeCalls.puts.find((p) => p.page.id === 'new-page');
+  assert.ok(written, 'the page Graph has and the mirror lacks must be fetched');
+  assert.equal(written.page.title, 'Page new-page');
+  assert.equal(written.page.lastModifiedDateTime, '2026-08-19T11:45:00Z');
+});
+
+test('the sweep marks a drifted page stale and spends no Graph request on it', async () => {
+  // The page is in both places, so the sweep neither deletes nor fetches it. All it can
+  // do — and all it needs to do — is send the next read to Graph.
+  const h = harness(
+    { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:00Z')] } },
+    {
+      sections: [section()],
+      digestsBySection: new Map([['sec-1', [digest('p1', '2026-08-19T11:00:00Z')]]]),
+    },
+  );
+
+  await runFullSweep(h.deps, BUDGET);
+
+  assert.deepEqual(h.storeCalls.staled, ['p1']);
+  assert.deepEqual(h.storeCalls.puts, [], 'a drift check costs no fetch and no write');
+  assert.deepEqual(h.storeCalls.deletes, []);
+});
+
+test('a page whose stored copy is already stale is not marked again', async () => {
+  // Not tidiness: a Firestore write per already-stale page, on every nightly sweep, for
+  // as long as nothing re-reads it.
+  const h = harness(
+    { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:00Z')] } },
+    {
+      sections: [section()],
+      digestsBySection: new Map([
+        ['sec-1', [{ ...digest('p1', '2026-08-19T11:00:00Z'), contentState: 'stale' as const }]],
+      ]),
+    },
+  );
+
+  await runFullSweep(h.deps, BUDGET);
+
+  assert.deepEqual(h.storeCalls.staled, []);
+});
+
+test('a second sweep does not re-mark a page the first one staled', async () => {
+  // The same property as the test above, reached through the real transition rather than
+  // a hand-seeded `contentState`. Nothing clears the stale mark until a read or an
+  // incremental re-fetches the page, so without the `present` check every nightly sweep
+  // would spend a Firestore write per drifted page for as long as it stayed unread.
+  const h = harness(
+    { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:00Z')] } },
+    {
+      sections: [section()],
+      digestsBySection: new Map([['sec-1', [digest('p1', '2026-08-19T11:00:00Z')]]]),
+    },
+  );
+
+  await runFullSweep(h.deps, BUDGET);
+  assert.deepEqual(h.storeCalls.staled, ['p1']);
+
+  await runFullSweep(h.deps, BUDGET);
+  assert.deepEqual(h.storeCalls.staled, ['p1'], 'the second run finds it already stale');
+});
+
+test('a sweep whose enumeration failed marks nothing stale', async () => {
+  const h = harness(
+    {
+      summaries: {
+        'sec-1': () => {
+          throw graphError(500);
+        },
+      },
+    },
+    {
+      sections: [section()],
+      digestsBySection: new Map([['sec-1', [digest('p1', '2026-08-19T11:00:00Z')]]]),
+    },
+  );
+
+  await runFullSweep(h.deps, BUDGET);
+
+  assert.deepEqual(h.storeCalls.deletes, [], 'a failed enumeration deletes nothing');
+  assert.deepEqual(h.storeCalls.staled, [], 'and marks nothing stale either');
+});
+
 test('the sweep does not advance a section watermark', async () => {
   // Anything it could not fetch inside the budget has to be picked up by the next
   // incremental, which only happens if the watermark stays where it is.
-  const h = harness({ tree: TREE, ids: { 'sec-1': ['p-new'] } });
+  const h = harness({ tree: TREE, summaries: { 'sec-1': [summary('p-new')] } });
 
   await runSweep(h.deps, BUDGET);
 
@@ -1900,7 +2029,7 @@ test('the sweep does not advance a section watermark', async () => {
 });
 
 test('a budget-exhausted sweep records where to resume', async () => {
-  const h = harness({ tree: TREE, ids: { 'sec-1': [], 'sec-2': [] } });
+  const h = harness({ tree: TREE, summaries: { 'sec-1': [], 'sec-2': [] } });
   h.data.sections = [section({ id: 'sec-1' }), section({ id: 'sec-2', path: '2026 / Other' })];
 
   // tree + sec-1's enumeration = 2, leaving nothing for sec-2.
@@ -1918,13 +2047,13 @@ test('a scoped sweep visits only moved sections; a full sweep visits all of them
   const stale = section({ id: 'still', graphLastModifiedDateTime: '2020-01-01T00:00:00Z' });
   const state = { ...initialSyncState(), sectionsScannedThrough: '2026-08-19T11:00:00.000Z' };
 
-  const scoped = harness({ ids: { still: [] } }, { sections: [stale], state });
+  const scoped = harness({ summaries: { still: [] } }, { sections: [stale], state });
   await runSweep(scoped.deps, BUDGET);
-  assert.deepEqual(scoped.graphCalls.pageIds, [], 'nothing moved, so nothing is swept');
+  assert.deepEqual(scoped.graphCalls.pageSummaries, [], 'nothing moved, so nothing is swept');
 
-  const full = harness({ ids: { still: [] } }, { sections: [stale], state });
+  const full = harness({ summaries: { still: [] } }, { sections: [stale], state });
   await runFullSweep(full.deps, BUDGET);
-  assert.deepEqual(full.graphCalls.pageIds, ['still'], 'the weekly backstop visits everything');
+  assert.deepEqual(full.graphCalls.pageSummaries, ['still'], 'the weekly backstop visits everything');
 });
 
 test('a scoped sweep visits a section whose timestamp moved only in the live tree', async () => {
@@ -1947,7 +2076,7 @@ test('a scoped sweep visits a section whose timestamp moved only in the live tre
   // The stored hash matches the *shape*, which the timestamps are excluded from, so the
   // run reads the tree and writes nothing — exactly the steady state the bug lived in.
   const h = harness(
-    { tree: moved, ids: { still: [] } },
+    { tree: moved, summaries: { still: [] } },
     {
       sections: [stale],
       state: { ...state, structureHash: structureHashOf(buildStructure(moved, sel([NB]))) },
@@ -1957,7 +2086,7 @@ test('a scoped sweep visits a section whose timestamp moved only in the live tre
   await runSweep(h.deps, BUDGET);
 
   assert.equal(h.storeCalls.structures, 0, 'no rewrite, so nothing refreshed the stored copy');
-  assert.deepEqual(h.graphCalls.pageIds, ['still'], 'and the section is swept anyway');
+  assert.deepEqual(h.graphCalls.pageSummaries, ['still'], 'and the section is swept anyway');
 });
 
 test('the sweep learns the nested section groups $expand could not reach', async () => {
