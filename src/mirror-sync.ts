@@ -8,10 +8,13 @@
 // was sized against — 5 notebooks, 40 sections, 2000 pages — a quiet day is 1 request and
 // a busy one is about 11.
 //
-// **Sweep** enumerates page ids per section and reconciles them against the mirror, which
-// is the only way a deletion is ever noticed: Graph has no /delta on any OneNote resource
-// and no tombstone for a deleted page, and the account-wide page list that would
-// enumerate everything cheaply is the banned one, error 20266.
+// **Sweep** enumerates each section's pages — id, title and stamp, for one request — and
+// reconciles them against the mirror. It does two jobs. It is the only way a deletion is
+// ever noticed: Graph has no /delta on any OneNote resource and no tombstone for a
+// deleted page, and the account-wide page list that would enumerate everything cheaply is
+// the banned one, error 20266. It is also the only thing that notices a page edited in
+// the OneNote client that the incremental pass missed — a stored stamp behind Graph's is
+// marked stale, which sends the next read to Graph and costs no request here.
 //
 // Everything below follows from four things measured against the real account:
 //
@@ -65,6 +68,7 @@ import {
   notebookIdentity,
   overlapFrom,
   pageHasDrifted,
+  pageNeedsRefetch,
   sectionIdentity,
   utf8Bytes,
   type MirrorPage,
@@ -1192,13 +1196,14 @@ async function deletePage(
 // ---------------------------------------------------------------------------
 
 /**
- * Enumerate page ids per section and reconcile them against the mirror.
+ * Enumerate each section's pages and reconcile them against the mirror: deletions,
+ * content drift, and discoveries.
  *
  * `unscoped` false sweeps only sections whose timestamp moved since the last sweep,
  * which the probe supports — a delete moves it. `unscoped` true sweeps every mirrored
  * section, and is the weekly backstop against the timestamp missing something.
  *
- * The sweep also queues ids Graph has that the mirror lacks. A page *moved into* a
+ * The sweep also queues pages Graph has that the mirror lacks. A page *moved into* a
  * mirrored section may not have its own `lastModifiedDateTime` bumped by the move — the
  * same class of unknown as the section roll-up — so without this it would be invisible
  * until someone next edited it.
@@ -1215,9 +1220,8 @@ async function sweepPass(
 
   const stored = await ctx.deps.store.listSectionsToSync();
 
-  // `includeBackfill` is false: a sweep reconciles page ids against a section it has
-  // already filled, and a never-synced section in an inactive notebook is the
-  // incremental pass's job. `sweep-all` skips the filter entirely, which is what it is
+  // `includeBackfill` is false: a sweep reconciles a section it has already filled, and a
+  // never-synced section in an inactive notebook is the incremental pass's job. `sweep-all` skips the filter entirely, which is what it is
   // for.
   let all = stored;
   if (activeOnly) {
@@ -1231,8 +1235,8 @@ async function sweepPass(
     : pickCandidates(all, structure.liveMtimes, {
         state: ctx.state,
         mayFilterByTimestamp: ctx.tally.treeRead,
-        // Read, never cleared: a sweep reconciles page ids rather than resuming a
-        // watermark, so it is not what the widening is waiting for.
+        // Read, never cleared: a sweep reconciles a section's pages against Graph rather
+        // than resuming a watermark, so it is not what the widening is waiting for.
         wideScanNotebookIds: new Set(ctx.state.wideScanNotebookIds),
       });
 
@@ -1305,10 +1309,35 @@ async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<v
   const mirrored = await ctx.deps.store.listPageDigestsInSection(section.id);
 
   for (const stored of mirrored) {
+    // Bounded, like the discovery loop below it, and for a cost the request budget does
+    // not otherwise see: a deletion is two Firestore writes, a stale mark is one plus a
+    // document delete, and a repair spends a Graph request as well. The first sweep after
+    // a deploy is when all three are most widespread. An early return skips
+    // `setSectionSweepResult`, so this section is not recorded as swept, and `done: false`
+    // is what makes the run report `budget-exhausted` rather than a clean pass.
+    if (ctx.budget.exhausted) {
+      ctx.tally.done = false;
+      return;
+    }
+
     const match = liveById.get(stored.id);
 
     if (match === undefined) {
       await deletePage(ctx, stored.id, section, 'sweep');
+      continue;
+    }
+
+    // Matched, so it is not a discovery. Removing it leaves `liveById` holding exactly
+    // the pages Graph has that the mirror lacks, which is what the loop below wants.
+    liveById.delete(stored.id);
+
+    // A page the pre-2026-08-21 sweep discovered carries `title: ''` and the epoch, and a
+    // stale mark repairs neither — it drops the content document and leaves the wrong
+    // title answering `list_pages`. The epoch is behind every live stamp, so these are
+    // exactly the documents the drift branch below would otherwise gut. Re-fetching costs
+    // one Graph request, once per document.
+    if (pageNeedsRefetch(stored)) {
+      await syncPage(ctx, section, match);
       continue;
     }
 
@@ -1317,23 +1346,23 @@ async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<v
     // stale sends the next read to Graph, which cannot be wrong. Fetching it here instead
     // would put a content request per drifted page inside a run already sized against the
     // hourly budget.
-    if (pageHasDrifted(stored, match)) {
-      try {
-        await ctx.deps.store.markPageStale(stored.id);
-        ctx.tally.pagesStaled += 1;
-      } catch (err) {
-        logEvent('mirror-page-failed', { pageId: stored.id, reason: reasonOf(err) });
-        ctx.tally.pagesFailed += 1;
-      }
-    }
+    //
+    // One case fires here that did not need to, and it is left knowingly:
+    // `writePageFromRaw`'s short-circuit compares the content hash, the title and the
+    // section and never writes `lastModifiedDateTime`, so a page the incremental re-read
+    // and found unchanged keeps its old stamp while Graph's moves. Its content is current
+    // and it is marked stale anyway — correct, and one wasted content fetch on the next
+    // read of it. Task 5 of
+    // `docs/superpowers/plans/2026-08-20-sync-graph-call-reduction.md` closes it by having
+    // the short-circuit call `MirrorStore.putPageMetadata`, which exists and is called
+    // from nowhere today.
+    if (pageHasDrifted(stored, match)) await markDrifted(ctx, stored.id);
   }
 
   // Pages Graph has that the mirror lacks — new, or moved in. Fetched now, budget
   // permitting; anything left is picked up by the next incremental, because this
   // section's watermark is deliberately not advanced here.
-  const mirroredIds = new Set(mirrored.map((page) => page.id));
-  for (const page of live) {
-    if (mirroredIds.has(page.id)) continue;
+  for (const page of liveById.values()) {
     if (ctx.budget.exhausted) {
       ctx.tally.done = false;
       return;
@@ -1345,6 +1374,25 @@ async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<v
     pageCount: live.length,
     lastSweptAt: ctx.startedAtIso,
   });
+}
+
+/**
+ * Mark one page's stored content stale, and keep sweeping if Firestore refuses.
+ *
+ * The `catch` is not the write path's "a failed invalidation never fails a write" — there
+ * is no write here to protect. It is that this sweep is the only pass that reconciles
+ * deletions, and one section's Firestore failure must not cost every section after it its
+ * deletion pass. The page is counted into `pagesFailed`, so the run does not report a
+ * clean pass over a section it left in an unknown state.
+ */
+async function markDrifted(ctx: PassContext, pageId: string): Promise<void> {
+  try {
+    await ctx.deps.store.markPageStale(pageId);
+    ctx.tally.pagesStaled += 1;
+  } catch (err) {
+    logEvent('mirror-page-failed', { pageId, reason: reasonOf(err) });
+    ctx.tally.pagesFailed += 1;
+  }
 }
 
 /** A reason string for a log line. Never a message, which can carry a request body. */

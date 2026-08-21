@@ -9,10 +9,10 @@
 //
 // **It is the incremental sync, not a sweep.** `runIncremental` costs one Graph request
 // when nothing has changed — the expanded tree — plus one per changed section and one per
-// changed page. A sweep enumerates page ids section by section and a full sweep visits
-// every selected section regardless of timestamps; either would take tens of seconds and
-// tens of requests on a tool call a human is waiting on. Deletions are still the sweep's
-// job, on the scheduler, which is unchanged.
+// changed page. A sweep enumerates every page of a section, section by section, and a
+// full sweep visits every selected section regardless of timestamps; either would take
+// tens of seconds and tens of requests on a tool call a human is waiting on. Deletions
+// and drift marking are still the sweep's job, on the scheduler, which is unchanged.
 //
 // **Everything here is bounded twice, and the second bound is the one that matters.**
 // The per-run budget caps what one refresh may spend. The interval caps how often a
@@ -98,8 +98,10 @@ export interface ReadSync {
  * - `treeRead`, because a failed expanded-tree read is *not* fatal to a sync — it carries
  *   on against the structure already in Firestore — and a notebook or section created
  *   since the last successful tree read is absent from that structure.
- * - `pagesFailed` zero, because a page whose content fetch failed keeps whatever copy the
- *   mirror already held.
+ * - `pagesFailed` zero. It counts three things, and each leaves part of the mirror where
+ *   it was: a page whose content fetch failed keeps whatever copy was stored, a section
+ *   whose page enumeration failed is reconciled not at all, and a stale mark Firestore
+ *   refused leaves a superseded copy looking current.
  *
  * Exported so the rule is asserted directly rather than through a fake sync.
  */

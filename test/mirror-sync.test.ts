@@ -1761,8 +1761,9 @@ test('a run that read no tree records no selection, so the next one still widens
 });
 
 test('a scoped sweep visits a widened notebook, and does not clear the set', async () => {
-  // The sweep is what reconciles page ids, so a widened notebook it skipped would leave
-  // pages deleted while it was frozen in the mirror with nothing to notice them. It reads
+  // The sweep is what reconciles a section's pages against Graph, so a widened notebook it
+  // skipped would leave pages deleted while it was frozen in the mirror with nothing to
+  // notice them. It reads
   // the set and never clears it: only a completed incremental run has visited what the
   // widening is for.
   const h = harness(
@@ -1951,10 +1952,38 @@ test('the sweep marks a drifted page stale and spends no Graph request on it', a
     },
   );
 
-  await runFullSweep(h.deps, BUDGET);
+  const report = await runFullSweep(h.deps, BUDGET);
 
   assert.deepEqual(h.storeCalls.staled, ['p1']);
+  assert.equal(report.pagesStaled, 1, 'the counter is the only thing that reports this');
   assert.deepEqual(h.storeCalls.puts, [], 'a drift check costs no fetch and no write');
+  assert.deepEqual(h.storeCalls.deletes, []);
+});
+
+test('a page stored later than Graph is a resync stamp, and keeps its content', async () => {
+  // `resyncPage` stamps `lastModifiedDateTime` from this process's clock after the write
+  // returns, so every page written through this server is stored *ahead* of the stamp
+  // Graph recorded for the same edit. `markPageStale` deletes the content document, so an
+  // inequality test here destroys the mirrored copy of exactly the most-used pages in the
+  // account, and nothing puts it back: no read path writes to the mirror, and the
+  // incremental will not re-fetch a page whose Graph stamp is behind the watermark.
+  const h = harness(
+    { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:00Z')] } },
+    {
+      sections: [section()],
+      digestsBySection: new Map([['sec-1', [digest('p1', '2026-08-19T13:00:02.481Z')]]]),
+    },
+  );
+
+  const report = await runFullSweep(h.deps, BUDGET);
+
+  assert.deepEqual(h.storeCalls.staled, []);
+  assert.equal(report.pagesStaled, 0);
+  assert.equal(
+    h.data.digestsBySection.get('sec-1')?.[0]?.contentState,
+    'present',
+    'the content document survives',
+  );
   assert.deepEqual(h.storeCalls.deletes, []);
 });
 
@@ -1971,16 +2000,17 @@ test('a page whose stored copy is already stale is not marked again', async () =
     },
   );
 
-  await runFullSweep(h.deps, BUDGET);
+  const report = await runFullSweep(h.deps, BUDGET);
 
   assert.deepEqual(h.storeCalls.staled, []);
+  assert.equal(report.pagesStaled, 0);
 });
 
 test('a second sweep does not re-mark a page the first one staled', async () => {
   // The same property as the test above, reached through the real transition rather than
-  // a hand-seeded `contentState`. Nothing clears the stale mark until a read or an
-  // incremental re-fetches the page, so without the `present` check every nightly sweep
-  // would spend a Firestore write per drifted page for as long as it stayed unread.
+  // a hand-seeded `contentState`. Only a sync clears the stale mark — a read that misses
+  // falls through to Graph and writes nothing back — so without the `present` check every
+  // nightly sweep would spend a Firestore write per drifted page until one did.
   const h = harness(
     { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:00Z')] } },
     {
@@ -2015,6 +2045,99 @@ test('a sweep whose enumeration failed marks nothing stale', async () => {
 
   assert.deepEqual(h.storeCalls.deletes, [], 'a failed enumeration deletes nothing');
   assert.deepEqual(h.storeCalls.staled, [], 'and marks nothing stale either');
+});
+
+test('a Firestore refusal on one stale mark does not cost the next section its sweep', async () => {
+  // Not the write path's "a failed invalidation never fails a write" — there is no write
+  // here to protect. The sweep is the only pass that reconciles deletions, and one
+  // section's Firestore failure must not stop every section after it from getting one.
+  const h = harness(
+    {
+      summaries: {
+        'sec-1': [summary('p1', '2026-08-19T13:00:00Z')],
+        'sec-2': [summary('p2', '2026-08-19T13:00:00Z')],
+      },
+    },
+    {
+      sections: [section({ id: 'sec-1' }), section({ id: 'sec-2', path: '2026 / Other' })],
+      digestsBySection: new Map([
+        ['sec-1', [digest('p1', '2026-08-19T11:00:00Z')]],
+        ['sec-2', [digest('p2', '2026-08-19T11:00:00Z')]],
+      ]),
+    },
+  );
+
+  const passes = h.deps.store.markPageStale.bind(h.deps.store);
+  h.deps.store.markPageStale = (pageId) =>
+    pageId === 'p1' ? Promise.reject(new Error('firestore-down')) : passes(pageId);
+
+  const report = await runFullSweep(h.deps, BUDGET);
+
+  assert.deepEqual(h.graphCalls.pageSummaries, ['sec-1', 'sec-2'], 'both sections are swept');
+  assert.deepEqual(h.storeCalls.staled, ['p2'], 'the section after the failure is marked');
+  assert.equal(report.pagesFailed, 1);
+  assert.equal(report.pagesStaled, 1);
+});
+
+test('a sweep out of budget stops before it deletes or marks anything else', async () => {
+  // The reconciliation loop spends Firestore writes rather than Graph requests — two per
+  // deletion, one plus a document delete per stale mark — and the first sweep after a
+  // deploy is when both are most widespread. Without the check the loop runs to the end
+  // of the section whatever the budget says.
+  const h = harness(
+    { summaries: { 'sec-1': [] } },
+    {
+      sections: [section()],
+      digestsBySection: new Map([['sec-1', [digest('p-gone')]]]),
+    },
+  );
+
+  // tree + sec-1's enumeration = 2, leaving nothing for the reconciliation.
+  const report = await runSweep(h.deps, { requestBudget: 2 });
+
+  assert.deepEqual(h.storeCalls.deletes, []);
+  assert.equal(report.done, false);
+  assert.equal(report.outcome, 'budget-exhausted');
+  assert.deepEqual(h.storeCalls.sweepResults, [], 'nor is the section recorded as swept');
+});
+
+test('a sweep out of budget inside the last section still reports work outstanding', async () => {
+  // The exhausted section being the *last* one is what makes this observable: `sweepPass`
+  // never runs its loop-top check again, so it clears `sweepCursorSectionId` and the run
+  // would report `complete` and `done: true` while pages it discovered were never fetched.
+  const h = harness({ summaries: { 'sec-1': [summary('p-new')] } }, { sections: [section()] });
+
+  const report = await runSweep(h.deps, { requestBudget: 2 });
+
+  assert.deepEqual(h.storeCalls.puts, [], 'the discovered page was not fetched');
+  assert.equal(report.done, false);
+  assert.equal(report.outcome, 'budget-exhausted');
+});
+
+test('a page the old sweep stored unstamped is re-fetched, not marked stale', async () => {
+  // Before 2026-08-21 a discovered page was written with `title: ''` and the epoch. Both
+  // reach the model, and a stale mark repairs neither: it drops the content document and
+  // leaves the wrong title answering `list_pages`. Under the drift rule the epoch is
+  // behind every live stamp, so these are exactly the documents the sweep would otherwise
+  // gut.
+  const h = harness(
+    { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:00Z')] } },
+    {
+      sections: [section()],
+      digestsBySection: new Map([
+        ['sec-1', [{ ...digest('p1'), title: '', lastModifiedDateTime: '1970-01-01T00:00:00.000Z' }]],
+      ]),
+    },
+  );
+
+  const report = await runFullSweep(h.deps, BUDGET);
+
+  assert.deepEqual(h.storeCalls.staled, [], 'a stale mark would leave the title wrong');
+  const written = h.storeCalls.puts.find((put) => put.page.id === 'p1');
+  assert.ok(written, 'the repair is a re-fetch');
+  assert.equal(written.page.title, 'Page p1');
+  assert.equal(written.page.lastModifiedDateTime, '2026-08-19T13:00:00Z');
+  assert.equal(report.pagesUpdated, 1);
 });
 
 test('the sweep does not advance a section watermark', async () => {

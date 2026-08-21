@@ -1035,16 +1035,40 @@ both reach the calling model: `lastModifiedDateTime` is printed in every tool re
 `titleLower` is what by-name matching compares. Neither self-heals, because a page moved
 into a section may not have its own timestamp bumped by the move, so no later incremental
 lists it. `lastModifiedDateTime` is what makes `pageHasDrifted` in `src/mirror-schema.ts`
-possible: a page in both places whose stamps differ is marked stale rather than fetched,
-which is the only thing in this repository that notices an edit made in the OneNote client
-that the incremental pass missed. Marking rather than fetching is the point — a content
-request per drifted page would sit inside a run already sized against the hourly 400,
-where a stale marker sends the next read to Graph and costs nothing here. The comparison
-is equality on two strings Graph itself wrote, so a tolerance would swallow a real edit;
-an empty live stamp is `toPageSummary`'s fallback for an absent field and is not treated
-as a change; and a stored copy that is not `present` is skipped, because it is already a
-miss for every read and re-marking it would be a Firestore write per already-stale page on
-every nightly sweep.
+possible: a page in both places whose stored stamp is *behind* Graph's is marked stale
+rather than fetched, which is the only thing in this repository that notices an edit made
+in the OneNote client that the incremental pass missed. Marking rather than fetching is
+the point — a content request per drifted page would sit inside a run already sized
+against the hourly 400, where a stale marker sends the next read to Graph and costs
+nothing here.
+
+**The drift comparison is one-directional, and that is what keeps it from destroying the
+mirror.** The two stamps are not the same clock. `resyncPage` stamps
+`new Date().toISOString()` from this process's clock *after* a write returns, because
+Graph's page metadata read is measured-unreliable, so a page written through this server
+is stored **later** than the stamp Graph recorded for the same edit. `markPageStale`
+deletes the content document, and nothing puts it back — no read path writes to the
+mirror, and the incremental will not re-fetch a page whose Graph stamp is behind the
+section watermark — so an inequality test destroys the mirrored copy of every page this
+server writes, on the next sweep, for ever. Only stored-behind-live is evidence of an
+edit. The comparison is on `Date.parse` milliseconds rather than on the strings, because
+Graph's measured format carries no fractional seconds and `toISOString` always carries
+three, and `'…:01.456Z' < '…:01Z'` is lexicographically true.
+
+A copy that is not `present` is skipped: it has no content document to invalidate, and
+re-marking it would be a Firestore write per already-stale page on every nightly sweep.
+That is *not* the same as "already a miss for every read" — a non-`present` copy is a miss
+for `get_page_content` alone, while `list_pages`, `list_pages_by_name`,
+`find_page_by_name` and `search_pages` all answer from the same page documents with no
+`contentState` check. A live stamp `Date.parse` rejects, including `toPageSummary`'s empty
+fallback for an absent field, is not evidence of anything.
+
+**A page carrying the epoch stamp is re-fetched rather than marked.** `pageNeedsRefetch`
+finds the documents the pre-2026-08-21 sweep wrote with `title: ''` and
+`1970-01-01T00:00:00.000Z`. The epoch is behind every live stamp, so the drift branch
+would gut them — dropping content that was correct and leaving the wrong title still
+answering `list_pages`, which is what a listing matches on. `syncPage` writes both fields
+from Graph's own listing, costs one request, and happens once per document.
 
 **An inactive notebook is backfilled once and then never re-listed.** `activeNotebookIds`
 in the selection document names which mirrored notebooks a sync still re-checks; absent or
