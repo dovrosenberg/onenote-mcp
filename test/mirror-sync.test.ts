@@ -1493,7 +1493,6 @@ function seenState(seen: Partial<MirrorSyncState>): MirrorSyncState {
   return {
     ...initialSyncState(),
     sectionsScannedThrough: '2026-08-19T11:55:00.000Z',
-    selectionSeen: true,
     ...seen,
   };
 }
@@ -1581,7 +1580,7 @@ test('removing a notebook from either list widens nothing', async () => {
   // The removal is still recorded, or re-activating this notebook later would diff
   // against a list it is already in and widen nothing.
   assert.deepEqual(
-    deactivated.storeCalls.patches.find((p) => p.selectionSeen !== undefined)
+    deactivated.storeCalls.patches.find((p) => p.mirroredNotebookIdsSeen !== undefined)
       ?.activeNotebookIdsSeen,
     [NB],
   );
@@ -1627,7 +1626,7 @@ test('deactivating then re-activating a notebook widens it the second time', asy
   h.storeCalls.patches.length = 0;
   await runIncremental(h.deps, BUDGET);
   assert.equal(
-    h.storeCalls.patches.some((p) => p.selectionSeen !== undefined),
+    h.storeCalls.patches.some((p) => p.mirroredNotebookIdsSeen !== undefined),
     false,
   );
 });
@@ -1681,7 +1680,7 @@ test('a run that read no tree records no selection, so the next one still widens
   const broke = harness({ tree: TWO_NOTEBOOKS }, structuredClone(seeded));
   await runIncremental(broke.deps, { requestBudget: 0 });
   assert.equal(
-    broke.storeCalls.patches.some((p) => p.selectionSeen !== undefined),
+    broke.storeCalls.patches.some((p) => p.mirroredNotebookIdsSeen !== undefined),
     false,
     'nothing was recorded',
   );
@@ -1708,7 +1707,7 @@ test('a run that read no tree records no selection, so the next one still widens
 
   await runIncremental(flaky.deps, BUDGET);
   assert.equal(
-    flaky.storeCalls.patches.some((p) => p.selectionSeen !== undefined),
+    flaky.storeCalls.patches.some((p) => p.mirroredNotebookIdsSeen !== undefined),
     false,
   );
   // A failed tree read leaves the stored timestamps stale, so that run visited every
@@ -1749,9 +1748,9 @@ test('a scoped sweep visits a widened notebook, and does not clear the set', asy
 });
 
 test('a state document that predates the selection fields records them and widens nothing', async () => {
-  // `selectionSeen` false is "written before these fields existed", not "the selection
-  // changed". Treating it as a change would make the first run after this deploy widen
-  // every mirrored notebook.
+  // `mirroredNotebookIdsSeen` null is "written before these fields existed", not "the
+  // selection changed". Treating it as a change would make the first run after this deploy
+  // widen every mirrored notebook.
   const h = harness(
     { tree: TWO_NOTEBOOKS },
     {
@@ -1764,7 +1763,7 @@ test('a state document that predates the selection fields records them and widen
   await runIncremental(h.deps, BUDGET);
 
   assert.deepEqual(h.graphCalls.changedSince, []);
-  const recorded = h.storeCalls.patches.find((p) => p.selectionSeen !== undefined);
+  const recorded = h.storeCalls.patches.find((p) => p.mirroredNotebookIdsSeen !== undefined);
   assert.deepEqual(recorded?.mirroredNotebookIdsSeen, [NB, NB2]);
   assert.deepEqual(recorded?.activeNotebookIdsSeen, [NB, NB2]);
   assert.deepEqual(recorded?.wideScanNotebookIds, []);

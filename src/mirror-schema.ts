@@ -828,10 +828,12 @@ export interface MirrorSyncState {
    * A hash could say *that* they changed and not *which* notebook, and which notebook is
    * the whole point: widening the scan for every notebook when one was activated costs a
    * listing request per section of the account. `activeNotebookIdsSeen` is `null` for
-   * "every mirrored notebook is active", exactly as in the selection document — which is
-   * why `selectionSeen` exists to tell that apart from "never recorded".
+   * "every mirrored notebook is active", exactly as in the selection document;
+   * `mirroredNotebookIdsSeen` null is the one that means "never recorded", and it is the
+   * field both `notebooksNeedingWideScan` and `selectionMatchesSeen` key on. A recorded
+   * empty list reads back as `[]` rather than as null, because `readIdList` returns an
+   * array for any array, so the two cannot be confused.
    */
-  readonly selectionSeen: boolean;
   readonly mirroredNotebookIdsSeen: readonly string[] | null;
   readonly activeNotebookIdsSeen: readonly string[] | null;
   /**
@@ -864,7 +866,6 @@ export function initialSyncState(): MirrorSyncState {
     runningMode: null,
     runningSince: null,
     unknownNotebookIds: 0,
-    selectionSeen: false,
     mirroredNotebookIdsSeen: null,
     activeNotebookIdsSeen: null,
     wideScanNotebookIds: [],
@@ -904,7 +905,6 @@ export function readSyncState(data: Record<string, unknown> | undefined): Mirror
     runningMode: syncModeOrNull(data['runningMode']),
     runningSince: stringOrNull(data['runningSince']),
     unknownNotebookIds: numberOr(data['unknownNotebookIds'], 0),
-    selectionSeen: booleanOr(data['selectionSeen'], initial.selectionSeen),
     mirroredNotebookIdsSeen: readIdList(data['mirroredNotebookIdsSeen']),
     activeNotebookIdsSeen: readIdList(data['activeNotebookIdsSeen']),
     wideScanNotebookIds: readIdList(data['wideScanNotebookIds']) ?? [],

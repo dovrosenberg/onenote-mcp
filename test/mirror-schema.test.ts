@@ -318,7 +318,6 @@ test('a well-formed sync-state document reads back verbatim', () => {
     runningMode: 'sweep',
     runningSince: '2026-08-19T12:05:00Z',
     unknownNotebookIds: 1,
-    selectionSeen: true,
     mirroredNotebookIdsSeen: ['nb-1', 'nb-2'],
     activeNotebookIdsSeen: ['nb-1'],
     wideScanNotebookIds: ['nb-2'],
@@ -396,9 +395,9 @@ test('notebooksNeedingWideScan names only what became mirrored or active', () =>
 
 test('a state document written before the selection fields reads as never recorded', () => {
   // What is actually deployed: `activeSelectionHash` and none of the fields that replaced
-  // it. `selectionSeen` false is what makes the first run after this deploy record the
-  // lists and widen nothing — reading the absent lists as "the selection was empty" would
-  // widen every mirrored notebook on that run instead.
+  // it. `mirroredNotebookIdsSeen` null is what makes the first run after this deploy
+  // record the lists and widen nothing — reading the absent lists as "the selection was
+  // empty" would widen every mirrored notebook on that run instead.
   const state = readSyncState({
     schemaVersion: 1,
     structureHash: 'abc123',
@@ -406,7 +405,6 @@ test('a state document written before the selection fields reads as never record
     activeSelectionHash: 'def456',
   });
 
-  assert.equal(state.selectionSeen, false);
   assert.equal(state.mirroredNotebookIdsSeen, null);
   assert.equal(state.activeNotebookIdsSeen, null);
   assert.deepEqual(state.wideScanNotebookIds, []);

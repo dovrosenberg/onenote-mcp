@@ -681,9 +681,11 @@ async function reconcileStructure(ctx: PassContext): Promise<StructureResult> {
  * `pagesSyncedThrough`, which nothing here touches, so no page is re-fetched that has not
  * changed.
  *
- * `selectionSeen` false is a state document written before these fields existed rather
- * than a change to the lists. Recording them is the whole job there; widening instead
- * would make the first run after the deploy a full-width scan.
+ * A state document written before these fields existed carries
+ * `mirroredNotebookIdsSeen: null`, and both schema functions read that as "never
+ * recorded": `notebooksNeedingWideScan` answers `[]` and `selectionMatchesSeen` answers
+ * false, so the first run after the deploy records the lists and widens nothing. That is
+ * the general path rather than a branch of its own.
  *
  * A run that read no tree records nothing, and that is not tidiness. `mirroredNotebookIds`
  * is empty on such a run — the budget ran out before the read, or `getExpandedTree`
@@ -706,16 +708,10 @@ async function reconcileSelection(
   // not the second, so a diff against it can only ever under-report, never widen something
   // that does not exist.
   const recorded = {
-    selectionSeen: true,
     mirroredNotebookIdsSeen: [...ctx.selection.notebookIds],
     activeNotebookIdsSeen:
       ctx.selection.activeNotebookIds === null ? null : [...ctx.selection.activeNotebookIds],
   };
-
-  if (!ctx.state.selectionSeen) {
-    await ctx.deps.store.patchSyncState({ ...recorded, wideScanNotebookIds: [...carried] });
-    return carried;
-  }
 
   const seen = {
     mirrored: ctx.state.mirroredNotebookIdsSeen,
