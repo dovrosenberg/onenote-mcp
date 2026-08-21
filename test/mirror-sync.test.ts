@@ -27,6 +27,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 
 import { GraphRequestError } from '../src/graph-structure.ts';
 import type {
@@ -47,12 +48,12 @@ import {
   sectionIdentity,
   type MirrorPage,
   type MirrorPageContent,
-  type MirrorPageDigest,
   type MirrorNotebook,
   type MirrorSection,
   type MirrorSectionGroup,
   type MirrorSyncState,
   type MirrorTombstone,
+  type PageStamp,
   type NotebookSelection,
   type StructureIdentity,
   type SyncMode,
@@ -142,12 +143,45 @@ function summary(id: string, modified = '2026-08-19T11:30:00Z'): PageSummary {
 /**
  * A stored page as the sweep reads it back.
  *
- * The default timestamp is `summary`'s, so a page seeded in both places is *not* drifted
- * unless a test says so — every sweep test written before drift existed asserts about
- * deletion and discovery, and a mismatching default would add a stale mark to all of them.
+ * The default timestamp is `summary`'s, so a page seeded in both places *agrees* with
+ * Graph unless a test says otherwise — every sweep test written before the stamp
+ * comparison existed asserts about deletion and discovery, and a mismatching default
+ * would add a content fetch to all of them.
  */
-function digest(id: string, modified = '2026-08-19T11:30:00Z'): MirrorPageDigest {
-  return { id, title: `Page ${id}`, lastModifiedDateTime: modified, contentState: 'present' };
+function digest(id: string, modified = '2026-08-19T11:30:00Z'): PageStamp {
+  return { id, title: `Page ${id}`, lastModifiedDateTime: modified };
+}
+
+const TYPED_HTML = '<p>typed</p>';
+
+/** The sha256 `writePageFromRaw` computes over a page's HTML. */
+function hashOf(html: string): string {
+  return createHash('sha256').update(html).digest('hex');
+}
+
+/**
+ * A stored page document, hashed against the harness's default content.
+ *
+ * A test that wants the short-circuit to fire seeds one of these; one that wants a full
+ * write overrides `contentHash`.
+ */
+function storedPage(overrides: Partial<MirrorPage> = {}): MirrorPage {
+  return {
+    id: 'p1',
+    title: 'Page p1',
+    titleLower: 'page p1',
+    sectionId: 'sec-1',
+    notebookId: NB,
+    sectionPath: '2026 / Daily',
+    lastModifiedDateTime: '2026-08-19T11:30:00Z',
+    contentState: 'present',
+    contentHash: hashOf(TYPED_HTML),
+    htmlLocation: 'firestore',
+    htmlObject: null,
+    htmlBytes: TYPED_HTML.length,
+    ink: null,
+    ...overrides,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -234,7 +268,7 @@ interface StoreState {
   sections: StoredSection[];
   groups: StoredSectionGroup[];
   pages: Map<string, MirrorPage>;
-  digestsBySection: Map<string, MirrorPageDigest[]>;
+  digestsBySection: Map<string, PageStamp[]>;
 }
 
 interface StoreCalls {
@@ -242,7 +276,8 @@ interface StoreCalls {
   patches: Partial<MirrorSyncState>[];
   puts: { page: MirrorPage; hasContent: boolean }[];
   deletes: MirrorTombstone[];
-  staled: string[];
+  /** One entry per `putPageMetadata`, which is the short-circuit correcting a stamp. */
+  metadata: { id: string; lastModifiedDateTime: string }[];
   structures: number;
   /** One entry per structure document actually written. A skipped one is absent. */
   structureWrites: { id: string }[];
@@ -323,7 +358,7 @@ function fakeStore(initial: Partial<StoreState> = {}): {
     patches: [],
     puts: [],
     deletes: [],
-    staled: [],
+    metadata: [],
     structures: 0,
     structureWrites: [],
     structureResets: [],
@@ -332,6 +367,16 @@ function fakeStore(initial: Partial<StoreState> = {}): {
     releases: [],
     childGroupsKnown: [],
     sweepResults: [],
+  };
+
+  /** What Firestore does to the projection when a page document's stamp is written. */
+  const restamp = (pageId: string, lastModifiedDateTime: string): void => {
+    for (const [sectionId, digests] of data.digestsBySection) {
+      data.digestsBySection.set(
+        sectionId,
+        digests.map((d) => (d.id === pageId ? { ...d, lastModifiedDateTime } : d)),
+      );
+    }
   };
 
   const store: SyncStore = {
@@ -386,9 +431,22 @@ function fakeStore(initial: Partial<StoreState> = {}): {
       return Promise.resolve();
     },
     getPage: (pageId) => Promise.resolve(data.pages.get(pageId) ?? null),
+    // Both writes apply their effect to the stamp a later `listPageDigestsInSection`
+    // reads back, not merely record the call. A fake that only pushed to `calls` would
+    // let "a second sweep after a re-fetch disagrees about nothing" pass against a mirror
+    // that had forgotten the correction — which is the one property saying the re-fetch
+    // converges rather than repeating every run.
     putPage: (page: MirrorPage, content: MirrorPageContent | null) => {
       calls.puts.push({ page, hasContent: content !== null });
       data.pages.set(page.id, page);
+      restamp(page.id, page.lastModifiedDateTime);
+      return Promise.resolve();
+    },
+    putPageMetadata: (page) => {
+      calls.metadata.push({ id: page.id, lastModifiedDateTime: page.lastModifiedDateTime });
+      const existing = data.pages.get(page.id);
+      if (existing !== undefined) data.pages.set(page.id, { ...existing, ...page });
+      restamp(page.id, page.lastModifiedDateTime);
       return Promise.resolve();
     },
     deletePage: (tombstone) => {
@@ -397,20 +455,6 @@ function fakeStore(initial: Partial<StoreState> = {}): {
     },
     listPageDigestsInSection: (sectionId) =>
       Promise.resolve(data.digestsBySection.get(sectionId) ?? []),
-    // The effect is applied, not merely recorded: the digest a later
-    // `listPageDigestsInSection` reads back comes out `contentState: 'stale'`. A fake
-    // that only pushed to `staled` would let "a second sweep does not re-mark a page the
-    // first one staled" pass against a mirror that had forgotten the mark.
-    markPageStale: (pageId) => {
-      calls.staled.push(pageId);
-      for (const [sectionId, digests] of data.digestsBySection) {
-        data.digestsBySection.set(
-          sectionId,
-          digests.map((d) => (d.id === pageId ? { ...d, contentState: 'stale' } : d)),
-        );
-      }
-      return Promise.resolve();
-    },
   };
 
   return { store, calls, data };
@@ -1910,9 +1954,9 @@ test('an empty enumeration on a section that really is empty still deletes', asy
 });
 
 test('the sweep queues ids Graph has that the mirror lacks', async () => {
-  // A page moved *into* a mirrored section may not have its own lastModifiedDateTime
-  // bumped by the move — the same class of unknown as the section roll-up — so without
-  // this it would be invisible until someone next edited it.
+  // Measured 2026-08-21: a page moved between sections keeps the lastModifiedDateTime it
+  // already had, so it is below every later section watermark and listPagesChangedSince
+  // never returns it. Without this loop it is invisible until someone next edits it.
   const h = harness({ tree: TREE, summaries: { 'sec-1': [summary('p-1'), summary('p-new')] } });
   h.data.digestsBySection.set('sec-1', [digest('p-1')]);
 
@@ -1925,9 +1969,9 @@ test('the sweep queues ids Graph has that the mirror lacks', async () => {
 
 test('the sweep stores a discovered page with its real title and timestamp', async () => {
   // Before listPageSummaries the sweep synthesized title '' and 1970-01-01 here, and
-  // neither self-heals: both fields reach the calling model, and a page moved into a
-  // section may not have its own timestamp bumped by the move, so no later incremental
-  // lists it.
+  // neither self-heals through the incremental pass: both fields reach the calling model,
+  // and a page moved into a section keeps its old timestamp (measured 2026-08-21), so no
+  // later incremental lists it.
   const h = harness(
     { summaries: { 'sec-1': [summary('new-page', '2026-08-19T11:45:00Z')] } },
     { sections: [section()] },
@@ -1941,32 +1985,50 @@ test('the sweep stores a discovered page with its real title and timestamp', asy
   assert.equal(written.page.lastModifiedDateTime, '2026-08-19T11:45:00Z');
 });
 
-test('the sweep marks a drifted page stale and spends no Graph request on it', async () => {
-  // The page is in both places, so the sweep neither deletes nor fetches it. All it can
-  // do — and all it needs to do — is send the next read to Graph.
+test('stamps a second apart send the sweep to Graph and leave the content in place', async () => {
+  // The old rule marked a disagreeing page stale, and `markPageStale` deletes the
+  // page-content document. Nothing re-fetches a stale page: the incremental will not list
+  // a page whose Graph stamp is behind the section watermark, no read path writes to the
+  // mirror, and the sweep skipped a non-`present` copy. So a mark was permanent, and the
+  // tolerance that guarded against it discarded every edit inside its window. A re-fetch
+  // has neither problem — the content hash decides, and a false positive costs one
+  // request.
   const h = harness(
-    { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:00Z')] } },
+    { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:01Z')] } },
     {
       sections: [section()],
-      digestsBySection: new Map([['sec-1', [digest('p1', '2026-08-19T11:00:00Z')]]]),
+      digestsBySection: new Map([['sec-1', [digest('p1', '2026-08-19T13:00:00Z')]]]),
     },
   );
 
-  const report = await runFullSweep(h.deps, BUDGET);
+  await runFullSweep(h.deps, BUDGET);
 
-  assert.deepEqual(h.storeCalls.staled, ['p1']);
-  assert.equal(report.pagesStaled, 1, 'the counter is the only thing that reports this');
-  assert.deepEqual(h.storeCalls.puts, [], 'a drift check costs no fetch and no write');
-  assert.deepEqual(h.storeCalls.deletes, []);
+  assert.deepEqual(h.graphCalls.pageSummaries, ['sec-1']);
+  assert.deepEqual(h.storeCalls.puts.map((p) => p.page.id), ['p1'], 'the page is re-fetched');
+  assert.deepEqual(h.storeCalls.deletes, [], 'and nothing is deleted over a stamp');
 });
 
-test('a page stored later than Graph is a resync stamp, and keeps its content', async () => {
+test('stamps a day apart re-fetch the same way', async () => {
+  const h = harness(
+    { summaries: { 'sec-1': [summary('p1', '2026-08-20T13:00:00Z')] } },
+    {
+      sections: [section()],
+      digestsBySection: new Map([['sec-1', [digest('p1', '2026-08-19T13:00:00Z')]]]),
+    },
+  );
+
+  await runFullSweep(h.deps, BUDGET);
+
+  assert.deepEqual(h.storeCalls.puts.map((p) => p.page.id), ['p1']);
+});
+
+test('a page stored ahead of Graph is re-fetched, and that is the repair', async () => {
   // `resyncPage` stamps `lastModifiedDateTime` from this process's clock after the write
   // returns, so every page written through this server is stored *ahead* of the stamp
-  // Graph recorded for the same edit. `markPageStale` deletes the content document, so an
-  // inequality test here destroys the mirrored copy of exactly the most-used pages in the
-  // account, and nothing puts it back: no read path writes to the mirror, and the
-  // incremental will not re-fetch a page whose Graph stamp is behind the watermark.
+  // Graph recorded for the same edit. Under the old mark that direction had to be excluded
+  // or the mirror lost its most-used pages permanently. Under a re-fetch it is the case
+  // that fixes itself: the page comes back with Graph's own string in place of the local
+  // one, and the next sweep finds the two agreeing.
   const h = harness(
     { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:00Z')] } },
     {
@@ -1977,27 +2039,19 @@ test('a page stored later than Graph is a resync stamp, and keeps its content', 
 
   const report = await runFullSweep(h.deps, BUDGET);
 
-  assert.deepEqual(h.storeCalls.staled, []);
-  assert.equal(report.pagesStaled, 0);
-  assert.equal(
-    h.data.digestsBySection.get('sec-1')?.[0]?.contentState,
-    'present',
-    'the content document survives',
-  );
+  const written = h.storeCalls.puts.find((put) => put.page.id === 'p1');
+  assert.ok(written, 'stored-ahead is a disagreement like any other');
+  assert.equal(written.page.lastModifiedDateTime, '2026-08-19T13:00:00Z', "Graph's string wins");
+  assert.equal(report.pagesFailed, 0, 'and it is not an error');
   assert.deepEqual(h.storeCalls.deletes, []);
 });
 
-test('a page Graph reports one second later keeps its content document', async () => {
-  // Measured 2026-08-21 (api-overview.md): four pages in one section, three untouched for
-  // two days, all came back with a `lastModifiedDateTime` exactly one second later on a
-  // second read of the same listing. Under a strict stored-behind-live test the sweep
-  // stales every page whose stored stamp came from the lower-reading path, and
-  // `markPageStale` deletes the page-content document. Nothing re-fetches a stale page:
-  // the incremental will not list a page whose Graph stamp is behind the section
-  // watermark, no read path writes to the mirror, and the next sweep skips a non-`present`
-  // copy. So this is the whole mirror's content, in one run.
+test('stamps that agree cost neither a fetch nor a write', async () => {
+  // The other half of the bargain. Every page in every swept section reads its stamp back,
+  // so a comparison that fired on agreement would put a content request per mirrored page
+  // inside a run sized against 400 requests an hour.
   const h = harness(
-    { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:01Z')] } },
+    { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:00Z')] } },
     {
       sections: [section()],
       digestsBySection: new Map([['sec-1', [digest('p1', '2026-08-19T13:00:00Z')]]]),
@@ -2006,56 +2060,74 @@ test('a page Graph reports one second later keeps its content document', async (
 
   const report = await runFullSweep(h.deps, BUDGET);
 
-  assert.deepEqual(h.storeCalls.staled, []);
-  assert.equal(report.pagesStaled, 0);
-  assert.equal(
-    h.data.digestsBySection.get('sec-1')?.[0]?.contentState,
-    'present',
-    'the content document survives',
-  );
-  assert.deepEqual(h.storeCalls.puts, [], 'and nothing is re-fetched over it either');
+  assert.equal(report.graphRequests, 2, 'the tree and the section enumeration, and nothing else');
+  assert.deepEqual(h.storeCalls.puts, []);
+  assert.deepEqual(h.storeCalls.metadata, []);
+  assert.equal(report.pagesUpdated, 0);
 });
 
-test('a page whose stored copy is already stale is not marked again', async () => {
-  // Not tidiness: a Firestore write per already-stale page, on every nightly sweep, for
-  // as long as nothing re-reads it.
+test('a re-fetch whose content is unchanged writes metadata and is not an update', async () => {
+  // This is what makes the re-fetch converge. Without the metadata write the stored stamp
+  // stays where it was, the next sweep disagrees with Graph again, and the same page is
+  // fetched on every run for ever.
   const h = harness(
     { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:00Z')] } },
     {
       sections: [section()],
-      digestsBySection: new Map([
-        ['sec-1', [{ ...digest('p1', '2026-08-19T11:00:00Z'), contentState: 'stale' as const }]],
-      ]),
+      pages: new Map([['p1', storedPage({ lastModifiedDateTime: '2026-08-19T11:00:00Z' })]]),
+      digestsBySection: new Map([['sec-1', [digest('p1', '2026-08-19T11:00:00Z')]]]),
     },
   );
 
   const report = await runFullSweep(h.deps, BUDGET);
 
-  assert.deepEqual(h.storeCalls.staled, []);
-  assert.equal(report.pagesStaled, 0);
+  assert.deepEqual(h.storeCalls.puts, [], 'the content is identical, so no page write');
+  assert.deepEqual(h.storeCalls.metadata, [
+    { id: 'p1', lastModifiedDateTime: '2026-08-19T13:00:00Z' },
+  ]);
+  assert.equal(report.pagesUpdated, 0, 'nothing changed, so nothing is reported as changed');
 });
 
-test('a second sweep does not re-mark a page the first one staled', async () => {
-  // The same property as the test above, reached through the real transition rather than
-  // a hand-seeded `contentState`. Only a sync clears the stale mark — a read that misses
-  // falls through to Graph and writes nothing back — so without the `present` check every
-  // nightly sweep would spend a Firestore write per drifted page until one did.
+test('a second sweep after a re-fetch disagrees about nothing', async () => {
+  // Convergence, through the real transition rather than a hand-seeded document: the
+  // metadata write above has to land where `listPageDigestsInSection` reads it back.
   const h = harness(
     { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:00Z')] } },
     {
       sections: [section()],
+      pages: new Map([['p1', storedPage({ lastModifiedDateTime: '2026-08-19T11:00:00Z' })]]),
       digestsBySection: new Map([['sec-1', [digest('p1', '2026-08-19T11:00:00Z')]]]),
     },
   );
 
-  await runFullSweep(h.deps, BUDGET);
-  assert.deepEqual(h.storeCalls.staled, ['p1']);
+  const first = await runFullSweep(h.deps, BUDGET);
+  assert.equal(first.graphRequests, 3, 'tree, enumeration, and the one content fetch');
 
-  await runFullSweep(h.deps, BUDGET);
-  assert.deepEqual(h.storeCalls.staled, ['p1'], 'the second run finds it already stale');
+  const second = await runFullSweep(h.deps, BUDGET);
+  assert.equal(second.graphRequests, 2, 'the second run fetches no page at all');
+  assert.equal(h.storeCalls.metadata.length, 1);
 });
 
-test('a sweep whose enumeration failed marks nothing stale', async () => {
+test('a re-fetch whose content changed writes the page', async () => {
+  const h = harness(
+    { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:00Z')] } },
+    {
+      sections: [section()],
+      pages: new Map([
+        ['p1', storedPage({ lastModifiedDateTime: '2026-08-19T11:00:00Z', contentHash: 'old' })],
+      ]),
+      digestsBySection: new Map([['sec-1', [digest('p1', '2026-08-19T11:00:00Z')]]]),
+    },
+  );
+
+  const report = await runFullSweep(h.deps, BUDGET);
+
+  assert.deepEqual(h.storeCalls.puts.map((p) => p.page.id), ['p1']);
+  assert.deepEqual(h.storeCalls.metadata, [], 'a full write is not also a metadata write');
+  assert.equal(report.pagesUpdated, 1);
+});
+
+test('a sweep whose enumeration failed fetches nothing and deletes nothing', async () => {
   const h = harness(
     {
       summaries: {
@@ -2073,10 +2145,10 @@ test('a sweep whose enumeration failed marks nothing stale', async () => {
   await runFullSweep(h.deps, BUDGET);
 
   assert.deepEqual(h.storeCalls.deletes, [], 'a failed enumeration deletes nothing');
-  assert.deepEqual(h.storeCalls.staled, [], 'and marks nothing stale either');
+  assert.deepEqual(h.storeCalls.puts, [], 'and re-fetches nothing either');
 });
 
-test('a Firestore refusal on one stale mark does not cost the next section its sweep', async () => {
+test('a Firestore refusal on one page does not cost the next section its sweep', async () => {
   // Not the write path's "a failed invalidation never fails a write" — there is no write
   // here to protect. The sweep is the only pass that reconciles deletions, and one
   // section's Firestore failure must not stop every section after it from getting one.
@@ -2096,23 +2168,21 @@ test('a Firestore refusal on one stale mark does not cost the next section its s
     },
   );
 
-  const passes = h.deps.store.markPageStale.bind(h.deps.store);
-  h.deps.store.markPageStale = (pageId) =>
-    pageId === 'p1' ? Promise.reject(new Error('firestore-down')) : passes(pageId);
+  const passes = h.deps.store.putPage.bind(h.deps.store);
+  h.deps.store.putPage = (page, content) =>
+    page.id === 'p1' ? Promise.reject(new Error('firestore-down')) : passes(page, content);
 
   const report = await runFullSweep(h.deps, BUDGET);
 
   assert.deepEqual(h.graphCalls.pageSummaries, ['sec-1', 'sec-2'], 'both sections are swept');
-  assert.deepEqual(h.storeCalls.staled, ['p2'], 'the section after the failure is marked');
+  assert.deepEqual(h.storeCalls.puts.map((p) => p.page.id), ['p2']);
   assert.equal(report.pagesFailed, 1);
-  assert.equal(report.pagesStaled, 1);
 });
 
-test('a sweep out of budget stops before it deletes or marks anything else', async () => {
-  // The reconciliation loop spends Firestore writes rather than Graph requests — two per
-  // deletion, one plus a document delete per stale mark — and the first sweep after a
-  // deploy is when both are most widespread. Without the check the loop runs to the end
-  // of the section whatever the budget says.
+test('a sweep out of budget stops before it deletes anything else', async () => {
+  // The reconciliation loop spends Firestore writes — two per deletion — and the first
+  // sweep after a deploy is when they are most widespread. Without the check the loop runs
+  // to the end of the section whatever the budget says.
   const h = harness(
     { summaries: { 'sec-1': [] } },
     {
@@ -2130,6 +2200,28 @@ test('a sweep out of budget stops before it deletes or marks anything else', asy
   assert.deepEqual(h.storeCalls.sweepResults, [], 'nor is the section recorded as swept');
 });
 
+test('a sweep out of budget stops before it re-fetches a disagreeing page', async () => {
+  // The check matters more than it did. The reconciliation loop used to spend Firestore
+  // writes alone; a disagreement now costs a Graph request, so a loop that ignored the
+  // budget could spend a content fetch per mirrored page in the section — against 400 an
+  // hour, shared with every interactive tool call.
+  const h = harness(
+    { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:00Z')] } },
+    {
+      sections: [section()],
+      digestsBySection: new Map([['sec-1', [digest('p1', '2026-08-19T11:00:00Z')]]]),
+    },
+  );
+
+  // tree + sec-1's enumeration = 2, leaving nothing for the re-fetch.
+  const report = await runSweep(h.deps, { requestBudget: 2 });
+
+  assert.deepEqual(h.storeCalls.puts, [], 'the disagreeing page was not fetched');
+  assert.equal(report.done, false, 'and the run says it left work behind');
+  assert.equal(report.outcome, 'budget-exhausted');
+  assert.deepEqual(h.storeCalls.sweepResults, [], 'nor is the section recorded as swept');
+});
+
 test('a sweep out of budget inside the last section still reports work outstanding', async () => {
   // The exhausted section being the *last* one is what makes this observable: `sweepPass`
   // never runs its loop-top check again, so it clears `sweepCursorSectionId` and the run
@@ -2143,12 +2235,11 @@ test('a sweep out of budget inside the last section still reports work outstandi
   assert.equal(report.outcome, 'budget-exhausted');
 });
 
-test('a page the old sweep stored unstamped is re-fetched, not marked stale', async () => {
+test('a page the old sweep stored unstamped is re-fetched by the same branch', async () => {
   // Before 2026-08-21 a discovered page was written with `title: ''` and the epoch. Both
-  // reach the model, and a stale mark repairs neither: it drops the content document and
-  // leaves the wrong title answering `list_pages`. Under the drift rule the epoch is
-  // behind every live stamp, so these are exactly the documents the sweep would otherwise
-  // gut.
+  // reach the model, and a stale mark repaired neither: it dropped the content document
+  // and left the wrong title answering `list_pages`. There is no separate predicate for
+  // these any more — the epoch disagrees with anything Graph sends.
   const h = harness(
     { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:00Z')] } },
     {
@@ -2161,7 +2252,6 @@ test('a page the old sweep stored unstamped is re-fetched, not marked stale', as
 
   const report = await runFullSweep(h.deps, BUDGET);
 
-  assert.deepEqual(h.storeCalls.staled, [], 'a stale mark would leave the title wrong');
   const written = h.storeCalls.puts.find((put) => put.page.id === 'p1');
   assert.ok(written, 'the repair is a re-fetch');
   assert.equal(written.page.title, 'Page p1');
@@ -2296,6 +2386,7 @@ function resyncDeps(
       store: {
         getPage: store.getPage,
         putPage: store.putPage,
+        putPageMetadata: store.putPageMetadata,
         deletePage: store.deletePage,
         getSection: (sectionId) =>
           Promise.resolve(data.sections.find((s) => s.id === sectionId) ?? null),
@@ -2466,9 +2557,14 @@ test('a page moved to another section is rewritten even with identical content',
   assert.equal(moved.storeCalls.puts[0]?.page.sectionPath, '2026 / Elsewhere');
 });
 
-test('the timestamp alone never forces a rewrite', async () => {
-  // lastModifiedDateTime moves on every write, so comparing it would rewrite every page
-  // the watermark overlap re-read and defeat the point of the short-circuit.
+test('the timestamp alone never forces a rewrite, but it is written back', async () => {
+  // lastModifiedDateTime moves on every write, so comparing it in the short-circuit would
+  // rewrite every page the watermark overlap re-read and defeat the point of it. The
+  // stamp still has to be *corrected*, through a metadata write that touches no content:
+  // `resyncPage` stores this process's clock, that string is printed in every tool result,
+  // and the sweep re-fetches any page whose stored stamp disagrees with Graph's. Without
+  // the correction the local value is permanent and every later sweep fetches the page
+  // again.
   const first = harness({ tree: TREE, changed: { 'sec-1': [summary('p-1', '2026-08-19T11:00:00Z')] } });
   await runIncremental(first.deps, BUDGET);
   const stored = first.data.pages.get('p-1');
@@ -2478,7 +2574,41 @@ test('the timestamp alone never forces a rewrite', async () => {
     { tree: TREE, changed: { 'sec-1': [summary('p-1', '2026-08-19T11:59:00Z')] } },
     { pages: new Map([['p-1', stored]]) },
   );
-  await runIncremental(later.deps, BUDGET);
+  const report = await runIncremental(later.deps, BUDGET);
 
-  assert.deepEqual(later.storeCalls.puts, []);
+  assert.deepEqual(later.storeCalls.puts, [], 'no content write');
+  assert.deepEqual(later.storeCalls.metadata, [
+    { id: 'p-1', lastModifiedDateTime: '2026-08-19T11:59:00Z' },
+  ]);
+  assert.equal(report.pagesUpdated, 0, 'and correcting a stamp is not a page update');
+});
+
+test('a short-circuit whose stamps already match writes nothing at all', async () => {
+  // The metadata write is a Firestore write per page, and the watermark overlap re-reads
+  // every page edited in the last hour on every run. Firing it on agreement would spend
+  // one on each of them for no change.
+  const h = harness(
+    { tree: TREE, changed: { 'sec-1': [summary('p1', '2026-08-19T11:30:00Z')] } },
+    { pages: new Map([['p1', storedPage({ lastModifiedDateTime: '2026-08-19T11:30:00Z' })]]) },
+  );
+
+  await runIncremental(h.deps, BUDGET);
+
+  assert.deepEqual(h.storeCalls.puts, []);
+  assert.deepEqual(h.storeCalls.metadata, []);
+});
+
+test('an empty live stamp never overwrites a stored one', async () => {
+  // `''` is `toPageSummary`'s fallback for a field Graph did not send, not a timestamp.
+  // Storing it would put an empty string in every tool result for that page and leave the
+  // real value unrecoverable without a full re-read.
+  const h = harness(
+    { tree: TREE, changed: { 'sec-1': [summary('p1', '')] } },
+    { pages: new Map([['p1', storedPage({ lastModifiedDateTime: '2026-08-19T11:30:00Z' })]]) },
+  );
+
+  await runIncremental(h.deps, BUDGET);
+
+  assert.deepEqual(h.storeCalls.metadata, []);
+  assert.equal(h.data.pages.get('p1')?.lastModifiedDateTime, '2026-08-19T11:30:00Z');
 });

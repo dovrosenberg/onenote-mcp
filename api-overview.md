@@ -162,10 +162,10 @@ that reads only `lastModifiedDateTime`. This is not lag: the third row is the sa
 two minutes on.
 
 The consequence is that a timestamp is not sufficient to decide whether a page needs
-re-reading. Anything that skips work on an unmoved stamp — the sweep's drift check, and
-the page-level skip — has to compare the title as well, or a page renamed outside this
-server keeps its old title in the mirror for ever, which is the field `find_page_by_name`
-and `search_pages` match on. The title costs nothing to compare: every listing this
+re-reading. Anything that skips work on an unmoved stamp — `writePageFromRaw`'s
+short-circuit, and anything built on the sweep's stamp comparison — has to compare the
+title as well, or a page renamed outside this server keeps its old title in the mirror for
+ever, which is the field `find_page_by_name` and `search_pages` match on. The title costs nothing to compare: every listing this
 repository makes already selects it.
 
 Measured through `PATCH /pages/{id}/content` with a `title` target, which is what
@@ -180,11 +180,17 @@ fractional seconds, in the same shape as the section timestamps recorded above.
 `resyncPage` stamps a page locally with `new Date().toISOString()`, which always emits
 three fractional digits.
 
-So the two are not comparable as strings. `'2026-08-21T12:17:52.400Z' < '2026-08-21T12:17:52Z'`
-is **true** lexicographically, because `.` is `0x2E` and `Z` is `0x5A` — a locally stamped
-page landing in the same second as Graph's own stamp sorts *before* it and reads as
-behind. `pageHasDrifted` compares `Date.parse` milliseconds for this reason. Do not
-"simplify" it back to a string comparison.
+So the two are not comparable as instants without parsing. `'2026-08-21T12:17:52.400Z' <
+'2026-08-21T12:17:52Z'` is **true** lexicographically, because `.` is `0x2E` and `Z` is
+`0x5A` — a locally stamped page landing in the same second as Graph's own stamp sorts
+*before* it.
+
+Nothing compares them as instants any more. `pageStampDiffers` in `src/mirror-schema.ts`
+asks only whether the two strings are the same string, and the sweep answers a difference
+by re-fetching the page. Two spellings of one instant therefore disagree, which is wanted:
+the re-fetch's short-circuit writes Graph's own spelling back through
+`MirrorStore.putPageMetadata`, so the locally stamped value is replaced rather than left in
+a field every tool result prints.
 
 ## Graph reports the same page one second apart on two reads
 
@@ -210,14 +216,19 @@ another ceiling it, but **the mechanism is not established**. What is establishe
 observation: a page's reported stamp can move by one second with nothing having happened
 to the page.
 
-The consequence is that no exact comparison of a stored stamp against a freshly read one
-is safe. A stored stamp taken from the lower-reading path is one second behind a live
-stamp taken from the other, on a page nobody edited. Anything that acts on
-stored-behind-live has to require a margin, and `TIMESTAMP_JITTER_MS` in
-`src/mirror-schema.ts` is that margin — 2 s, the observed second plus a second of room.
-The margin is one-sided: stored-ahead-of-live is the `resyncPage` local-stamp case
-recorded under **Writing page content**, and widening the test in that direction is what
-destroys the mirrored content of every page this server writes.
+The consequence is that a stamp difference is not proof of an edit. It is **not** that a
+margin is needed: a tolerance wide enough to absorb this second also discards every real
+edit made inside it, and an edit the sweep never notices is served as current for ever.
+
+What the sweep does instead is treat a difference as a hint. `pageStampDiffers` in
+`src/mirror-schema.ts` compares the two strings and nothing more, and the sweep answers a
+difference by re-fetching the page; `writePageFromRaw`'s content-hash comparison is the
+authoritative check, and a page whose content turns out to be unchanged costs one Graph
+request and a metadata write that stores Graph's stamp. So a page caught by this
+one-second wobble is fetched once and then agrees. The direction of the difference is
+irrelevant for the same reason — stored-ahead-of-live is the `resyncPage` local-stamp case
+recorded under **Writing page content**, and a re-fetch corrects it where the old stale
+mark destroyed it.
 
 ## A section's page listing reports a title immediately; `GET /pages/{id}` does not
 
@@ -228,8 +239,38 @@ already correct. That is the opposite of the page-metadata weakness recorded und
 created seconds earlier.
 
 So the listing endpoint is a usable source of titles and the per-page metadata endpoint is
-not. A title comparison built on a listing does not need the empty-string guard that one
-built on `GET /pages/{id}` would.
+not.
+
+**That does not make `""` a safe sentinel for "no title read yet".** A later probe of the
+same account found a page whose listing entry carries `"title": ""` — a genuinely untitled
+page, not a read that failed. So an empty title is a legitimate value from either endpoint,
+and any comparison has to handle it as one rather than treating it as missing data. What
+the listing's reliability buys is that a title read from it can be *trusted*, not that it
+can never be empty.
+
+## Moving a page between sections changes its id and keeps its timestamp
+
+**Measured 2026-08-21**, moving one page between two sections in the OneNote client.
+
+**The page id changed completely** — both the GUID and the trailing section component:
+
+```
+before: 0-cc8f8e7e3eef4994be2452e57bb7ad1a!124-…!sc42d54e6be164de4b3b13f4a50c4160e
+after:  0-e641c1d6852b089a057bcd40db72a242!1-…!s2b04cff65ae64bf6b5a31d46ce86cb57
+```
+
+A page id therefore embeds the section it sits in, and there is no id that survives a move.
+To the mirror a moved page is a delete in the source section plus a create in the
+destination, which is what the sweep already reconciles on both sides: the source's stored
+page matches no live id and is tombstoned, and the destination's live id matches no stored
+page and is fetched.
+
+**The moved page kept its original `lastModifiedDateTime`** — `2026-08-21T12:17:53Z`, the
+minute it was created, not the minute it was moved. This settles a premise the sweep's
+rationale had been asserting without a measurement. A page moved into a section carries a
+stamp older than the section's watermark, so `listPagesChangedSince` never returns it and
+no incremental pass will ever see it. **Only the sweep finds a moved page.** That is the
+measured justification for the sweep existing at all.
 
 ## Clock skew between Graph and this service: seconds, not minutes
 

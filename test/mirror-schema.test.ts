@@ -33,8 +33,7 @@ import {
   LISTING_HOLD_EXPIRY_MS,
   notebookIdentity,
   overlapFrom,
-  pageHasDrifted,
-  pageNeedsRefetch,
+  pageStampDiffers,
   planStructureWrite,
   isActive,
   notebooksNeedingWideScan,
@@ -42,7 +41,6 @@ import {
   readSyncState,
   sectionIdentity,
   selectionMatchesSeen,
-  TIMESTAMP_JITTER_MS,
   utf8Bytes,
 } from '../src/mirror-schema.ts';
 
@@ -777,153 +775,78 @@ test('a plan keys its writes by the Firestore document id, not the Graph id', ()
 });
 
 // ---------------------------------------------------------------------------
-// Content drift
+// Stamp comparison
 // ---------------------------------------------------------------------------
 
-test('drift is stored-behind-live, and a stored stamp ahead of Graph is not drift', () => {
-  // The direction is the whole point. `resyncPage` stamps `lastModifiedDateTime` from
-  // this process's clock *after* a write returns, so a page written through this server
-  // is stored later than the stamp Graph recorded for the same edit. An inequality test
-  // fires on every one of them, and `markPageStale` deletes the content document.
-  const stored = {
-    id: 'p1',
-    title: 'Page',
-    lastModifiedDateTime: '2026-08-19T12:00:00Z',
-    contentState: 'present' as const,
-  };
+test('stamps that disagree in either direction disagree, at any size', () => {
+  // Direction carried meaning while the sweep's response was `markPageStale`, which
+  // deletes the content document. `resyncPage` stamps `lastModifiedDateTime` from this
+  // process's clock after a write returns, so a page written through this server is
+  // stored *ahead* of the stamp Graph recorded for the same edit — and a symmetric test
+  // destroyed exactly the most-used pages in the account, permanently, because no read
+  // path writes to the mirror. The response is now a re-fetch, which replaces the local
+  // stamp with Graph's. That is the repair rather than the damage, so both directions
+  // belong here and neither is an error.
+  const stored = { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00Z' };
   const live = { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00Z' };
 
-  assert.equal(pageHasDrifted(stored, live), false, 'identical stamps are not drift');
+  assert.equal(pageStampDiffers(stored, live), false, 'identical stamps agree');
   assert.equal(
-    pageHasDrifted(stored, { ...live, lastModifiedDateTime: '2026-08-19T12:01:00Z' }),
+    pageStampDiffers(stored, { ...live, lastModifiedDateTime: '2026-08-19T12:00:01Z' }),
     true,
-    'Graph a minute ahead is an edit the incremental pass missed',
+    'one second later disagrees — no margin, so no real edit is discarded',
   );
   assert.equal(
-    pageHasDrifted(stored, { ...live, lastModifiedDateTime: '2026-08-20T12:00:00Z' }),
+    pageStampDiffers(stored, { ...live, lastModifiedDateTime: '2026-08-20T12:00:00Z' }),
     true,
-    'and so is Graph a day ahead',
+    'and a day later disagrees',
   );
   assert.equal(
-    pageHasDrifted({ ...stored, lastModifiedDateTime: '2026-08-19T12:00:01Z' }, live),
-    false,
-    'stored ahead of Graph is a resyncPage stamp, not a change',
-  );
-  assert.equal(
-    pageHasDrifted({ ...stored, lastModifiedDateTime: '2026-08-19T13:00:00Z' }, live),
-    false,
-    'and stored an hour ahead is not drift either — the tolerance is one-sided',
+    pageStampDiffers({ ...stored, lastModifiedDateTime: '2026-08-19T12:00:02.481Z' }, live),
+    true,
+    'stored ahead of live is the resyncPage shape, and it disagrees like any other',
   );
 });
 
-test('a live stamp inside the jitter margin is not drift, and the boundary is not drift', () => {
-  // Measured 2026-08-21 (api-overview.md, "Graph reports the same unchanged page one
-  // second apart"): four pages in one section, three of them untouched for two days, all
-  // reported a `lastModifiedDateTime` exactly one second later on a second read. A
-  // strict `storedAt < liveAt` reads every one of those as drift, and the sweep's drift
-  // branch calls `markPageStale`, which deletes the page-content document. Nothing
-  // re-fetches a stale page, so one sweep could empty the mirror's content permanently.
-  const stored = {
-    id: 'p1',
-    title: 'Page',
-    lastModifiedDateTime: '2026-08-19T12:00:00Z',
-    contentState: 'present' as const,
-  };
-  const at = (ms: number) => ({
-    id: 'p1',
-    title: 'Page',
-    lastModifiedDateTime: new Date(Date.parse(stored.lastModifiedDateTime) + ms).toISOString(),
-  });
+test('the comparison is on the strings, and nothing is parsed', () => {
+  // Two spellings of one instant disagree, and that is the intended answer rather than a
+  // wart. Graph's measured format carries no fractional seconds (`2026-08-19T19:32:39Z`,
+  // api-overview.md) while `Date.prototype.toISOString` always carries three, so a page
+  // `resyncPage` stamped can hold the second spelling. Re-fetching it costs one Graph
+  // request and ends with Graph's own spelling stored, which is what makes the next sweep
+  // agree. A `Date.parse` compare would leave the local spelling in place for ever, and
+  // that string is printed in every tool result.
+  const stored = { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00.000Z' };
+  const live = { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00Z' };
 
-  assert.equal(TIMESTAMP_JITTER_MS, 2000, 'one observed second, plus one second of margin');
-  assert.equal(
-    pageHasDrifted(stored, at(1000)),
-    false,
-    'the measured case: one second later on the same unchanged page',
-  );
-  // The margin is inclusive of the boundary — drift needs the live stamp *more* than
-  // TIMESTAMP_JITTER_MS later, so a gap of exactly 2000 ms is not drift and 2001 is.
-  assert.equal(pageHasDrifted(stored, at(TIMESTAMP_JITTER_MS)), false, 'exactly 2 s is not drift');
-  assert.equal(pageHasDrifted(stored, at(TIMESTAMP_JITTER_MS + 1)), true, 'one ms past it is');
+  assert.equal(pageStampDiffers(stored, live), true);
 });
 
-test('a locally stamped page in the same second as Graph is not drift', () => {
-  // Graph's measured format carries no fractional seconds (`2026-08-19T19:32:39Z`,
-  // api-overview.md) and `Date.prototype.toISOString` always carries three. A
-  // lexicographic compare puts `.456Z` *before* `Z`, so a resync landing in the same
-  // second as Graph's own stamp would read as drift and cost the page its content copy.
-  const stored = {
-    id: 'p1',
-    title: 'Page',
-    lastModifiedDateTime: '2026-08-19T12:00:01.456Z',
-    contentState: 'present' as const,
-  };
-  const live = { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:01Z' };
+test('an unparseable or empty stamp is a disagreement like any other', () => {
+  // Nothing is parsed, so there is no shape to reject. An empty live stamp is
+  // `toPageSummary`'s fallback for a field Graph did not send; re-fetching on it costs one
+  // request and tells the truth, where treating it as agreement would hide every edit to a
+  // page Graph declines to stamp.
+  const stored = { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00Z' };
 
-  assert.equal(pageHasDrifted(stored, live), false);
+  assert.equal(pageStampDiffers(stored, { ...stored, lastModifiedDateTime: '' }), true);
+  assert.equal(pageStampDiffers(stored, { ...stored, lastModifiedDateTime: 'not-a-date' }), true);
   assert.equal(
-    pageHasDrifted(stored, { ...live, lastModifiedDateTime: '2026-08-19T12:00:10Z' }),
+    pageStampDiffers({ ...stored, lastModifiedDateTime: '' }, { ...stored, lastModifiedDateTime: '' }),
+    false,
+    'two empty stamps still agree, so a page Graph never stamps is fetched once and left alone',
+  );
+});
+
+test('a page the old sweep stored unstamped disagrees with every live stamp', () => {
+  // Before 2026-08-21 a page the sweep discovered was written with `title: ''` and
+  // `new Date(0).toISOString()`. Both reach the calling model. There is no separate
+  // predicate for them any more: the epoch disagrees with anything Graph sends, so the
+  // same branch re-fetches them and the repair writes both fields from Graph's listing.
+  const stored = { id: 'p1', title: '', lastModifiedDateTime: '1970-01-01T00:00:00.000Z' };
+
+  assert.equal(
+    pageStampDiffers(stored, { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00Z' }),
     true,
-    'a stamp clear of the jitter margin really is later',
-  );
-});
-
-test('pageHasDrifted reads only a present copy and a live stamp it can parse', () => {
-  const stored = {
-    id: 'p1',
-    title: 'Page',
-    lastModifiedDateTime: '2026-08-19T12:00:00Z',
-    contentState: 'present' as const,
-  };
-  const live = { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T13:00:00Z' };
-
-  assert.equal(pageHasDrifted(stored, live), true, 'the control: this one does drift');
-  assert.equal(
-    pageHasDrifted({ ...stored, contentState: 'stale' }, live),
-    false,
-    'a copy already stale has no content document to invalidate',
-  );
-  assert.equal(
-    pageHasDrifted({ ...stored, contentState: 'missing' }, live),
-    false,
-    'nor has one recorded as missing',
-  );
-  assert.equal(
-    pageHasDrifted(stored, { ...live, lastModifiedDateTime: '' }),
-    false,
-    'an absent timestamp is not evidence of a change',
-  );
-  assert.equal(
-    pageHasDrifted(stored, { ...live, lastModifiedDateTime: 'not-a-date' }),
-    false,
-    'nor is a stamp that parses to nothing',
-  );
-  assert.equal(
-    pageHasDrifted({ ...stored, lastModifiedDateTime: 'not-a-date' }, live),
-    false,
-    'and an unparseable stored stamp is not compared either',
-  );
-});
-
-test('a page carrying the epoch stamp is one the old sweep discovered', () => {
-  // The pre-2026-08-21 sweep stored a page it discovered with `title: ''` and
-  // `new Date(0).toISOString()`. A stale mark drops its content and leaves the wrong
-  // title answering `list_pages`, so the sweep re-fetches it instead.
-  const stored = {
-    id: 'p1',
-    title: '',
-    lastModifiedDateTime: '1970-01-01T00:00:00.000Z',
-    contentState: 'present' as const,
-  };
-
-  assert.equal(pageNeedsRefetch(stored), true);
-  assert.equal(
-    pageNeedsRefetch({ ...stored, lastModifiedDateTime: '2026-08-19T12:00:00Z' }),
-    false,
-  );
-  assert.equal(
-    pageNeedsRefetch({ ...stored, contentState: 'stale' }),
-    true,
-    'a stale copy carrying the epoch still has a wrong title to repair',
   );
 });

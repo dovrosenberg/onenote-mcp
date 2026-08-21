@@ -55,13 +55,13 @@ import {
   type MirrorNotebook,
   type MirrorPage,
   type MirrorPageContent,
-  type MirrorPageDigest,
   type MirrorSection,
   type MirrorSectionGroup,
   type MirrorSyncState,
   type MirrorTombstone,
   type NotebookSelection,
   type NotebookStructureWrite,
+  type PageStamp,
   type SectionGroupStructureWrite,
   type SectionStructureWrite,
   type StructureIdentity,
@@ -387,12 +387,12 @@ export class MirrorStore {
   }
 
   /** Every stored page in one section, projected to what a sweep reconciles on. */
-  async listPageDigestsInSection(sectionId: string): Promise<MirrorPageDigest[]> {
-    return this.#query<MirrorPageDigest>(
+  async listPageDigestsInSection(sectionId: string): Promise<PageStamp[]> {
+    return this.#query<PageStamp>(
       'listing mirrored page digests',
       this.#pages()
         .where('sectionId', '==', sectionId)
-        .select('id', 'title', 'lastModifiedDateTime', 'contentState'),
+        .select('id', 'title', 'lastModifiedDateTime'),
     );
   }
 
@@ -446,7 +446,15 @@ export class MirrorStore {
     });
   }
 
-  /** Update only the metadata Graph's page list carries, leaving content untouched. */
+  /**
+   * Update only the metadata Graph's page list carries, leaving content untouched.
+   *
+   * `contentSyncedAt` is refreshed too, and that is not an oversight. The only caller is
+   * `writePageFromRaw`'s short-circuit, which has just re-read the page from Graph and
+   * found the stored content identical — so the copy really was confirmed at this moment,
+   * and `contentSyncedAt` is what `mirroredAt` reports to the calling model. Leaving it at
+   * its old value would tell a model the answer is older than it is.
+   */
   async putPageMetadata(
     page: Pick<
       MirrorPage,
@@ -456,7 +464,14 @@ export class MirrorStore {
     await this.#run('writing mirrored page metadata', () =>
       this.#pages()
         .doc(encodeMirrorId(page.id))
-        .set({ ...page, lastModified: new Date(page.lastModifiedDateTime) }, { merge: true }),
+        .set(
+          {
+            ...page,
+            lastModified: new Date(page.lastModifiedDateTime),
+            contentSyncedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        ),
     );
   }
 

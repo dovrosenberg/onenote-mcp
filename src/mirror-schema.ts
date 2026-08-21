@@ -794,121 +794,42 @@ export interface PageStamp {
 }
 
 /**
- * A stored page as a sweep reads it back: a `PageStamp` plus the stored content state.
- * `MirrorPage` satisfies it, and it is the projection `listPageDigestsInSection` asks
- * Firestore for.
+ * Do the mirror's stamp and Graph's stamp for one page disagree?
  *
- * The sweep reads three of the four fields: `id` to reconcile against Graph's ids,
- * `lastModifiedDateTime` to notice drift, and `contentState` to skip a copy that has no
- * content document to invalidate. `title` is read by nothing here. It is in the
- * projection because the shape is `PageStamp` plus one field, and a projection is a list
- * of field names rather than a saving worth splitting the type over.
+ * A hint, not a verdict. It says the two strings are not the same string; it does not
+ * claim the page changed, and the name says so — the sweep's answer to a disagreement is
+ * to re-fetch the page, and `writePageFromRaw`'s content-hash comparison is what decides
+ * whether anything is written. That is why there is no margin, no direction test and no
+ * `Date.parse` here:
+ *
+ * - **No margin.** A tolerance buys jitter-safety by discarding every real edit inside the
+ *   window, and an edit the sweep never notices is served as current for ever. A false
+ *   positive costs one Graph request.
+ * - **No direction.** Stored-ahead-of-live is the signature of a page written through this
+ *   server: `resyncPage` stamps `new Date().toISOString()` from this process's clock,
+ *   because Graph's page *metadata* read is measured-unreliable (`api-overview.md`:
+ *   `GET /pages/{id}?$select=title` answers `""` for a page created seconds earlier). Under
+ *   the old response — `markPageStale`, which deletes the page-content document — firing on
+ *   that direction destroyed the mirrored copy of exactly the most-used pages in the
+ *   account, and nothing put it back, because no read path ever writes to the mirror. A
+ *   re-fetch does the opposite: it replaces the local stamp with Graph's own. **Do not put
+ *   a mark back in that branch.**
+ * - **No parsing.** Two spellings of one instant (`…:00Z` and `…:00.000Z`) disagree, and
+ *   that is wanted: the second is what `resyncPage` writes, `lastModifiedDateTime` is
+ *   printed in every tool result, and a re-fetch is what replaces it with Graph's spelling.
+ *   A parsed compare would leave the local spelling stored for ever.
+ *
+ * A page the pre-2026-08-21 sweep discovered carries `title: ''` and `new Date(0)`, and
+ * needs no predicate of its own: the epoch disagrees with anything Graph sends, so the same
+ * branch re-fetches it and the repair writes both fields from Graph's listing.
+ *
+ * An empty live stamp is `toPageSummary`'s fallback for a field Graph did not send. It
+ * disagrees like any other value, so such a page is re-fetched once per sweep and the
+ * short-circuit declines to store the empty string over a good one. That is the price of
+ * never hiding an edit, and no page Graph stamps ever pays it.
  */
-export interface MirrorPageDigest extends PageStamp {
-  readonly contentState: ContentState;
-}
-
-/**
- * The stamp the sweep synthesized for a page it discovered, before it selected the field.
- *
- * `new Date(0).toISOString()`, written literally so this module keeps its property of
- * having no imports and no computed constants. Documents carrying it are still in the
- * mirror; `pageNeedsRefetch` is what finds them.
- */
-export const UNSTAMPED_PAGE_DATE = '1970-01-01T00:00:00.000Z';
-
-/**
- * Is this a page the old sweep stored with no title and no timestamp?
- *
- * Until 2026-08-21 `listPageIds` asked for `$select=id` alone, so a page the sweep
- * discovered was written with `title: ''` and the epoch. Both reach the calling model —
- * `lastModifiedDateTime` is printed in every tool result and `titleLower` is what by-name
- * matching compares — and neither self-heals: a page moved into a section may not have
- * its own timestamp bumped by the move, so no later incremental lists it.
- *
- * Marking such a page stale would be worse than leaving it: that drops its content
- * document and leaves the wrong title still answering `list_pages`. Re-fetching writes
- * both fields from Graph's own listing, and happens once per document, because the
- * repaired one no longer carries the epoch.
- *
- * `contentState` is not consulted. A stale copy carrying the epoch has the same wrong
- * title, and re-fetching repairs that as well.
- */
-export function pageNeedsRefetch(stored: MirrorPageDigest): boolean {
-  return stored.lastModifiedDateTime === UNSTAMPED_PAGE_DATE;
-}
-
-/**
- * How much later than the stored stamp Graph's may read without that being an edit.
- *
- * **Measured 2026-08-21** (`api-overview.md`, *Graph reports the same page one second
- * apart on two reads*). One scratch section's page listing was read twice. Between the two
- * reads all four pages reported a `lastModifiedDateTime` exactly one second later than
- * before, and three of the four had not been touched for two days — a real edit would have
- * stamped them with that day's date, and they kept their 2026-08-19 dates. So the same
- * unchanged page reports two values one second apart depending on the read. The mechanism
- * is not established.
- *
- * 2000 ms is the one observed second plus one second of margin. It is **not** a clock-skew
- * allowance. Both stamps `pageHasDrifted` compares against this margin come from Graph on
- * the ordinary path, so no second clock is involved; the skew between Graph and this
- * service is a separate measurement, recorded in `api-overview.md` under *Clock skew
- * between Graph and this service*.
- *
- * The cost of the tolerance is that an edit whose Graph stamp lands 2 s or less after the
- * stored stamp is not noticed by the sweep. That is acceptable because the sweep is a
- * backstop rather than the mechanism: `syncSection` re-lists a section whose
- * `lastModifiedDateTime` moved and `writePageFromRaw` compares the content hash, so an
- * edit inside the margin is still caught by the incremental pass on its own next run.
- */
-export const TIMESTAMP_JITTER_MS = 2000;
-
-/**
- * Has Graph's copy of this page moved past the mirror's?
- *
- * **The two sides are not the same clock, and the direction of the comparison is what
- * carries that.** A stored stamp is Graph's own string on every page the sync fetched —
- * but `resyncPage` stamps `new Date().toISOString()` from this process's clock, because
- * Graph's page *metadata* read is measured-unreliable (`api-overview.md`:
- * `GET /pages/{id}?$select=title` answers `""` for a page created seconds earlier). It
- * stamps *after* the write returns, so its value is later than the one Graph recorded for
- * the same edit. Stored-ahead-of-live is therefore the ordinary signature of a page
- * written through this server, and it must not fire: `markPageStale` deletes the content
- * document, and no read path ever writes to the mirror, so an inequality test destroys
- * the mirrored copy of every page this server writes and nothing puts it back.
- *
- * Only stored-behind-live is evidence of an edit. An edit made in the OneNote client
- * moves Graph ahead of whatever the mirror holds, including in a frozen notebook, which
- * no incremental pass ever re-lists.
- *
- * **And only by more than `TIMESTAMP_JITTER_MS`.** Graph reported the same unchanged page
- * one second apart across two reads — see that constant. The margin is applied to this
- * direction alone and must stay that way: a symmetric one (`Math.abs`) would put the
- * stored-ahead case back inside the test for every write whose local stamp lands within
- * two seconds of Graph's, which is the case above that destroys data. The boundary is
- * inclusive of the margin: a gap of exactly `TIMESTAMP_JITTER_MS` is not drift.
- *
- * **The comparison is on parsed milliseconds, not on the strings.** A lexicographic `<`
- * would be a correct chronological compare only if both sides carried the same precision,
- * and they do not: Graph's measured format has no fractional seconds
- * (`2026-08-19T19:32:39Z`, api-overview.md) while `Date.prototype.toISOString` always has
- * three. `'…:01.456Z' < '…:01Z'` is true because `.` sorts below `Z`, so a resync landing
- * in the same second as Graph's stamp would read as drift.
- *
- * A copy that is not `present` has no content document to invalidate, and re-marking it
- * would be a Firestore write per already-stale page on every nightly sweep. An empty live
- * stamp is `toPageSummary`'s fallback for an absent field, which is not evidence of
- * anything, and a stamp of any shape `Date.parse` rejects is treated the same way — the
- * safe answer here is the one that changes nothing.
- */
-export function pageHasDrifted(stored: MirrorPageDigest, live: PageStamp): boolean {
-  if (stored.contentState !== 'present') return false;
-
-  const storedAt = Date.parse(stored.lastModifiedDateTime);
-  const liveAt = Date.parse(live.lastModifiedDateTime);
-  if (Number.isNaN(storedAt) || Number.isNaN(liveAt)) return false;
-
-  return liveAt - storedAt > TIMESTAMP_JITTER_MS;
+export function pageStampDiffers(stored: PageStamp, live: PageStamp): boolean {
+  return stored.lastModifiedDateTime !== live.lastModifiedDateTime;
 }
 
 export interface MirrorPageContent {

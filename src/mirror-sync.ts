@@ -13,8 +13,11 @@
 // ever noticed: Graph has no /delta on any OneNote resource and no tombstone for a
 // deleted page, and the account-wide page list that would enumerate everything cheaply is
 // the banned one, error 20266. It is also the only thing that notices a page edited in
-// the OneNote client that the incremental pass missed — a stored stamp behind Graph's is
-// marked stale, which sends the next read to Graph and costs no request here.
+// the OneNote client that the incremental pass missed, and the only thing that finds a
+// page *moved into* a section — measured 2026-08-21, a move keeps the page's stamp, so it
+// is below every later watermark. Both come from one comparison: a stored stamp that is
+// not the same string as Graph's sends the page back through `syncPage`, and the content
+// hash decides whether anything is written.
 //
 // Everything below follows from four things measured against the real account:
 //
@@ -67,13 +70,11 @@ import {
   inkmlObjectName,
   notebookIdentity,
   overlapFrom,
-  pageHasDrifted,
-  pageNeedsRefetch,
+  pageStampDiffers,
   sectionIdentity,
   utf8Bytes,
   type MirrorPage,
   type MirrorPageContent,
-  type MirrorPageDigest,
   type MirrorSection,
   type MirrorSectionGroup,
   type MirrorSyncState,
@@ -81,6 +82,7 @@ import {
   type NotebookSelection,
   type NotebookStructureWrite,
   type NotebookTreeFields,
+  type PageStamp,
   type SectionGroupStructureWrite,
   type SectionGroupTreeFields,
   type SectionStructureWrite,
@@ -137,10 +139,16 @@ export interface SyncStore {
   setChildGroupsKnown(groupId: string, known: boolean): Promise<void>;
   getPage(pageId: string): Promise<MirrorPage | null>;
   putPage(page: MirrorPage, content: MirrorPageContent | null): Promise<void>;
+  putPageMetadata(page: PageMetadataWrite): Promise<void>;
   deletePage(tombstone: MirrorTombstone): Promise<void>;
-  listPageDigestsInSection(sectionId: string): Promise<MirrorPageDigest[]>;
-  markPageStale(pageId: string): Promise<void>;
+  listPageDigestsInSection(sectionId: string): Promise<PageStamp[]>;
 }
+
+/** The fields a short-circuited page write corrects without touching stored content. */
+export type PageMetadataWrite = Pick<
+  MirrorPage,
+  'id' | 'title' | 'titleLower' | 'sectionId' | 'notebookId' | 'sectionPath' | 'lastModifiedDateTime'
+>;
 
 export interface SyncDeps {
   readonly graph: SyncGraph;
@@ -165,8 +173,6 @@ export interface SyncReport {
   readonly sectionsVisited: number;
   readonly pagesUpdated: number;
   readonly pagesDeleted: number;
-  /** Pages the sweep found changed in Graph and invalidated without re-reading. */
-  readonly pagesStaled: number;
   readonly pagesFailed: number;
   /** Selected notebook ids matching no notebook. A mistyped id is silent otherwise. */
   readonly unknownNotebookIds: number;
@@ -438,7 +444,6 @@ interface Tally {
   sectionsVisited: number;
   pagesUpdated: number;
   pagesDeleted: number;
-  pagesStaled: number;
   pagesFailed: number;
   unknownNotebookIds: number;
   unknownActiveNotebookIds: number;
@@ -471,7 +476,6 @@ async function runMode(
     sectionsVisited: 0,
     pagesUpdated: 0,
     pagesDeleted: 0,
-    pagesStaled: 0,
     pagesFailed: 0,
     unknownNotebookIds: 0,
     unknownActiveNotebookIds: 0,
@@ -512,7 +516,6 @@ async function runMode(
     sectionsVisited: tally.sectionsVisited,
     pagesUpdated: tally.pagesUpdated,
     pagesDeleted: tally.pagesDeleted,
-    pagesStaled: tally.pagesStaled,
     pagesFailed: tally.pagesFailed,
     unknownNotebookIds: tally.unknownNotebookIds,
     unknownActiveNotebookIds: tally.unknownActiveNotebookIds,
@@ -537,7 +540,6 @@ async function runMode(
     sectionsVisited: report.sectionsVisited,
     pagesUpdated: report.pagesUpdated,
     pagesDeleted: report.pagesDeleted,
-    pagesStaled: report.pagesStaled,
     pagesFailed: report.pagesFailed,
     sectionsSkippedInactive: report.sectionsSkippedInactive,
     durationMs: report.durationMs,
@@ -1056,7 +1058,7 @@ function placementOf(section: MirrorSection): PagePlacement {
 
 /** The narrow slice both the sync and a post-write resync write through. */
 export interface PageWriteDeps {
-  readonly store: Pick<SyncStore, 'getPage' | 'putPage'>;
+  readonly store: Pick<SyncStore, 'getPage' | 'putPage' | 'putPageMetadata'>;
   readonly blobs: MirrorBlobWriter;
 }
 
@@ -1101,6 +1103,29 @@ export async function writePageFromRaw(
     stored.title === summary.title &&
     stored.sectionId === placement.sectionId
   ) {
+    // The content is right. The stamp may not be, and it has to be corrected here or
+    // nowhere: `resyncPage` writes this process's clock into `lastModifiedDateTime`,
+    // nothing above compares that field, and the string is printed in every tool result.
+    // The sweep re-fetches any page whose stored stamp disagrees with Graph's, so without
+    // this write the local value is permanent and that page is fetched again on every
+    // sweep, for ever.
+    //
+    // An empty live stamp is `toPageSummary`'s fallback for a field Graph did not send and
+    // must not overwrite a good stored one.
+    if (
+      summary.lastModifiedDateTime !== '' &&
+      summary.lastModifiedDateTime !== stored.lastModifiedDateTime
+    ) {
+      await deps.store.putPageMetadata({
+        id: summary.id,
+        title: summary.title,
+        titleLower: summary.title.toLowerCase(),
+        sectionId: placement.sectionId,
+        notebookId: placement.notebookId,
+        sectionPath: placement.sectionPath,
+        lastModifiedDateTime: summary.lastModifiedDateTime,
+      });
+    }
     return false;
   }
 
@@ -1197,16 +1222,16 @@ async function deletePage(
 
 /**
  * Enumerate each section's pages and reconcile them against the mirror: deletions,
- * content drift, and discoveries.
+ * stamp disagreements, and discoveries.
  *
  * `unscoped` false sweeps only sections whose timestamp moved since the last sweep,
  * which the probe supports — a delete moves it. `unscoped` true sweeps every mirrored
  * section, and is the weekly backstop against the timestamp missing something.
  *
- * The sweep also queues pages Graph has that the mirror lacks. A page *moved into* a
- * mirrored section may not have its own `lastModifiedDateTime` bumped by the move — the
- * same class of unknown as the section roll-up — so without this it would be invisible
- * until someone next edited it.
+ * The sweep also queues pages Graph has that the mirror lacks. Measured 2026-08-21, a page
+ * moved between sections keeps the `lastModifiedDateTime` it already had, so it sits below
+ * every later section watermark and `listPagesChangedSince` never returns it. Without this
+ * loop it would be invisible until someone next edited it.
  */
 async function sweepPass(
   ctx: PassContext,
@@ -1285,9 +1310,9 @@ async function learnNestedGroups(ctx: PassContext): Promise<void> {
 }
 
 /**
- * One section's page reconciliation: deletions, content drift, and discoveries.
+ * One section's page reconciliation: deletions, stamp disagreements, and discoveries.
  *
- * **A failed enumeration deletes nothing and marks nothing.** An auth failure or a 500
+ * **A failed enumeration deletes nothing and fetches nothing.** An auth failure or a 500
  * would otherwise empty the mirror one section at a time, and nothing about a deleted
  * page is recoverable from here. That is the single most important line in this file.
  */
@@ -1309,12 +1334,14 @@ async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<v
   const mirrored = await ctx.deps.store.listPageDigestsInSection(section.id);
 
   for (const stored of mirrored) {
-    // Bounded, like the discovery loop below it, and for a cost the request budget does
-    // not otherwise see: a deletion is two Firestore writes, a stale mark is one plus a
-    // document delete, and a repair spends a Graph request as well. The first sweep after
-    // a deploy is when all three are most widespread. An early return skips
-    // `setSectionSweepResult`, so this section is not recorded as swept, and `done: false`
-    // is what makes the run report `budget-exhausted` rather than a clean pass.
+    // Bounded, like the discovery loop below it. A deletion is two Firestore writes the
+    // request budget does not otherwise see, and a stamp disagreement now costs a Graph
+    // request as well — so without this check one section could spend a content fetch per
+    // mirrored page in it, against 400 an hour shared with every interactive tool call.
+    // The first sweep after a deploy is when both are most widespread. An early return
+    // skips `setSectionSweepResult`, so this section is not recorded as swept, and
+    // `done: false` is what makes the run report `budget-exhausted` rather than a clean
+    // pass.
     if (ctx.budget.exhausted) {
       ctx.tally.done = false;
       return;
@@ -1331,32 +1358,24 @@ async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<v
     // the pages Graph has that the mirror lacks, which is what the loop below wants.
     liveById.delete(stored.id);
 
-    // A page the pre-2026-08-21 sweep discovered carries `title: ''` and the epoch, and a
-    // stale mark repairs neither — it drops the content document and leaves the wrong
-    // title answering `list_pages`. The epoch is behind every live stamp, so these are
-    // exactly the documents the drift branch below would otherwise gut. Re-fetching costs
-    // one Graph request, once per document.
-    if (pageNeedsRefetch(stored)) {
-      await syncPage(ctx, section, match);
-      continue;
-    }
-
-    // The sweep's second job, and it costs no Graph request: a page whose stored stamp is
-    // behind Graph's is content the mirror would otherwise serve as current. Marking it
-    // stale sends the next read to Graph, which cannot be wrong. Fetching it here instead
-    // would put a content request per drifted page inside a run already sized against the
-    // hourly budget.
+    // The sweep's second job: the two stamps disagree, so re-read the page. The stamp is a
+    // hint and nothing more — `writePageFromRaw` compares the content hash and writes only
+    // if something actually changed, and corrects the stored stamp when nothing did, which
+    // is what stops the next sweep asking again.
     //
-    // One case fires here that did not need to, and it is left knowingly:
-    // `writePageFromRaw`'s short-circuit compares the content hash, the title and the
-    // section and never writes `lastModifiedDateTime`, so a page the incremental re-read
-    // and found unchanged keeps its old stamp while Graph's moves. Its content is current
-    // and it is marked stale anyway — correct, and one wasted content fetch on the next
-    // read of it. Task 5 of
-    // `docs/superpowers/plans/2026-08-20-sync-graph-call-reduction.md` closes it by having
-    // the short-circuit call `MirrorStore.putPageMetadata`, which exists and is called
-    // from nowhere today.
-    if (pageHasDrifted(stored, match)) await markDrifted(ctx, stored.id);
+    // **This must not become a stale mark.** `markPageStale` deletes the page-content
+    // document, and nothing re-fetches a stale page: the incremental will not list a page
+    // whose Graph stamp is behind the section watermark, no read path writes to the
+    // mirror, and a mark is therefore permanent. `resyncPage` stamps this process's clock,
+    // so a page written through this server is stored *ahead* of Graph — one sweep could
+    // delete the mirrored content of every page the server has ever written. A re-fetch
+    // repairs that case instead of destroying it, which is why the comparison needs no
+    // direction test and no tolerance, and why no edit is too small for it to notice.
+    //
+    // It also subsumes the pre-2026-08-21 discovered pages, which carry `title: ''` and
+    // `new Date(0)`: the epoch disagrees with anything Graph sends, and the re-fetch writes
+    // both fields from Graph's listing.
+    if (pageStampDiffers(stored, match)) await syncPage(ctx, section, match);
   }
 
   // Pages Graph has that the mirror lacks — new, or moved in. Fetched now, budget
@@ -1374,25 +1393,6 @@ async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<v
     pageCount: live.length,
     lastSweptAt: ctx.startedAtIso,
   });
-}
-
-/**
- * Mark one page's stored content stale, and keep sweeping if Firestore refuses.
- *
- * The `catch` is not the write path's "a failed invalidation never fails a write" — there
- * is no write here to protect. It is that this sweep is the only pass that reconciles
- * deletions, and one section's Firestore failure must not cost every section after it its
- * deletion pass. The page is counted into `pagesFailed`, so the run does not report a
- * clean pass over a section it left in an unknown state.
- */
-async function markDrifted(ctx: PassContext, pageId: string): Promise<void> {
-  try {
-    await ctx.deps.store.markPageStale(pageId);
-    ctx.tally.pagesStaled += 1;
-  } catch (err) {
-    logEvent('mirror-page-failed', { pageId, reason: reasonOf(err) });
-    ctx.tally.pagesFailed += 1;
-  }
 }
 
 /** A reason string for a log line. Never a message, which can carry a request body. */
@@ -1416,7 +1416,7 @@ export interface ResyncHint {
 
 export interface ResyncDeps extends PageWriteDeps {
   readonly content: SyncContent;
-  readonly store: Pick<SyncStore, 'getPage' | 'putPage' | 'deletePage'> & {
+  readonly store: Pick<SyncStore, 'getPage' | 'putPage' | 'putPageMetadata' | 'deletePage'> & {
     getSection(sectionId: string): Promise<MirrorSection | null>;
   };
   readonly now?: () => number;

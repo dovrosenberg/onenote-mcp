@@ -226,9 +226,9 @@ section at a time; a section whose page listing failed keeps its old watermark, 
 next run retries it rather than skipping every page it never reached; a budget-exhausted
 run keeps the advances it earned, because the backfill is five hours of slices; and an
 unchanged content hash writes nothing and renders no ink, which is what makes the hour of
-watermark overlap nearly free; and a sweep that found a page drifted marks it stale
-without fetching it, so the check that closes the permanent-staleness hole costs no Graph
-request. What no test there covers is whether Graph's timestamps
+watermark overlap nearly free; and a sweep whose two stamps disagree re-fetches the page
+rather than marking it stale, because a mark deletes the content document and nothing
+re-fetches a stale page. What no test there covers is whether Graph's timestamps
 behave as the algorithm assumes — that a page create, edit and delete each move the
 section's `lastModifiedDateTime` is measured in `api-overview.md`, not checked here.
 
@@ -1034,55 +1034,57 @@ stored with — before this the sweep synthesized `''` and `1970-01-01T00:00:00.
 both reach the calling model: `lastModifiedDateTime` is printed in every tool result and
 `titleLower` is what by-name matching compares. Neither self-heals, because a page moved
 into a section may not have its own timestamp bumped by the move, so no later incremental
-lists it. `lastModifiedDateTime` is what makes `pageHasDrifted` in `src/mirror-schema.ts`
-possible: a page in both places whose stored stamp is *behind* Graph's by more than
-`TIMESTAMP_JITTER_MS` is marked stale
-rather than fetched, which is the only thing in this repository that notices an edit made
-in the OneNote client that the incremental pass missed. Marking rather than fetching is
-the point — a content request per drifted page would sit inside a run already sized
-against the hourly 400, where a stale marker sends the next read to Graph and costs
-nothing here.
+lists it — measured 2026-08-21 and recorded in `api-overview.md`: a page moved between
+sections keeps the stamp it had, so it is below any later watermark and **only the sweep
+can find it**. `lastModifiedDateTime` is what makes `pageStampDiffers` in
+`src/mirror-schema.ts` possible: a page in both places whose two stamps are not the same
+string is re-fetched, which is the only thing in this repository that notices an edit made
+in the OneNote client that the incremental pass missed.
 
-**The drift comparison is one-directional, and that is what keeps it from destroying the
-mirror.** The two stamps are not the same clock. `resyncPage` stamps
-`new Date().toISOString()` from this process's clock *after* a write returns, because
-Graph's page metadata read is measured-unreliable, so a page written through this server
-is stored **later** than the stamp Graph recorded for the same edit. `markPageStale`
-deletes the content document, and nothing puts it back — no read path writes to the
-mirror, and the incremental will not re-fetch a page whose Graph stamp is behind the
-section watermark — so an inequality test destroys the mirrored copy of every page this
-server writes, on the next sweep, for ever. Only stored-behind-live is evidence of an
-edit. The comparison is on `Date.parse` milliseconds rather than on the strings, because
-Graph's measured format carries no fractional seconds and `toISOString` always carries
-three, and `'…:01.456Z' < '…:01Z'` is lexicographically true.
+**A stamp difference triggers a re-fetch, never a stale mark, and the difference between
+those two is data loss.** `markPageStale` deletes the page-content document, and nothing
+re-fetches a stale page — no read path writes to the mirror, the incremental will not list
+a page whose Graph stamp is behind the section watermark, so a mark is permanent. Since
+`resyncPage` stamps `new Date().toISOString()` from this process's clock after a write
+returns, every page written through this server is stored *ahead* of Graph, and a
+mark-on-difference would delete the mirrored content of exactly the account's most-used
+pages. A re-fetch does the opposite: the page comes back with Graph's own string in place
+of the local one, which is the repair. **Do not put a mark back in that branch.**
 
-**And stored-behind-live is not enough on its own: it has to be behind by more than
-`TIMESTAMP_JITTER_MS`.** Measured 2026-08-21 and recorded in `api-overview.md` under
-*Graph reports the same page one second apart on two reads* — one section's page listing
-was read twice and all four pages came back exactly one second later the second time,
-three of them untouched for two days. So a stored stamp one second behind a live one is
-the ordinary reading of an unchanged page, and a strict `<` stales it and deletes its
-content document. The margin is 2000 ms: the one observed second, plus one second of
-room. It is not a clock-skew allowance. The margin applies to this direction only — a
-symmetric `Math.abs` puts the `resyncPage` case back inside the test, which is the failure
-the paragraph above exists to prevent. What it costs is that an edit landing within two
-seconds of the stored stamp is invisible to the sweep, which is acceptable because the
-sweep is a backstop and the incremental pass notices a content change by hash.
+**The comparison has no margin, no direction test and no `Date.parse`, and the re-fetch is
+what makes all three affordable.** A tolerance buys jitter-safety by discarding every real
+edit inside its window, and an edit the sweep never notices is served as current for ever;
+a false positive costs one Graph request. Direction stopped mattering once the response
+became a re-fetch. Parsing stopped mattering for the same reason: two spellings of one
+instant (`…:00Z` from Graph, `…:00.000Z` from `resyncPage`) disagree, they are re-fetched
+once, and the short-circuit stores Graph's spelling — where a parsed compare would leave
+the local one in a field every tool result prints. Graph's own one-second wobble on an
+unchanged page, measured 2026-08-21, is absorbed the same way: one request, then agreement.
+`contentState` is not consulted either, so a stale or missing copy in a swept section is
+repaired rather than skipped, and the pre-2026-08-21 documents carrying `title: ''` and
+`1970-01-01T00:00:00.000Z` need no predicate of their own — the epoch disagrees with
+anything Graph sends.
 
-A copy that is not `present` is skipped: it has no content document to invalidate, and
-re-marking it would be a Firestore write per already-stale page on every nightly sweep.
-That is *not* the same as "already a miss for every read" — a non-`present` copy is a miss
-for `get_page_content` alone, while `list_pages`, `list_pages_by_name`,
-`find_page_by_name` and `search_pages` all answer from the same page documents with no
-`contentState` check. A live stamp `Date.parse` rejects, including `toPageSummary`'s empty
-fallback for an absent field, is not evidence of anything.
+**The stamp is a hint; `writePageFromRaw`'s content hash is the check.** A re-fetch whose
+content is identical writes no page document, so a false positive costs one Graph request
+and one small Firestore write rather than a re-render and a blob upload.
 
-**A page carrying the epoch stamp is re-fetched rather than marked.** `pageNeedsRefetch`
-finds the documents the pre-2026-08-21 sweep wrote with `title: ''` and
-`1970-01-01T00:00:00.000Z`. The epoch is behind every live stamp, so the drift branch
-would gut them — dropping content that was correct and leaving the wrong title still
-answering `list_pages`, which is what a listing matches on. `syncPage` writes both fields
-from Graph's own listing, costs one request, and happens once per document.
+**A short-circuited page write corrects the stored stamp, and without that the sweep never
+converges.** `writePageFromRaw` compares the content hash, the title and the section and
+deliberately does not compare `lastModifiedDateTime` — including it would rewrite every
+page the watermark overlap re-read. But leaving the stored stamp alone means the next sweep
+disagrees with Graph again and fetches the same page for ever. So the short-circuit calls
+`MirrorStore.putPageMetadata`, which writes the metadata fields and refreshes
+`contentSyncedAt` — the caller has just confirmed the content against Graph, and
+`contentSyncedAt` is what `mirroredAt` reports to the model. It fires only when the two
+stamps differ, because it is a Firestore write per page and the overlap re-reads every page
+edited in the last hour on every run. A live stamp of `''` never overwrites a stored one:
+that is `toPageSummary`'s fallback for a field Graph did not send, not a timestamp.
+
+**The sweep's reconciliation loop checks the request budget, and that check now guards
+Graph requests rather than only Firestore writes.** A disagreement costs a content fetch,
+so a loop that ignored the budget could spend one per mirrored page in a section, against
+400 an hour shared with every interactive tool call.
 
 **An inactive notebook is backfilled once and then never re-listed.** `activeNotebookIds`
 in the selection document names which mirrored notebooks a sync still re-checks; absent or

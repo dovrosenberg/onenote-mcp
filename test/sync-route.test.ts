@@ -42,7 +42,6 @@ function report(overrides: Partial<SyncReport> = {}): SyncReport {
     sectionsVisited: 1,
     pagesUpdated: 2,
     pagesDeleted: 0,
-    pagesStaled: 0,
     pagesFailed: 0,
     unknownNotebookIds: 0,
     unknownActiveNotebookIds: 0,
