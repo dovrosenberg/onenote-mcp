@@ -393,6 +393,22 @@ test('notebooksNeedingWideScan names only what became mirrored or active', () =>
   );
 });
 
+test('a null active list resolves through the tree, not through the selection', () => {
+  // The third parameter is the notebooks the tree actually returned as mirrored, which is
+  // not `current.notebookIds`: a selected id naming no notebook is in the second list and
+  // not the first. `activeNotebookIds: null` means "every mirrored notebook is active", so
+  // resolving it through the selection would widen for a notebook that does not exist.
+  const previous = { mirrored: ['a', 'b', 'ghost'], active: ['a'] };
+  const current = { notebookIds: ['a', 'b', 'ghost'], activeNotebookIds: null };
+
+  assert.deepEqual(notebooksNeedingWideScan(previous, current, ['a', 'b']), ['b']);
+  // What the selection-resolved answer would have been, for contrast.
+  assert.deepEqual(notebooksNeedingWideScan(previous, current, current.notebookIds), [
+    'b',
+    'ghost',
+  ]);
+});
+
 test('a state document written before the selection fields reads as never recorded', () => {
   // What is actually deployed: `activeSelectionHash` and none of the fields that replaced
   // it. `mirroredNotebookIdsSeen` null is what makes the first run after this deploy
