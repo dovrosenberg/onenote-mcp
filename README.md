@@ -653,6 +653,11 @@ on this account — and the inline refresh's 12-request budget would take weeks 
 Delete the job once `sync/state.backfillComplete` is true, which is when every mirrored
 section has a non-null `pagesSyncedThrough`. Nothing else calls `POST /sync`.
 
+**The first structure write after upgrading rewrites every document once.** Structure
+documents carry an `identity` string that says what the tree said about them, and a
+document written before that field existed has none — so it does not match and is written.
+It is one pass of Firestore writes and no Graph requests, and it happens once.
+
 **An inactive notebook is backfilled once and then frozen.** `activeNotebookIds` in the
 selection document is what draws that line — see **Choosing what to mirror**. A selected
 notebook that is not active is filled by the backfill and served from the mirror for ever
@@ -703,8 +708,9 @@ the clock, on sections whose pages were cheaper to render.
 | Cadence | Requests/hour at budget 120 | |
 |---|---|---|
 | `*/20` | up to 360 | the fastest cadence that cannot exceed the limit |
+| `*/15` | up to 480 | under it while runs stay clock-bound, over it when they are not |
 | `*/10` | up to 720 | over the limit whenever runs are request-bound |
-| `*/5` | up to 1440 | **over the limit** — what is running today, by explicit choice |
+| `*/5` | up to 1440 | measured against this account on 2026-08-20: 429s within 45 minutes |
 
 Past 400 an hour Graph answers 429 with OData code `10007`. A refused request does no work
 and still spends the attempt, the section's watermark does not advance, and the penalty
@@ -761,8 +767,10 @@ gcloud scheduler jobs delete onenote-mcp-sync \
   --project="$GCP_PROJECT" --location="$GCP_REGION"
 ```
 
-The backfill job on the deployed account is at `*/5` rather than the `*/20` above, which
-puts it over the hourly limit deliberately — see **What it costs** for what that trades.
+The backfill job on the deployed account is at `*/15`. That is under the limit while runs
+stay clock-bound — measured at 61–81 requests per run on 2026-08-20 — and over it if they
+start spending the full 120-request budget again. `*/20` is the cadence that cannot exceed
+it either way; dropping `MIRROR_SYNC_REQUEST_BUDGET` to 100 makes `*/15` safe as well.
 
 Retries are safe on both: every mode is idempotent, and a retry after a budget-exhausted
 run is actively useful during the backfill. While both jobs exist, the run lease makes an
@@ -795,9 +803,11 @@ changes is that no incremental pass and no sweep re-checks it once its backfill 
 an edit made in the OneNote client to an inactive notebook does not reach the mirror until
 the notebook is made active again or `/sync/sweep/all` is run by hand.
 
-Moving a notebook back into `activeNotebookIds` is safe: the next run notices the active set
-changed, clears `sectionsScannedThrough`, and re-lists every active section against its own
-per-section watermark. Only pages that genuinely changed are fetched.
+Moving a notebook back into `activeNotebookIds` is safe, and it costs only that notebook:
+the next run diffs the stored lists, finds the one id that became active, and re-lists that
+notebook's sections against their own per-section watermarks. Every other notebook keeps its
+watermark and is not listed. Only pages that genuinely changed are fetched. Adding a notebook
+to `notebookIds` behaves the same way.
 
 An id in `notebookIds` matching no notebook is reported as `unknownNotebookIds` in every run
 report. An id in `activeNotebookIds` naming no *mirrored* notebook — a typo, or a real
