@@ -44,8 +44,11 @@
 // saw. Per section because a budget-bounded run does not finish, and a global watermark
 // advanced past sections it never visited loses every edit in them permanently.
 // Pass-start because Graph's clock and this service's clock are not the same clock; the
-// hour of overlap in `overlapFrom` covers the difference, and a re-fetch of an unchanged
-// page is nearly free because `contentHash` short-circuits it.
+// hour of overlap `overlapFrom` reaches back covers the difference, and a page it
+// re-lists that has not changed costs nothing at all — `storedPageIsCurrent` skips it
+// without a request. The *section* scan reaches back a shorter distance for the opposite
+// reason: every section it surfaces costs a listing request. The two windows are
+// `WATERMARK_OVERLAP_MS` and `SECTION_SCAN_OVERLAP_MS` in ./mirror-schema.ts.
 
 import { createHash } from 'node:crypto';
 
@@ -74,6 +77,7 @@ import {
   pageStampDiffers,
   sectionIdentity,
   storedPageIsCurrent,
+  SECTION_SCAN_OVERLAP_MS,
   utf8Bytes,
   type MirrorPage,
   type MirrorPageContent,
@@ -698,9 +702,9 @@ async function reconcileStructure(ctx: PassContext): Promise<StructureResult> {
  * set carried in the state document, plus whatever this run's diff added. Without it a
  * notebook just mirrored or just activated would never be re-checked — tier 1 skips a
  * section whose `graphLastModifiedDateTime` is older than
- * `overlapFrom(state.sectionsScannedThrough)`, and that cutoff advances on every completed
- * run, so a section last edited three months ago while its notebook was frozen is older
- * than the cutoff for ever.
+ * `overlapFrom(state.sectionsScannedThrough, SECTION_SCAN_OVERLAP_MS)`, and that cutoff
+ * advances on every completed run, so a section last edited three months ago while its
+ * notebook was frozen is older than the cutoff for ever.
  *
  * `sectionsScannedThrough` is deliberately not touched. Nulling it is what this replaced,
  * and it is a global value: one activation made every mirrored active section a
@@ -891,7 +895,7 @@ export function pickCandidates(
   const observed = withLiveMtimes(sections, live);
   if (!state.sectionRollUpTrusted || !mayFilterByTimestamp) return observed;
 
-  const since = overlapFrom(state.sectionsScannedThrough);
+  const since = overlapFrom(state.sectionsScannedThrough, SECTION_SCAN_OVERLAP_MS);
   return observed.filter(
     (section) =>
       // First, because it is the only clause that can be true of a section every other

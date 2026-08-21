@@ -1107,9 +1107,10 @@ scan for the notebooks it named. So `active` is recorded separately, in
 
 **A selection change widens the scan for the notebooks it named, and for no others.**
 Tier 1 of `pickCandidates` skips a section whose `graphLastModifiedDateTime` is older than
-`overlapFrom(state.sectionsScannedThrough)`, and that cutoff advances on every completed
-run — so a notebook just added to `notebookIds`, or just added to `activeNotebookIds`, has
-sections months older than the cutoff that nothing else would ever make candidates again.
+`overlapFrom(state.sectionsScannedThrough, SECTION_SCAN_OVERLAP_MS)`, and that cutoff
+advances on every completed run — so a notebook just added to `notebookIds`, or just added
+to `activeNotebookIds`, has sections months older than the cutoff that nothing else would
+ever make candidates again.
 `notebooksNeedingWideScan` in `src/mirror-schema.ts` diffs the two lists the state document
 recorded against the two the selection document now holds, and returns only the ids that
 became mirrored or became active; `pickCandidates` bypasses the cutoff for those notebooks'
@@ -1166,6 +1167,17 @@ the lists and widens nothing. There is no separate flag for it — treating it a
 would make the first run after the deploy a full-width scan, and a boolean saying which
 null it was would be a second answer to a question `mirroredNotebookIdsSeen` already
 settles.
+
+**There are two overlap windows and they are different widths on purpose.**
+`WATERMARK_OVERLAP_MS` (an hour) is how far back a *section's page listing* reaches beyond
+that section's `pagesSyncedThrough`; a page it surfaces that has not changed costs no Graph
+request, because `storedPageIsCurrent` skips it from the listing's own stamp and title, so
+the width buys margin and spends bytes. `SECTION_SCAN_OVERLAP_MS` (fifteen minutes) is how
+far back tier 1 of `pickCandidates` reaches beyond `sectionsScannedThrough`; every section
+it surfaces costs one `listPagesChangedSince` on every run for as long as the window lasts.
+Do not collapse them back into one constant. The evidence that the narrower one is too
+narrow is an `ageMs` above 900000 on a `sync-overlap-save` line; `README.md` carries the
+query under **Proving it works**, beside the `graph-clock-skew` one.
 
 **Activity never touches the write path.** `resyncPage` consults `section.mirrored` and
 nothing else, so a write to a frozen notebook still marks the page stale, still reaches

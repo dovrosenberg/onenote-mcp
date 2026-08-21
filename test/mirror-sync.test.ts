@@ -1049,18 +1049,60 @@ test('a wide-scan notebook is a candidate whatever the cutoff says', () => {
   );
 });
 
-test('the overlap window is applied, so a section on the boundary is not skipped', () => {
-  // Graph's clock and this service's are not the same clock. A section modified fifty
-  // minutes before the last pass started still gets visited.
+test('the section scan window is fifteen minutes, not an hour', () => {
+  // The two windows cost different things. This one keeps an edited section a candidate,
+  // at one `listPagesChangedSince` per run for as long as it lasts; an hour of that was
+  // the last term worth cutting. `outside` is the section an hour-wide cutoff would still
+  // be listing.
   const state: MirrorSyncState = {
     ...initialSyncState(),
     sectionsScannedThrough: '2026-08-19T12:00:00.000Z',
   };
-  const sections = [section({ id: 'just-before', graphLastModifiedDateTime: '2026-08-19T11:10:00Z' })];
+  const sections = [
+    section({ id: 'inside', graphLastModifiedDateTime: '2026-08-19T11:50:00Z' }),
+    section({ id: 'outside', graphLastModifiedDateTime: '2026-08-19T11:40:00Z' }),
+    section({
+      id: 'never',
+      graphLastModifiedDateTime: '2020-01-01T00:00:00Z',
+      pagesSyncedThrough: null,
+    }),
+    section({
+      id: 'widened',
+      notebookId: 'nb-2',
+      graphLastModifiedDateTime: '2020-01-01T00:00:00Z',
+    }),
+  ];
+
+  // Both clauses that outrank the cutoff are here rather than in tests of their own,
+  // because narrowing the window is the change most likely to take them with it: a
+  // never-synced section and a section in a notebook being caught up on are both months
+  // older than any cutoff, and both must survive it.
+  assert.deepEqual(
+    pickCandidates(sections, NO_LIVE, {
+      state,
+      mayFilterByTimestamp: true,
+      wideScanNotebookIds: new Set(['nb-2']),
+    }).map((s) => s.id),
+    ['inside', 'never', 'widened'],
+  );
+});
+
+test('the scan cutoff is closed, so a section stamped exactly on it is a candidate', () => {
+  // Graph's clock and this service's are not the same clock: the stamp compared is
+  // Graph's and the watermark is this process's. The boundary is closed for the same
+  // reason `overlapSaveAgeMs` reads a stamp equal to the watermark as inside the window.
+  const state: MirrorSyncState = {
+    ...initialSyncState(),
+    sectionsScannedThrough: '2026-08-19T12:00:00.000Z',
+  };
+  const sections = [
+    section({ id: 'on-it', graphLastModifiedDateTime: '2026-08-19T11:45:00.000Z' }),
+    section({ id: 'a-ms-before', graphLastModifiedDateTime: '2026-08-19T11:44:59.999Z' }),
+  ];
 
   assert.deepEqual(
     pickCandidates(sections, NO_LIVE, opts(state, true)).map((s) => s.id),
-    ['just-before'],
+    ['on-it'],
   );
 });
 
@@ -1242,6 +1284,27 @@ test('an unchanged content hash writes nothing and renders no ink', async () => 
   assert.equal(report.pagesUpdated, 0);
   // The watermark still advances: the section was visited and found unchanged.
   assert.deepEqual(second.storeCalls.watermarks, [{ sectionId: 'sec-1', watermark: NOW_ISO }]);
+});
+
+test('the page listing still reaches back an hour, whatever the section scan window is', async () => {
+  // Two windows, two constants, two reasons. This one decides which pages a section's
+  // listing returns, and `storedPageIsCurrent` skips an unchanged one without a request —
+  // so widening it costs bytes and it keeps the full hour of margin. Pointing it at
+  // `SECTION_SCAN_OVERLAP_MS` would narrow it to fifteen minutes with nothing else
+  // failing, and the page below would stop being listed at all.
+  const sinceSeen: string[] = [];
+  const edited = '2026-08-19T09:30:00Z';
+
+  const h = harness({}, { sections: [section({ pagesSyncedThrough: '2026-08-19T10:00:00Z' })] });
+  h.deps.graph.listPagesChangedSince = (sectionId, since) => {
+    sinceSeen.push(since);
+    return Promise.resolve(edited >= since ? [summary('p1', edited)] : []);
+  };
+
+  const report = await runIncremental(h.deps, BUDGET);
+
+  assert.deepEqual(sinceSeen, ['2026-08-19T09:00:00.000Z'], 'the watermark, less an hour');
+  assert.equal(report.pagesUpdated, 1, 'and the page only that hour surfaced was fetched');
 });
 
 /** Every `sync-overlap-save` line this run wrote, parsed. */

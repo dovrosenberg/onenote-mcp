@@ -20,6 +20,7 @@ import {
   LEASE_EXPIRY_MS,
   MirrorSchemaError,
   SCHEMA_VERSION,
+  SECTION_SCAN_OVERLAP_MS,
   WATERMARK_OVERLAP_MS,
   encodeMirrorId,
   groupIdentity,
@@ -233,6 +234,26 @@ test('the overlap is an hour, and it is subtracted rather than added', () => {
     Date.parse(overlapFrom('2026-08-19T12:00:00.000Z')) <
       Date.parse('2026-08-19T12:00:00.000Z'),
   );
+});
+
+test('the section scan window is fifteen minutes, and narrower than the page listing', () => {
+  // Two constants because the two windows cost different things: a page the listing
+  // surfaces unchanged costs no request, and a section the scan surfaces costs one
+  // `listPagesChangedSince` every run. Collapsing them back into one is the mistake this
+  // asserts against, from both directions — the value, and the relation between them.
+  assert.equal(SECTION_SCAN_OVERLAP_MS, 900_000);
+  assert.ok(
+    SECTION_SCAN_OVERLAP_MS < WATERMARK_OVERLAP_MS,
+    'the scan window must stay the narrower of the two',
+  );
+
+  // `overlapFrom`'s default is the page-listing window, so a caller that passes nothing
+  // gets the hour. That is what makes the scan the side that has to name its constant.
+  assert.equal(
+    overlapFrom('2026-08-19T12:00:00.000Z'),
+    overlapFrom('2026-08-19T12:00:00.000Z', WATERMARK_OVERLAP_MS),
+  );
+  assert.equal(overlapFrom('2026-08-19T12:00:00.000Z', SECTION_SCAN_OVERLAP_MS), '2026-08-19T11:45:00.000Z');
 });
 
 test('an overlap save is a page whose stamp predates the watermark', () => {

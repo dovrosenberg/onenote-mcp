@@ -688,11 +688,25 @@ notebooks and 202 sections are mirrored, and 2 notebooks and 70 sections are act
 | Run | Requests |
 |---|---|
 | Inline refresh, nothing changed | 1 — the expanded tree, and nothing else |
-| Inline refresh, a few edited pages | 3–12; 12 is a hard budget |
+| Inline refresh, a few edited pages | 2–12; a fetch only for a page that really changed, and 12 is a hard budget |
 | Nightly `/sync/sweep/full` over the active notebooks | ~70 here, plus one per changed page |
 | `/sync/sweep` over sections whose timestamp moved | one per section visited |
 | `/sync/sweep/all` over every mirrored notebook | ~202 here — half the hourly budget |
 | One backfill run | 49–120 measured; it stops on whichever budget binds first |
+
+**A page that has not changed costs no request.** The changed-page listing carries every
+page's stamp and title, and a stored copy that matches both is not fetched again. So a
+run's cost tracks the pages that really changed rather than the pages edited in the last
+hour, and `pagesSkipped` in the run report is how many it declined that way.
+
+**The two overlap windows are different widths, and that is deliberate.**
+`WATERMARK_OVERLAP_MS` is an hour and decides which pages a section's listing returns;
+nothing it surfaces costs a request, so it keeps the margin. `SECTION_SCAN_OVERLAP_MS` is
+fifteen minutes and decides how long a section that was edited once keeps being visited,
+at one listing request per run — an hour of that was the last term worth cutting. Both are
+margins against Graph's propagation lag and the gap between its clock and this service's;
+the two log queries under **Proving it works** are what say whether fifteen minutes is
+right.
 
 `MIRROR_SYNC_REQUEST_BUDGET` (default 120) is a hard stop. A run that reaches it commits
 what it did, answers 200 with `"done": false`, and resumes on the next schedule. That is
@@ -837,6 +851,26 @@ A 200 is not proof on its own. The three things that are:
 - **`sectionsSkippedInactive` is the number you expect.** A count covering every mirrored
   section means the active set is empty or mistyped; `unknownActiveNotebookIds` in the same
   report says which.
+
+Two log-based numbers say whether the overlap windows are the right width. Neither is
+urgent; read them after the service has been running for a week.
+
+```bash
+# How far back the page-listing overlap actually reached to catch a page that had really
+# changed. The largest ageMs over a day is the narrowest section-scan window that would
+# still have caught every one of them; above 900000 means SECTION_SCAN_OVERLAP_MS is too
+# narrow. Nothing logged at all means neither window has ever caught anything.
+gcloud logging read \
+  'resource.type="cloud_run_revision" AND jsonPayload.event="sync-overlap-save"' \
+  --project="$GCP_PROJECT" --limit=50 --freshness=1d --format='value(jsonPayload.ageMs)'
+
+# How far this service's clock is from Graph's, in milliseconds, signed. Both overlap
+# windows and the settle guard are sized against this being seconds rather than minutes.
+# Nothing logged means it stayed under the threshold, which is the expected reading.
+gcloud logging read \
+  'resource.type="cloud_run_revision" AND jsonPayload.event="graph-clock-skew"' \
+  --project="$GCP_PROJECT" --limit=50 --freshness=1d --format='value(jsonPayload.skewMs)'
+```
 
 Watch the backfill by re-running the job and reading `done` in successive reports: `false`
 with a rising `pagesUpdated`, then `true`. `sync/state.backfillComplete` says the same

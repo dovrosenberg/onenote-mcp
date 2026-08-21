@@ -273,14 +273,63 @@ function readIdList(raw: unknown): string[] | null {
 // ---------------------------------------------------------------------------
 
 /**
- * How far back a re-query reaches beyond the stored watermark.
+ * How far back a *section's page listing* reaches beyond that section's watermark.
  *
  * Graph's clock and this service's clock are not the same clock, and the watermark is
- * the time a pass *started* rather than the newest page it saw. A re-fetch of an
- * unchanged page is idempotent and nearly free — `contentHash` short-circuits it — and a
- * missed page is neither.
+ * the time a pass *started* rather than the newest page it saw. A page this window pulls
+ * into a listing costs nothing on its own: the listing already carries the page's stamp
+ * and title, and `storedPageIsCurrent` skips a stored copy that matches without a Graph
+ * request. So the hour buys margin and spends bytes.
+ *
+ * Not the window that decides which *sections* are listed at all. That one costs one
+ * request per section per run and is `SECTION_SCAN_OVERLAP_MS`, below.
  */
 export const WATERMARK_OVERLAP_MS = 3_600_000;
+
+/**
+ * How far back the *section scan* reaches beyond `sectionsScannedThrough`.
+ *
+ * Separate from `WATERMARK_OVERLAP_MS` because the two windows cost different things.
+ * That one pulls unchanged pages into a listing that is already being made. This one
+ * keeps an edited section a candidate, and every candidate costs one
+ * `listPagesChangedSince` on every run for as long as the window lasts — so an hour here
+ * re-listed a section edited once on every run for the next hour, against a budget of 400
+ * requests an hour shared with the interactive tools.
+ *
+ * Fifteen minutes. Both windows cover the same two things, and both are now measured
+ * rather than guessed at:
+ *
+ * - **Clock skew.** `api-overview.md` bounds it at seconds rather than minutes — a page
+ *   created inside a 15-second local bracket was stamped by Graph inside that bracket.
+ *   `recordClockSkew` in ./graph-throttle.ts reports it continuously from the running
+ *   service, and `graph-clock-skew` in the logs is the number to read.
+ * - **Propagation.** A section's `lastModifiedDateTime` rolls up from page creates, edits
+ *   and deletes, measured 2026-08-19. The largest movement ever seen in a stamp that had
+ *   nothing done to it is one second, and that shift was not path-dependent.
+ *
+ * What the window has to cover is the sum of those two, and nothing else. The cutoff is
+ * derived from the start of the last *completed* run, so an edit made between two runs
+ * carries a stamp after that instant and is a candidate under a window of any width. The
+ * case the window exists for is an edit made *before* a run started that the run's tree
+ * read did not yet reflect: the next cutoff has to still be behind it, which it is
+ * whenever the lag is under the window. Fifteen minutes is about sixty times the largest
+ * effect either measurement above shows. The lag itself has never been measured directly,
+ * which is why the log line below is the thing to watch rather than an argument.
+ *
+ * **What would show fifteen minutes is too narrow:** an `ageMs` above 900000 on a
+ * `sync-overlap-save` line. That event fires for a page whose stamp predates its
+ * section's watermark *and* that turned out to have really changed — a page the window is
+ * the only reason the sync saw. The largest `ageMs` over a long run is the narrowest
+ * window that would still have caught everything, and a value above this constant is a
+ * page a 15-minute scan window would have reached late. `README.md` carries the query
+ * under **Proving it works**.
+ *
+ * Being wrong here costs a night rather than an edit: the nightly `/sync/sweep/full`
+ * compares stamps and titles against every stored page, so a section this window declined
+ * is reconciled then. A notebook just mirrored or just activated does not depend on this
+ * window at all — `notebooksNeedingWideScan` covers that case.
+ */
+export const SECTION_SCAN_OVERLAP_MS = 900_000;
 
 /**
  * The instant a re-query should start from, given a watermark.
@@ -288,6 +337,10 @@ export const WATERMARK_OVERLAP_MS = 3_600_000;
  * A null watermark means the section has never been synced, which asks for everything:
  * the epoch. Overlap is subtracted rather than added, and the result is clamped to never
  * exceed the watermark itself, so a negative or absurd overlap cannot skip a window.
+ *
+ * The default is the page-listing window, because that is the call with a watermark of
+ * its own to reach back from. The section scan passes `SECTION_SCAN_OVERLAP_MS`
+ * explicitly.
  */
 export function overlapFrom(
   watermarkIso: string | null,
@@ -309,11 +362,12 @@ export function overlapFrom(
 /**
  * How far a page's stamp predates the watermark, when the overlap is why it was listed.
  *
- * `WATERMARK_OVERLAP_MS` is a margin against Graph's propagation lag and the gap between
- * its clock and this process's, and it was chosen rather than measured. A page whose
- * stamp is older than the watermark is one that only `overlapFrom`'s reach put in front
- * of the sync; the largest age ever seen for a page that turned out to have really
- * changed is the narrowest window that would still have caught everything.
+ * Both overlap windows are margins against Graph's propagation lag and the gap between
+ * its clock and this process's. A page whose stamp is older than the watermark is one
+ * that only `overlapFrom`'s reach put in front of the sync; the largest age ever seen for
+ * a page that turned out to have really changed is the narrowest window that would still
+ * have caught everything, and it is the evidence `SECTION_SCAN_OVERLAP_MS` names for
+ * whether fifteen minutes is too narrow.
  *
  * Returns null when the page is not one of those: a stamp at or after the watermark would
  * have been listed by a window of any width, a null watermark means the section asked for

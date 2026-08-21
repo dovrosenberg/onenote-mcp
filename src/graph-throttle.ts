@@ -267,9 +267,9 @@ export function resetClockSkewThrottle(): void {
 /**
  * Record how far this process's clock is from Graph's, from a header already sent.
  *
- * Every cross-clock comparison in the mirror sync — the watermark overlap in
- * `overlapFrom`, and the settle guard in `storedPageIsCurrent` — is sized on an
- * assumption about this number. `api-overview.md` bounds it loosely: one probe on
+ * Every cross-clock comparison in the mirror sync — both overlap windows `overlapFrom`
+ * applies, and the settle guard in `storedPageIsCurrent` — is sized on an assumption
+ * about this number, and `SECTION_SCAN_OVERLAP_MS` is the narrowest of the three. `api-overview.md` bounds it loosely: one probe on
  * 2026-08-21 put it inside a bracket that contains a full round trip, taken against a
  * developer workstation rather than the deployed service, which rules out minutes and
  * hours and settles nothing tighter. This reports it continuously from the running
