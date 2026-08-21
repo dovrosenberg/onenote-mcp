@@ -74,7 +74,7 @@ import {
   notebookIdentity,
   overlapFrom,
   overlapSaveAgeMs,
-  pageStampDiffers,
+  pageListingDiffers,
   sectionIdentity,
   storedPageIsCurrent,
   SECTION_SCAN_OVERLAP_MS,
@@ -1409,10 +1409,21 @@ async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<v
     // the pages Graph has that the mirror lacks, which is what the loop below wants.
     liveById.delete(stored.id);
 
-    // The sweep's second job: the two stamps disagree, so re-read the page. The stamp is a
-    // hint and nothing more — `writePageFromRaw` compares the content hash and writes only
-    // if something actually changed, and corrects the stored stamp when nothing did, which
-    // is what stops the next sweep asking again.
+    // The sweep's second job: the listing disagrees with the stored copy, so re-read the
+    // page. `pageListingDiffers` compares the stamp *and* the title, and the title half is
+    // what makes the sweep able to see a rename at all: measured 2026-08-21
+    // (api-overview.md), a rename moves no `lastModifiedDateTime`, and the incremental
+    // never lists a page whose stamp is below the section watermark — so a stamp-only
+    // comparison here left a page renamed outside this server carrying its old title in the
+    // mirror for ever, which is the field every listing and every by-name lookup matches
+    // on. The reachable route needs nothing unmeasured: `update_page_title` marks the page
+    // stale without touching its stamp, the PATCH renames it without moving the stamp, and
+    // a `resyncPage` that hit a transient failure is documented as non-fatal.
+    //
+    // The disagreement is a hint and nothing more — `writePageFromRaw` compares the content
+    // hash, the title and the section and writes only if something actually changed, and
+    // corrects the stored stamp when nothing did, which is what stops the next sweep asking
+    // again.
     //
     // **This must not become a stale mark.** `markPageStale` deletes the page-content
     // document, and nothing re-fetches a stale page: the incremental will not list a page
@@ -1426,7 +1437,7 @@ async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<v
     // It also subsumes the pre-2026-08-21 discovered pages, which carry `title: ''` and
     // `new Date(0)`: the epoch disagrees with anything Graph sends, and the re-fetch writes
     // both fields from Graph's listing.
-    if (pageStampDiffers(stored, match)) await syncPage(ctx, section, match);
+    if (pageListingDiffers(stored, match)) await syncPage(ctx, section, match);
   }
 
   // Pages Graph has that the mirror lacks — new, or moved in. Fetched now, budget

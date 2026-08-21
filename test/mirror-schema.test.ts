@@ -35,6 +35,7 @@ import {
   notebookIdentity,
   overlapFrom,
   overlapSaveAgeMs,
+  pageListingDiffers,
   pageStampDiffers,
   planStructureWrite,
   storedPageIsCurrent,
@@ -901,6 +902,35 @@ test('a page the old sweep stored unstamped disagrees with every live stamp', ()
   assert.equal(
     pageStampDiffers(stored, { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00Z' }),
     true,
+  );
+});
+
+test('pageListingDiffers fires on the stamp or the title, and on nothing else', () => {
+  // The rule the sweep and `storedPageIsCurrent` share. It is one function because a
+  // stamp-only comparison is permanently blind to a rename — measured 2026-08-21 — and the
+  // sweep is the one pass that ever looks at a page whose stamp has not moved.
+  const stored: PageStamp = { id: 'p1', title: 'Monday', lastModifiedDateTime: '2026-08-19T12:00:00Z' };
+
+  assert.equal(pageListingDiffers(stored, { ...stored }), false, 'identical is identical');
+  assert.equal(
+    pageListingDiffers(stored, { ...stored, lastModifiedDateTime: '2026-08-19T12:00:01Z' }),
+    true,
+    'an edit moves the stamp',
+  );
+  assert.equal(
+    pageListingDiffers(stored, { ...stored, title: 'Tuesday' }),
+    true,
+    'and a rename moves only the title',
+  );
+  assert.equal(
+    pageListingDiffers(stored, { ...stored, title: 'monday' }),
+    true,
+    'case included: `titleLower` is derived from the stored title, so a case-only rename changes what is stored',
+  );
+  assert.equal(
+    pageListingDiffers(stored, { ...stored, id: 'p2' }),
+    false,
+    'the id is how the two were paired, not part of the comparison',
   );
 });
 

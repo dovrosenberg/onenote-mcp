@@ -920,6 +920,34 @@ export function pageStampDiffers(stored: PageStamp, live: PageStamp): boolean {
 }
 
 /**
+ * Does the mirror's copy of this page disagree with what a page listing says about it?
+ *
+ * The stamp **or** the title. It is one predicate rather than two comparisons written out
+ * at each call site because the two callers have to answer identically, and the reason is
+ * measured: a rename moves no `lastModifiedDateTime` (api-overview.md, "A page rename does
+ * not move the page's `lastModifiedDateTime`"), so a stamp-only comparison is permanently
+ * blind to one. Both callers answer a disagreement the same way, by fetching the page:
+ *
+ * - `storedPageIsCurrent` below, which decides whether the incremental pass may skip the
+ *   content fetch for a page the changed-page listing returned.
+ * - `sweepSection` in ./mirror-sync.ts, which compares a stored digest against the
+ *   section's live page listing. That one is the only pass that ever looks at a page whose
+ *   stamp has not moved, so it is where a missed rename becomes permanent: the incremental
+ *   will not list a page whose stamp is below the section watermark, and no read path
+ *   writes to the mirror.
+ *
+ * Written out twice, a margin or a parse added to one would not reach the other, and the
+ * sweep is the copy where the omission has no upper bound on how long it lasts.
+ *
+ * A `PageStamp` is all a caller needs on either side: `listPageDigestsInSection` projects
+ * one out of the page documents and `listPageSummaries` already selects the same three
+ * fields, so neither comparison costs a request or a field.
+ */
+export function pageListingDiffers(stored: PageStamp, live: PageStamp): boolean {
+  return pageStampDiffers(stored, live) || stored.title !== live.title;
+}
+
+/**
  * How long a stored copy must have been in hand before its stamp is trusted.
  *
  * Graph stamps `lastModifiedDateTime` to the whole second — measured 2026-08-21 and
@@ -953,12 +981,12 @@ export const TIMESTAMP_SETTLE_MS = 30_000;
  * current:
  *
  * - `contentState` — a write already marked this stale, or its content was never stored.
- * - the stamp — exact string equality, delegated to `pageStampDiffers` so the sweep and
- *   the skip cannot drift into two different rules for one comparison. An empty or
- *   unparseable live stamp needs no clause of its own: `Date.parse` answers NaN for it and
- *   every comparison against NaN is false, so the settle guard below refuses the page.
- * - the title — a rename moves no timestamp, so a stamp-only check goes permanently blind
- *   to one. Measured 2026-08-21 and recorded in api-overview.md: a `PATCH
+ * - the stamp and the title together, delegated to `pageListingDiffers` so the sweep and
+ *   the skip cannot drift into two different rules for one comparison. The stamp is exact
+ *   string equality; an empty or unparseable live stamp needs no clause of its own,
+ *   because `Date.parse` answers NaN for it and every comparison against NaN is false, so
+ *   the settle guard below refuses the page. The title is there because a rename moves no
+ *   timestamp — measured 2026-08-21 and recorded in api-overview.md: a `PATCH
  *   /pages/{id}/content` replacing the title left `lastModifiedDateTime` at its old value,
  *   still unchanged two minutes later. The title is the field `find_page_by_name` and
  *   `search_pages` match on, so a mirror that missed a rename answers by the wrong name
@@ -983,8 +1011,7 @@ export function storedPageIsCurrent(
   settleMs: number = TIMESTAMP_SETTLE_MS,
 ): boolean {
   if (stored.contentState !== 'present') return false;
-  if (pageStampDiffers(stored, live)) return false;
-  if (stored.title !== live.title) return false;
+  if (pageListingDiffers(stored, live)) return false;
   if (stored.sectionId !== sectionId) return false;
 
   // Null for an absent field, which is what a document written before `contentSyncedAt`

@@ -162,11 +162,17 @@ that reads only `lastModifiedDateTime`. This is not lag: the third row is the sa
 two minutes on.
 
 The consequence is that a timestamp is not sufficient to decide whether a page needs
-re-reading. Anything that skips work on an unmoved stamp — `writePageFromRaw`'s
-short-circuit, and anything built on the sweep's stamp comparison — has to compare the
-title as well, or a page renamed outside this server keeps its old title in the mirror for
-ever, which is the field `find_page_by_name` and `search_pages` match on. The title costs nothing to compare: every listing this
-repository makes already selects it.
+re-reading. Anything that skips work on an unmoved stamp has to compare the title as well,
+or a page renamed outside this server keeps its old title in the mirror for ever, which is
+the field `find_page_by_name` and `search_pages` match on. Three places do:
+`writePageFromRaw`'s short-circuit, `storedPageIsCurrent`, and `sweepSection` — the last
+two through `pageListingDiffers` in `src/mirror-schema.ts`, which is one predicate so a
+change to the rule cannot reach only one of them. The title costs nothing to compare: every
+listing this repository makes already selects it.
+
+The sweep is the place where omitting it has no upper bound. The incremental pass never
+lists a page whose stamp is below the section watermark, so once a rename has been missed
+the sweep is the only thing that could still see it.
 
 Measured through `PATCH /pages/{id}/content` with a `title` target, which is what
 `update_page_title` sends. Whether a rename performed **in the OneNote client** behaves

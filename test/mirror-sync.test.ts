@@ -369,12 +369,19 @@ function fakeStore(initial: Partial<StoreState> = {}): {
     sweepResults: [],
   };
 
-  /** What Firestore does to the projection when a page document's stamp is written. */
-  const restamp = (pageId: string, lastModifiedDateTime: string): void => {
+  /**
+   * What Firestore does to the projection when a page document is written.
+   *
+   * The title as well as the stamp, because `listPageDigestsInSection` reads both back off
+   * the same document and the sweep compares both. A fake that re-projected only the stamp
+   * left a swept rename disagreeing on every later run, which is the shape of the bug the
+   * comparison exists to fix.
+   */
+  const reproject = (pageId: string, fields: Omit<PageStamp, 'id'>): void => {
     for (const [sectionId, digests] of data.digestsBySection) {
       data.digestsBySection.set(
         sectionId,
-        digests.map((d) => (d.id === pageId ? { ...d, lastModifiedDateTime } : d)),
+        digests.map((d) => (d.id === pageId ? { ...d, ...fields } : d)),
       );
     }
   };
@@ -439,14 +446,14 @@ function fakeStore(initial: Partial<StoreState> = {}): {
     putPage: (page: MirrorPage, content: MirrorPageContent | null) => {
       calls.puts.push({ page, hasContent: content !== null });
       data.pages.set(page.id, page);
-      restamp(page.id, page.lastModifiedDateTime);
+      reproject(page.id, { title: page.title, lastModifiedDateTime: page.lastModifiedDateTime });
       return Promise.resolve();
     },
     putPageMetadata: (page) => {
       calls.metadata.push({ id: page.id, lastModifiedDateTime: page.lastModifiedDateTime });
       const existing = data.pages.get(page.id);
       if (existing !== undefined) data.pages.set(page.id, { ...existing, ...page });
-      restamp(page.id, page.lastModifiedDateTime);
+      reproject(page.id, { title: page.title, lastModifiedDateTime: page.lastModifiedDateTime });
       return Promise.resolve();
     },
     deletePage: (tombstone) => {
@@ -2463,6 +2470,63 @@ test('a page stored ahead of Graph is re-fetched, and that is the repair', async
   assert.equal(written.page.lastModifiedDateTime, '2026-08-19T13:00:00Z', "Graph's string wins");
   assert.equal(report.pagesFailed, 0, 'and it is not an error');
   assert.deepEqual(h.storeCalls.deletes, []);
+});
+
+test('a page renamed outside this server is swept, though Graph moved no timestamp', async () => {
+  // Measured 2026-08-21 (api-overview.md, "A page rename does not move the page's
+  // `lastModifiedDateTime`"): a PATCH replacing a title left the stamp at its old value,
+  // still unchanged two minutes later. So a sweep that compared stamps alone was blind to
+  // every rename, and the sweep is the only pass that looks at a page whose stamp has not
+  // moved — the incremental never lists one, because its stamp is below the section
+  // watermark.
+  //
+  // The reachable route to this state needs nothing unmeasured: `update_page_title` calls
+  // `markPageStale`, which leaves `lastModifiedDateTime` alone, the PATCH renames the page
+  // without moving it, and a `resyncPage` that hits a transient 429 is documented as
+  // non-fatal. The mirror is then left holding the old title under a stamp that agrees
+  // with Graph, and `find_page_by_name`, `search_pages` and every listing answer by it.
+  const h = harness(
+    {
+      summaries: {
+        'sec-1': [{ id: 'p1', title: 'Renamed', lastModifiedDateTime: '2026-08-19T11:30:00Z' }],
+      },
+    },
+    {
+      sections: [section()],
+      pages: new Map([['p1', storedPage()]]),
+      digestsBySection: new Map([['sec-1', [digest('p1', '2026-08-19T11:30:00Z')]]]),
+    },
+  );
+
+  const report = await runFullSweep(h.deps, BUDGET);
+
+  assert.equal(report.graphRequests, 3, 'tree, enumeration, and the content fetch the title forced');
+  assert.equal(h.storeCalls.puts[0]?.page.title, 'Renamed');
+  assert.equal(h.storeCalls.puts[0]?.page.titleLower, 'renamed', 'which is what by-name matching reads');
+  assert.deepEqual(h.storeCalls.deletes, [], 'a rename is not a deletion');
+});
+
+test('a swept rename converges: the second sweep fetches nothing', async () => {
+  // The other half. A comparison that fired every run would put a content request per
+  // renamed page into every sweep for ever, against 400 an hour.
+  const h = harness(
+    {
+      summaries: {
+        'sec-1': [{ id: 'p1', title: 'Renamed', lastModifiedDateTime: '2026-08-19T11:30:00Z' }],
+      },
+    },
+    {
+      sections: [section()],
+      pages: new Map([['p1', storedPage()]]),
+      digestsBySection: new Map([['sec-1', [digest('p1', '2026-08-19T11:30:00Z')]]]),
+    },
+  );
+
+  const first = await runFullSweep(h.deps, BUDGET);
+  assert.equal(first.graphRequests, 3);
+
+  const second = await runFullSweep(h.deps, BUDGET);
+  assert.equal(second.graphRequests, 2, 'the titles now agree, so no page is fetched');
 });
 
 test('stamps that agree cost neither a fetch nor a write', async () => {

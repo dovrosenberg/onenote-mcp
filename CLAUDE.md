@@ -1036,12 +1036,25 @@ both reach the calling model: `lastModifiedDateTime` is printed in every tool re
 into a section may not have its own timestamp bumped by the move, so no later incremental
 lists it — measured 2026-08-21 and recorded in `api-overview.md`: a page moved between
 sections keeps the stamp it had, so it is below any later watermark and **only the sweep
-can find it**. `lastModifiedDateTime` is what makes `pageStampDiffers` in
-`src/mirror-schema.ts` possible: a page in both places whose two stamps are not the same
-string is re-fetched, which is the only thing in this repository that notices an edit made
-in the OneNote client that the incremental pass missed.
+can find it**. `title` and `lastModifiedDateTime` together are what make `pageListingDiffers` in
+`src/mirror-schema.ts` possible: a page in both places whose stamp or whose title differs
+is re-fetched, which is the only thing in this repository that notices an edit or a rename
+made in the OneNote client that the incremental pass missed.
 
-**A stamp difference triggers a re-fetch, never a stale mark, and the difference between
+**The sweep compares the title as well as the stamp, and the title half is not
+redundant.** Measured 2026-08-21 and recorded in `api-overview.md`: a rename moves no
+`lastModifiedDateTime`. The incremental never lists a page whose stamp is below the section
+watermark, so the sweep is the only pass that ever looks at one — and a stamp-only
+comparison there left a page renamed outside this server carrying its old title in the
+mirror permanently, which is the field every listing and every by-name lookup matches on.
+The reachable route needs nothing unmeasured: `update_page_title` calls `markPageStale`,
+which leaves the stamp alone; the PATCH renames the page without moving it; and a
+`resyncPage` that hit a transient failure is documented below as non-fatal. Both the sweep
+and `storedPageIsCurrent` call `pageListingDiffers`, one predicate rather than two written
+out, because a margin or a parse added to one copy would not reach the other and the
+sweep's copy is where the omission has no upper bound on how long it lasts.
+
+**A listing difference triggers a re-fetch, never a stale mark, and the difference between
 those two is data loss.** `markPageStale` deletes the page-content document, and nothing
 re-fetches a stale page — no read path writes to the mirror, the incremental will not list
 a page whose Graph stamp is behind the section watermark, so a mark is permanent. Since
@@ -1060,10 +1073,17 @@ instant (`…:00Z` from Graph, `…:00.000Z` from `resyncPage`) disagree, they a
 once, and the short-circuit stores Graph's spelling — where a parsed compare would leave
 the local one in a field every tool result prints. Graph's own one-second wobble on an
 unchanged page, measured 2026-08-21, is absorbed the same way: one request, then agreement.
-`contentState` is not consulted either, so a stale or missing copy in a swept section is
-repaired rather than skipped, and the pre-2026-08-21 documents carrying `title: ''` and
-`1970-01-01T00:00:00.000Z` need no predicate of their own — the epoch disagrees with
-anything Graph sends.
+The pre-2026-08-21 documents carrying `title: ''` and `1970-01-01T00:00:00.000Z` need no
+predicate of their own — the epoch disagrees with anything Graph sends.
+
+`contentState` is **not** consulted, and the listing comparison is what covers for it. A
+stale or missing copy whose stamp and title both still match Graph's listing is skipped,
+not repaired. Nothing routinely produces one: every write that marks a page stale moves
+either the stamp (`append_to_page`, and `create_page` has no document to mark) or the title
+(`update_page_title`). The residue is a rename to a byte-identical title whose resync then
+failed, which leaves a permanent `get_page_content` miss and one Graph request per call.
+Closing it means projecting `contentState` into `listPageDigestsInSection`, which is a
+`src/mirror-store.ts` change with no test available to it.
 
 **The stamp is a hint; `writePageFromRaw`'s content hash is the check.** A re-fetch whose
 content is identical writes no page document, so a false positive costs one Graph request
@@ -1293,8 +1313,11 @@ behaviour before the mirror existed.
 falls back to `markPageStale`, which makes the next read a miss — correct, just slower. If
 that fails too, the event is logged and nothing else happens. The write has already
 happened by then, so turning either into a reported error would send the caller to retry a
-change that is already made. It is self-healing regardless: the write moved the page's
-`lastModifiedDateTime`, so the next incremental run repairs whatever this could not.
+change that is already made. An append or a create is self-healing regardless: the write
+moved the page's `lastModifiedDateTime`, so the next incremental run repairs whatever this
+could not. A **rename** is not — measured 2026-08-21, `PATCH /pages/{id}/content` replacing
+a title moves no stamp, so no later incremental lists the page and the sweep is what
+repairs it, on the scheduler's own cadence rather than within the poll interval.
 
 **The write-sync is bound whenever a mirror exists, not only when reads are enabled.** A
 mirror being filled by the sync while `MIRROR_READ_ENABLED` is false still holds copies a
