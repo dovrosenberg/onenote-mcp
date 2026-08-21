@@ -146,6 +146,71 @@ unchanged. The field moves on a write and only on a write.
 
 A re-read of the deleted page answered `404`.
 
+## A page rename does not move the page's `lastModifiedDateTime`
+
+**Measured 2026-08-21**, against a scratch page, reading
+`/me/onenote/sections/{id}/pages?$select=id,title,lastModifiedDateTime` between each step:
+
+| Step | Page `title` | Page `lastModifiedDateTime` |
+|---|---|---|
+| after `POST /sections/{id}/pages` (201) | `probe-clock-2026-08-21` | `2026-08-21T12:17:52Z` |
+| after `PATCH /pages/{id}/content` replacing the title (204) | `probe-clock-2026-08-21 RENAMED` | `2026-08-21T12:17:52Z` |
+| re-read ~2 minutes later | `probe-clock-2026-08-21 RENAMED` | `2026-08-21T12:17:52Z` |
+
+The title changed and the timestamp did not, so a rename is invisible to any comparison
+that reads only `lastModifiedDateTime`. This is not lag: the third row is the same value
+two minutes on.
+
+The consequence is that a timestamp is not sufficient to decide whether a page needs
+re-reading. Anything that skips work on an unmoved stamp — the sweep's drift check, and
+the page-level skip — has to compare the title as well, or a page renamed outside this
+server keeps its old title in the mirror for ever, which is the field `find_page_by_name`
+and `search_pages` match on. The title costs nothing to compare: every listing this
+repository makes already selects it.
+
+Measured through `PATCH /pages/{id}/content` with a `title` target, which is what
+`update_page_title` sends. Whether a rename performed **in the OneNote client** behaves
+the same way is not yet measured; it is the case that matters, because a rename made
+through this server already updates the mirror directly.
+
+## Page timestamps have whole-second resolution, and this server's do not
+
+**Measured 2026-08-21.** Graph returned `2026-08-21T12:17:52Z` for the page above — no
+fractional seconds, in the same shape as the section timestamps recorded above.
+`resyncPage` stamps a page locally with `new Date().toISOString()`, which always emits
+three fractional digits.
+
+So the two are not comparable as strings. `'2026-08-21T12:17:52.400Z' < '2026-08-21T12:17:52Z'`
+is **true** lexicographically, because `.` is `0x2E` and `Z` is `0x5A` — a locally stamped
+page landing in the same second as Graph's own stamp sorts *before* it and reads as
+behind. `pageHasDrifted` compares `Date.parse` milliseconds for this reason. Do not
+"simplify" it back to a string comparison.
+
+## A section's page listing reports a title immediately; `GET /pages/{id}` does not
+
+**Measured 2026-08-21.** `GET /sections/{id}/pages?$select=id,title,lastModifiedDateTime`
+issued seconds after `POST /sections/{id}/pages` returned the new page with its title
+already correct. That is the opposite of the page-metadata weakness recorded under
+**Writing page content**, where `GET /pages/{id}?$select=title` answered `""` for pages
+created seconds earlier.
+
+So the listing endpoint is a usable source of titles and the per-page metadata endpoint is
+not. A title comparison built on a listing does not need the empty-string guard that one
+built on `GET /pages/{id}` would.
+
+## Clock skew between Graph and this service: seconds, not minutes
+
+**Measured 2026-08-21**, loosely. A page created between local `12:17:39.939Z` and
+`12:17:55.387Z` was stamped by Graph at `12:17:52Z` — inside the bracket. The bracket is
+wide because it contains a full client round trip, so this bounds the skew rather than
+measuring it, and the clock it was taken against is a developer workstation rather than
+the deployed service.
+
+What it rules out is gross skew: not minutes, not hours. That is the property the
+watermark overlap is sized against, so an overlap of minutes has room. A tighter number
+needs the telemetry that reports the difference from inside the service on every run.
+
+
 ## Moving a section between notebooks: **unmeasured**
 
 Nothing here has been run against the service, and the sync depends on it. Two questions,
