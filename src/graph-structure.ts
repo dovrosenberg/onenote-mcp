@@ -60,9 +60,9 @@ const NODE_SELECT = '$select=id,displayName&$orderby=displayName';
  * the response: 441 KB without it against 78 KB with it, for the same tree. The separator
  * inside a clause carrying both `$select` and `$expand` is a semicolon, not a comma.
  *
- * This is the shape the OneNote throttling guidance asks for — see the `Graph request
- * budget` section of CLAUDE.md. The per-container walk that returns the same data costs
- * `1 + 2 x containers`, which is 195 requests on the real account against this one.
+ * This is the shape the OneNote throttling guidance asks for — see `docs/graph.md`. The
+ * per-container walk that returns the same data costs `1 + 2 x containers`, which is 195
+ * requests on the real account against this one.
  */
 const EXPANDED_TREE_URL =
   `${GRAPH_ROOT}/me/onenote/notebooks?$select=id,displayName,lastModifiedDateTime` +

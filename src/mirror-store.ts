@@ -4,7 +4,7 @@
 // instead: document ids, field shapes, the oversize threshold, the watermark arithmetic,
 // how a hand-edited document is read. That is not tidiness. This file has no automated
 // test and cannot get one on this machine — there is no Firestore emulator here, and
-// CLAUDE.md forbids substituting an in-memory fake because the behaviour at stake is
+// test/README.md forbids substituting an in-memory fake because the behaviour at stake is
 // transaction retry under contention and FieldValue.serverTimestamp(), and a fake would
 // assert the fake. So the split is what keeps the untestable surface down to method
 // calls whose failure is obvious in a live run.

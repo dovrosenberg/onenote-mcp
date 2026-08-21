@@ -7,7 +7,7 @@ below are the authority on what it actually did here, because several of them co
 the documentation.
 
 Read this before adding a Graph call. The throttling limits and the design principles
-they force are in the `Graph request budget` section of `CLAUDE.md`.
+they force are in `docs/graph.md`.
 
 ## Resource paths
 

@@ -729,7 +729,7 @@ the clock, on sections whose pages were cheaper to render.
 Past 400 an hour Graph answers 429 with OData code `10007`. A refused request does no work
 and still spends the attempt, the section's watermark does not advance, and the penalty
 outlasts a short backoff — five retries spanning three minutes were all refused after one
-burst, recorded in the `Graph request budget` section of `CLAUDE.md`. Exceeding the limit
+burst, recorded in `docs/graph.md`. Exceeding the limit
 therefore does not finish the backfill sooner. Halving `MIRROR_SYNC_REQUEST_BUDGET` buys a
 halved interval at the same hourly spend, at the cost of one extra tree read per run.
 

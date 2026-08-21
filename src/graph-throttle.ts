@@ -81,7 +81,7 @@ export const BASE_BACKOFF_MS = 2_000;
  * The longest a single retry will wait before giving up instead.
  *
  * Graph decides how long a 429 lasts and says so in `Retry-After`, and OneNote's answer
- * can be minutes — CLAUDE.md records five retries spanning three minutes all refused
+ * can be minutes — docs/graph.md records five retries spanning three minutes all refused
  * after one burst. Honouring that verbatim is correct for the account and wrong for the
  * process: Cloud Run cuts a request at 300 seconds, and the mirror sync budgets 240, both
  * checked *before* an operation starts. One request that sleeps for three minutes inside

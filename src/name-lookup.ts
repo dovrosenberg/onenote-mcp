@@ -2,8 +2,7 @@
 //
 // The browsing tools in ./structure-tools.ts take ids, so a caller that already knows
 // the names spends three or four round trips getting to a page. This resolves the whole
-// path in one Graph request, using the expanded tree described in the `Graph request
-// budget` section of CLAUDE.md.
+// path in one Graph request, using the expanded tree described in `docs/graph.md`.
 //
 // Three rules the tools built on this depend on:
 //

@@ -2,7 +2,7 @@
 //
 // Nothing here touches Firestore, Cloud Storage, or the network. That is the point:
 // ./mirror-store.ts and ./mirror-blobs.ts cannot be tested on this machine — there is no
-// Firestore emulator here and CLAUDE.md rules out an in-memory fake, because what is at
+// Firestore emulator here and test/README.md rules out an in-memory fake, because what is at
 // stake in those files is transaction behaviour and FieldValue.serverTimestamp() and a
 // fake would assert the fake. So everything that is a *decision* rather than a call
 // lives here, where it runs in a plain unit test: document ids, the field shapes, the

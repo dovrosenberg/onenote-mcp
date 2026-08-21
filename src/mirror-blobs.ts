@@ -5,7 +5,7 @@
 // already 750 KB, so a PNG would fill most of a document on its own and leave no room to
 // grow if that budget is ever raised.
 //
-// **The InkML is stored beside the PNG, and that is not redundant.** CLAUDE.md records
+// **The InkML is stored beside the PNG, and that is not redundant.** docs/content.md records
 // MAX_INK_PNG_BYTES as "a budget chosen rather than measured against any client's cap",
 // and `fitInkToByteBudget` shrinks a render by re-rasterising the SVG and measuring. If
 // only the PNG were kept, changing that number would mean re-fetching every inked page
