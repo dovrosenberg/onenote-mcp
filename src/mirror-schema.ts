@@ -839,6 +839,31 @@ export function pageNeedsRefetch(stored: MirrorPageDigest): boolean {
 }
 
 /**
+ * How much later than the stored stamp Graph's may read without that being an edit.
+ *
+ * **Measured 2026-08-21** (`api-overview.md`, *Graph reports the same page one second
+ * apart on two reads*). One scratch section's page listing was read twice. Between the two
+ * reads all four pages reported a `lastModifiedDateTime` exactly one second later than
+ * before, and three of the four had not been touched for two days — a real edit would have
+ * stamped them with that day's date, and they kept their 2026-08-19 dates. So the same
+ * unchanged page reports two values one second apart depending on the read. The mechanism
+ * is not established.
+ *
+ * 2000 ms is the one observed second plus one second of margin. It is **not** a clock-skew
+ * allowance. Both stamps `pageHasDrifted` compares against this margin come from Graph on
+ * the ordinary path, so no second clock is involved; the skew between Graph and this
+ * service is a separate measurement, recorded in `api-overview.md` under *Clock skew
+ * between Graph and this service*.
+ *
+ * The cost of the tolerance is that an edit whose Graph stamp lands 2 s or less after the
+ * stored stamp is not noticed by the sweep. That is acceptable because the sweep is a
+ * backstop rather than the mechanism: `syncSection` re-lists a section whose
+ * `lastModifiedDateTime` moved and `writePageFromRaw` compares the content hash, so an
+ * edit inside the margin is still caught by the incremental pass on its own next run.
+ */
+export const TIMESTAMP_JITTER_MS = 2000;
+
+/**
  * Has Graph's copy of this page moved past the mirror's?
  *
  * **The two sides are not the same clock, and the direction of the comparison is what
@@ -855,6 +880,13 @@ export function pageNeedsRefetch(stored: MirrorPageDigest): boolean {
  * Only stored-behind-live is evidence of an edit. An edit made in the OneNote client
  * moves Graph ahead of whatever the mirror holds, including in a frozen notebook, which
  * no incremental pass ever re-lists.
+ *
+ * **And only by more than `TIMESTAMP_JITTER_MS`.** Graph reported the same unchanged page
+ * one second apart across two reads — see that constant. The margin is applied to this
+ * direction alone and must stay that way: a symmetric one (`Math.abs`) would put the
+ * stored-ahead case back inside the test for every write whose local stamp lands within
+ * two seconds of Graph's, which is the case above that destroys data. The boundary is
+ * inclusive of the margin: a gap of exactly `TIMESTAMP_JITTER_MS` is not drift.
  *
  * **The comparison is on parsed milliseconds, not on the strings.** A lexicographic `<`
  * would be a correct chronological compare only if both sides carried the same precision,
@@ -876,7 +908,7 @@ export function pageHasDrifted(stored: MirrorPageDigest, live: PageStamp): boole
   const liveAt = Date.parse(live.lastModifiedDateTime);
   if (Number.isNaN(storedAt) || Number.isNaN(liveAt)) return false;
 
-  return storedAt < liveAt;
+  return liveAt - storedAt > TIMESTAMP_JITTER_MS;
 }
 
 export interface MirrorPageContent {

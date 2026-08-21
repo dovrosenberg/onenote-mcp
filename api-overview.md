@@ -186,6 +186,39 @@ page landing in the same second as Graph's own stamp sorts *before* it and reads
 behind. `pageHasDrifted` compares `Date.parse` milliseconds for this reason. Do not
 "simplify" it back to a string comparison.
 
+## Graph reports the same page one second apart on two reads
+
+**Measured 2026-08-21.** One scratch section's page listing
+(`GET /sections/{id}/pages?$select=id,title,lastModifiedDateTime`) was read several times
+in a row. Between two of those reads, every page in the section reported a
+`lastModifiedDateTime` exactly one second later than it had before:
+
+| Page | Earlier read | Later read |
+|---|---|---|
+| probe page | `2026-08-21T12:17:52Z` | `2026-08-21T12:17:53Z` |
+| absolute spike | `2026-08-19T00:41:30Z` | `2026-08-19T00:41:31Z` |
+| geometry spike | `2026-08-19T00:39:41Z` | `2026-08-19T00:39:42Z` |
+| Renamed by update_page_title | `2026-08-19T00:24:22Z` | `2026-08-19T00:24:23Z` |
+
+Three of the four had not been touched for two days. A genuine edit would have stamped
+them with that day's date; they kept their 2026-08-19 dates and gained one second. So this
+is not an edit — the same unchanged page reports two values one second apart on different
+reads.
+
+The uniform +1 is consistent with one read path flooring the sub-second component and
+another ceiling it, but **the mechanism is not established**. What is established is the
+observation: a page's reported stamp can move by one second with nothing having happened
+to the page.
+
+The consequence is that no exact comparison of a stored stamp against a freshly read one
+is safe. A stored stamp taken from the lower-reading path is one second behind a live
+stamp taken from the other, on a page nobody edited. Anything that acts on
+stored-behind-live has to require a margin, and `TIMESTAMP_JITTER_MS` in
+`src/mirror-schema.ts` is that margin — 2 s, the observed second plus a second of room.
+The margin is one-sided: stored-ahead-of-live is the `resyncPage` local-stamp case
+recorded under **Writing page content**, and widening the test in that direction is what
+destroys the mirrored content of every page this server writes.
+
 ## A section's page listing reports a title immediately; `GET /pages/{id}` does not
 
 **Measured 2026-08-21.** `GET /sections/{id}/pages?$select=id,title,lastModifiedDateTime`

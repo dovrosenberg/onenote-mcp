@@ -1035,7 +1035,8 @@ both reach the calling model: `lastModifiedDateTime` is printed in every tool re
 `titleLower` is what by-name matching compares. Neither self-heals, because a page moved
 into a section may not have its own timestamp bumped by the move, so no later incremental
 lists it. `lastModifiedDateTime` is what makes `pageHasDrifted` in `src/mirror-schema.ts`
-possible: a page in both places whose stored stamp is *behind* Graph's is marked stale
+possible: a page in both places whose stored stamp is *behind* Graph's by more than
+`TIMESTAMP_JITTER_MS` is marked stale
 rather than fetched, which is the only thing in this repository that notices an edit made
 in the OneNote client that the incremental pass missed. Marking rather than fetching is
 the point — a content request per drifted page would sit inside a run already sized
@@ -1054,6 +1055,19 @@ server writes, on the next sweep, for ever. Only stored-behind-live is evidence 
 edit. The comparison is on `Date.parse` milliseconds rather than on the strings, because
 Graph's measured format carries no fractional seconds and `toISOString` always carries
 three, and `'…:01.456Z' < '…:01Z'` is lexicographically true.
+
+**And stored-behind-live is not enough on its own: it has to be behind by more than
+`TIMESTAMP_JITTER_MS`.** Measured 2026-08-21 and recorded in `api-overview.md` under
+*Graph reports the same page one second apart on two reads* — one section's page listing
+was read twice and all four pages came back exactly one second later the second time,
+three of them untouched for two days. So a stored stamp one second behind a live one is
+the ordinary reading of an unchanged page, and a strict `<` stales it and deletes its
+content document. The margin is 2000 ms: the one observed second, plus one second of
+room. It is not a clock-skew allowance. The margin applies to this direction only — a
+symmetric `Math.abs` puts the `resyncPage` case back inside the test, which is the failure
+the paragraph above exists to prevent. What it costs is that an edit landing within two
+seconds of the stored stamp is invisible to the sweep, which is acceptable because the
+sweep is a backstop and the incremental pass notices a content change by hash.
 
 A copy that is not `present` is skipped: it has no content document to invalidate, and
 re-marking it would be a Firestore write per already-stale page on every nightly sweep.

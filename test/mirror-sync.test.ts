@@ -1987,6 +1987,35 @@ test('a page stored later than Graph is a resync stamp, and keeps its content', 
   assert.deepEqual(h.storeCalls.deletes, []);
 });
 
+test('a page Graph reports one second later keeps its content document', async () => {
+  // Measured 2026-08-21 (api-overview.md): four pages in one section, three untouched for
+  // two days, all came back with a `lastModifiedDateTime` exactly one second later on a
+  // second read of the same listing. Under a strict stored-behind-live test the sweep
+  // stales every page whose stored stamp came from the lower-reading path, and
+  // `markPageStale` deletes the page-content document. Nothing re-fetches a stale page:
+  // the incremental will not list a page whose Graph stamp is behind the section
+  // watermark, no read path writes to the mirror, and the next sweep skips a non-`present`
+  // copy. So this is the whole mirror's content, in one run.
+  const h = harness(
+    { summaries: { 'sec-1': [summary('p1', '2026-08-19T13:00:01Z')] } },
+    {
+      sections: [section()],
+      digestsBySection: new Map([['sec-1', [digest('p1', '2026-08-19T13:00:00Z')]]]),
+    },
+  );
+
+  const report = await runFullSweep(h.deps, BUDGET);
+
+  assert.deepEqual(h.storeCalls.staled, []);
+  assert.equal(report.pagesStaled, 0);
+  assert.equal(
+    h.data.digestsBySection.get('sec-1')?.[0]?.contentState,
+    'present',
+    'the content document survives',
+  );
+  assert.deepEqual(h.storeCalls.puts, [], 'and nothing is re-fetched over it either');
+});
+
 test('a page whose stored copy is already stale is not marked again', async () => {
   // Not tidiness: a Firestore write per already-stale page, on every nightly sweep, for
   // as long as nothing re-reads it.

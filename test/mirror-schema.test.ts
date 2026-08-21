@@ -42,6 +42,7 @@ import {
   readSyncState,
   sectionIdentity,
   selectionMatchesSeen,
+  TIMESTAMP_JITTER_MS,
   utf8Bytes,
 } from '../src/mirror-schema.ts';
 
@@ -794,15 +795,56 @@ test('drift is stored-behind-live, and a stored stamp ahead of Graph is not drif
 
   assert.equal(pageHasDrifted(stored, live), false, 'identical stamps are not drift');
   assert.equal(
-    pageHasDrifted(stored, { ...live, lastModifiedDateTime: '2026-08-19T12:00:01Z' }),
+    pageHasDrifted(stored, { ...live, lastModifiedDateTime: '2026-08-19T12:01:00Z' }),
     true,
-    'Graph one second ahead is an edit the incremental pass missed',
+    'Graph a minute ahead is an edit the incremental pass missed',
+  );
+  assert.equal(
+    pageHasDrifted(stored, { ...live, lastModifiedDateTime: '2026-08-20T12:00:00Z' }),
+    true,
+    'and so is Graph a day ahead',
   );
   assert.equal(
     pageHasDrifted({ ...stored, lastModifiedDateTime: '2026-08-19T12:00:01Z' }, live),
     false,
-    "stored ahead of Graph is a resyncPage stamp, not a change",
+    'stored ahead of Graph is a resyncPage stamp, not a change',
   );
+  assert.equal(
+    pageHasDrifted({ ...stored, lastModifiedDateTime: '2026-08-19T13:00:00Z' }, live),
+    false,
+    'and stored an hour ahead is not drift either — the tolerance is one-sided',
+  );
+});
+
+test('a live stamp inside the jitter margin is not drift, and the boundary is not drift', () => {
+  // Measured 2026-08-21 (api-overview.md, "Graph reports the same unchanged page one
+  // second apart"): four pages in one section, three of them untouched for two days, all
+  // reported a `lastModifiedDateTime` exactly one second later on a second read. A
+  // strict `storedAt < liveAt` reads every one of those as drift, and the sweep's drift
+  // branch calls `markPageStale`, which deletes the page-content document. Nothing
+  // re-fetches a stale page, so one sweep could empty the mirror's content permanently.
+  const stored = {
+    id: 'p1',
+    title: 'Page',
+    lastModifiedDateTime: '2026-08-19T12:00:00Z',
+    contentState: 'present' as const,
+  };
+  const at = (ms: number) => ({
+    id: 'p1',
+    title: 'Page',
+    lastModifiedDateTime: new Date(Date.parse(stored.lastModifiedDateTime) + ms).toISOString(),
+  });
+
+  assert.equal(TIMESTAMP_JITTER_MS, 2000, 'one observed second, plus one second of margin');
+  assert.equal(
+    pageHasDrifted(stored, at(1000)),
+    false,
+    'the measured case: one second later on the same unchanged page',
+  );
+  // The margin is inclusive of the boundary — drift needs the live stamp *more* than
+  // TIMESTAMP_JITTER_MS later, so a gap of exactly 2000 ms is not drift and 2001 is.
+  assert.equal(pageHasDrifted(stored, at(TIMESTAMP_JITTER_MS)), false, 'exactly 2 s is not drift');
+  assert.equal(pageHasDrifted(stored, at(TIMESTAMP_JITTER_MS + 1)), true, 'one ms past it is');
 });
 
 test('a locally stamped page in the same second as Graph is not drift', () => {
@@ -820,9 +862,9 @@ test('a locally stamped page in the same second as Graph is not drift', () => {
 
   assert.equal(pageHasDrifted(stored, live), false);
   assert.equal(
-    pageHasDrifted(stored, { ...live, lastModifiedDateTime: '2026-08-19T12:00:02Z' }),
+    pageHasDrifted(stored, { ...live, lastModifiedDateTime: '2026-08-19T12:00:10Z' }),
     true,
-    'the next second really is later',
+    'a stamp clear of the jitter margin really is later',
   );
 });
 
