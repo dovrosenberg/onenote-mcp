@@ -18,6 +18,7 @@ import {
   UNGATED,
   createGate,
   parseRetryAfter,
+  recordClockSkew,
   type RequestGate,
 } from './graph-throttle.ts';
 // Decoding lives in ./graph-decode.ts. That module imports GraphResponseError and the
@@ -320,6 +321,7 @@ export async function graphGet(
   fetchImpl: FetchLike,
 ): Promise<Record<string, unknown>> {
   const response = await fetchImpl(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  recordClockSkew(response.headers);
 
   if (!response.ok) {
     // The body is read before it is thrown away: Graph puts the actual reason in it,

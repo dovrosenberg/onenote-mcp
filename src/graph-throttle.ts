@@ -26,6 +26,8 @@
 // The gate is injected rather than global so a test can run without waiting: the
 // `createGraph*` factories pass PRODUCTION_GATE, and a bare constructor gets UNGATED.
 
+import { logEvent } from './logging.ts';
+
 /** Anything that runs a Graph request under some policy. */
 export interface RequestGate {
   run<T>(operation: () => Promise<T>): Promise<T>;
@@ -218,6 +220,88 @@ export function parseRetryAfter(header: string | null, now: number = Date.now())
   const date = Date.parse(header);
   if (Number.isNaN(date)) return undefined;
   return Math.max(0, date - now);
+}
+
+// ---------------------------------------------------------------------------
+// Clock skew
+// ---------------------------------------------------------------------------
+
+/**
+ * How far this process's clock may sit from Graph's before it is worth an event.
+ *
+ * An HTTP `Date` header carries whole seconds and the value is read after a round trip,
+ * so nothing below a second or so is measurable this way. Five seconds is well clear of
+ * that and well below every margin in the sync that depends on the two clocks being
+ * close.
+ */
+export const CLOCK_SKEW_LOG_THRESHOLD_MS = 5_000;
+
+/**
+ * At most one skew event this often, however many responses arrive.
+ *
+ * A threshold alone is not a limit: a clock that is simply wrong is over it on every
+ * response, and this service can make hundreds of requests an hour. That is log volume
+ * with no extra information in it, and it buries `graph-auth-failure` and
+ * `token-cache-write-refused`, the two events an operator alerts on. Ten minutes still
+ * reports a skew that appears and a skew that goes away within one scheduled sync
+ * interval.
+ *
+ * The window is measured on this process's own clock, which is the one under suspicion.
+ * A clock that is wrong by a constant still measures elapsed time correctly, and one
+ * jumping far enough to break the window is a fault this event would report anyway.
+ */
+export const CLOCK_SKEW_LOG_INTERVAL_MS = 10 * 60_000;
+
+/** When the last `graph-clock-skew` line was written, on the caller's clock. */
+let lastSkewLogAtMs = -Infinity;
+
+/**
+ * Clear the interval limit so one test's event does not suppress the next test's.
+ *
+ * Tests only; nothing in `src/` calls it, the same arrangement `setEventSink` has.
+ */
+export function resetClockSkewThrottle(): void {
+  lastSkewLogAtMs = -Infinity;
+}
+
+/**
+ * Record how far this process's clock is from Graph's, from a header already sent.
+ *
+ * Every cross-clock comparison in the mirror sync — the watermark overlap in
+ * `overlapFrom`, and the settle guard in `storedPageIsCurrent` — is sized on an
+ * assumption about this number. `api-overview.md` bounds it loosely: one probe on
+ * 2026-08-21 put it inside a bracket that contains a full round trip, taken against a
+ * developer workstation rather than the deployed service, which rules out minutes and
+ * hours and settles nothing tighter. This reports it continuously from the running
+ * service's own clock, and costs no request — `Date` is on every response.
+ *
+ * Returns the signed skew in milliseconds, positive when this process is ahead of Graph,
+ * or null when the header is absent or unreadable. Resolution is whole seconds, because
+ * that is all an HTTP date carries; a value under a second is rounding, not skew.
+ *
+ * The argument is a `Headers` and a clock, and deliberately not the response or the URL:
+ * all three call sites have a URL in scope, and a URL carries a page id. What is logged
+ * is one number.
+ */
+export function recordClockSkew(headers: Headers, now: () => number = Date.now): number | null {
+  const header = headers.get('date');
+  if (header === null) return null;
+
+  const serverMs = Date.parse(header);
+  if (Number.isNaN(serverMs)) return null;
+
+  const atMs = now();
+  const skewMs = atMs - serverMs;
+
+  if (
+    Math.abs(skewMs) >= CLOCK_SKEW_LOG_THRESHOLD_MS &&
+    atMs - lastSkewLogAtMs >= CLOCK_SKEW_LOG_INTERVAL_MS
+  ) {
+    lastSkewLogAtMs = atMs;
+    logEvent('graph-clock-skew', { skewMs: Math.round(skewMs) });
+  }
+
+  return skewMs;
 }
 
 function defaultSleep(ms: number): Promise<void> {
