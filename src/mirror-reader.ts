@@ -16,7 +16,7 @@
 // rather than only the selected notebooks. Page *content* follows the selection; notebook
 // and section names do not. Without that, both tools would answer confidently and
 // partially from a mirror holding three notebooks out of fifty-five, and a partial answer
-// that cannot be detected as partial is the failure docs/mirror.md names about truncated
+// that cannot be detected as partial is the failure docs/content.md names about truncated
 // searches. Unscoped `search_pages` still reports `accountCoverage.searched` against
 // `accountCoverage.inAccount`, because its *pages* really are a subset.
 //

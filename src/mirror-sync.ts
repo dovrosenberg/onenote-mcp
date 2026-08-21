@@ -265,7 +265,7 @@ export interface BuiltStructure {
  * are in the selection. Without this, `list_notebooks` — which takes no arguments — and
  * an unscoped `search_pages` would answer confidently and partially from a mirror holding
  * 3 of 55 notebooks, and a partial answer that cannot be detected as partial is the
- * failure docs/mirror.md already names about truncated searches.
+ * failure docs/content.md already names about truncated searches.
  *
  * **It emits tree-owned fields only.** No `pagesSyncedThrough`, no `pageCount`, no
  * `childGroupsKnown`, no `pendingWrites` — the tree read knows none of them, and a
