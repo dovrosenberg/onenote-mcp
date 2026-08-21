@@ -64,12 +64,12 @@
     {
       "id": 7,
       "subject": "Task 8: The section-scan overlap drops to fifteen minutes",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         6
       ],
       "description": "**Goal:** A section edited once stops being re-listed on every run for an hour afterwards.\n\n**Files:**\n- Modify: `src/mirror-schema.ts` \u2014 SECTION_SCAN_OVERLAP_MS\n- Modify: `src/mirror-sync.ts:687` \u2014 pickCandidates passes it\n- Modify: `README.md` \u2014 the request-budget table\n- Test: `test/mirror-sync.test.ts`\n\n**Acceptance Criteria:**\n- pickCandidates uses a 15-minute cutoff and the page listing still uses an hour\n- A section 20 minutes older than the scan watermark is not a candidate\n- A section 10 minutes older still is\n- A never-synced section is a candidate whatever its stamp\n- A section in a wide-scan notebook is a candidate whatever its stamp\n\n**Verify:** `npm run typecheck && npm test`\n\n```json:metadata\n{\"files\": [\"src/mirror-schema.ts\", \"src/mirror-sync.ts\", \"README.md\", \"test/mirror-sync.test.ts\"], \"verifyCommand\": \"npm run typecheck && npm test\", \"acceptanceCriteria\": [\"two separate overlap constants\", \"15 minutes on the section scan\", \"an hour still on the page listing\", \"wide-scan notebooks bypass the cutoff\", \"README cost table updated\"]}\n```"
     }
   ],
-  "lastUpdated": "2026-08-21T08:51:30.665309"
+  "lastUpdated": "2026-08-21T09:58:52.767655"
 }
