@@ -1212,9 +1212,18 @@ request, because `storedPageIsCurrent` skips it from the listing's own stamp and
 the width buys margin and spends bytes. `SECTION_SCAN_OVERLAP_MS` (fifteen minutes) is how
 far back tier 1 of `pickCandidates` reaches beyond `sectionsScannedThrough`; every section
 it surfaces costs one `listPagesChangedSince` on every run for as long as the window lasts.
-Do not collapse them back into one constant. The evidence that the narrower one is too
-narrow is an `ageMs` above 900000 on a `sync-overlap-save` line; `README.md` carries the
-query under **Proving it works**, beside the `graph-clock-skew` one.
+Do not collapse them back into one constant.
+
+**The `sync-overlap-save` line measures the hour, not the fifteen minutes.**
+`overlapSaveAgeMs` is called with `section.pagesSyncedThrough`, so its `ageMs` is bounded
+by `WATERMARK_OVERLAP_MS`; an `ageMs` approaching 3600000 says the hour is too narrow, and
+one in the tens of minutes is ordinary. **Nothing observes whether the section-scan window
+is wide enough.** A section that window declines is never a candidate, so `syncSection`
+never runs, no page listing is made, and no line is written at all — the failure is silence
+rather than a large number. The nightly `/sync/sweep/full` is the backstop: it compares
+stamps and titles against every stored page whatever the timestamps say, so a section the
+15-minute window declined is reconciled by morning. `README.md` carries the query under
+**Proving it works**, beside the `graph-clock-skew` one.
 
 **Activity never touches the write path.** `resyncPage` consults `section.mirrored` and
 nothing else, so a write to a frozen notebook still marks the page stale, still reaches

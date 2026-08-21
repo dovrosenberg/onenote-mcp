@@ -857,9 +857,14 @@ urgent; read them after the service has been running for a week.
 
 ```bash
 # How far back the page-listing overlap actually reached to catch a page that had really
-# changed. The largest ageMs over a day is the narrowest section-scan window that would
-# still have caught every one of them; above 900000 means SECTION_SCAN_OVERLAP_MS is too
-# narrow. Nothing logged at all means neither window has ever caught anything.
+# changed. The largest ageMs over a day is the narrowest WATERMARK_OVERLAP_MS that would
+# still have caught every one of them; approaching 3600000 means that hour is too narrow.
+# Tens of minutes is ordinary. Nothing logged at all means the overlap has never caught
+# anything.
+#
+# It says nothing about SECTION_SCAN_OVERLAP_MS. A section that window declines is never
+# listed, so it produces no line here at all -- that failure is silence, not a large
+# number, and nothing observes it. The nightly /sync/sweep/full is the backstop for it.
 gcloud logging read \
   'resource.type="cloud_run_revision" AND jsonPayload.event="sync-overlap-save"' \
   --project="$GCP_PROJECT" --limit=50 --freshness=1d --format='value(jsonPayload.ageMs)'

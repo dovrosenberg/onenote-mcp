@@ -283,6 +283,12 @@ function readIdList(raw: unknown): string[] | null {
  *
  * Not the window that decides which *sections* are listed at all. That one costs one
  * request per section per run and is `SECTION_SCAN_OVERLAP_MS`, below.
+ *
+ * **This is the window the `sync-overlap-save` log line measures.** `overlapSaveAgeMs` is
+ * called with `section.pagesSyncedThrough`, so the `ageMs` it reports is how far a page's
+ * stamp predates that section's page-listing watermark — bounded by this hour and by
+ * nothing else. An `ageMs` approaching 3600000 is what would say the hour is too narrow.
+ * Values in the tens of minutes are ordinary and say nothing.
  */
 export const WATERMARK_OVERLAP_MS = 3_600_000;
 
@@ -316,18 +322,20 @@ export const WATERMARK_OVERLAP_MS = 3_600_000;
  * effect either measurement above shows. The lag itself has never been measured directly,
  * which is why the log line below is the thing to watch rather than an argument.
  *
- * **What would show fifteen minutes is too narrow:** an `ageMs` above 900000 on a
- * `sync-overlap-save` line. That event fires for a page whose stamp predates its
- * section's watermark *and* that turned out to have really changed — a page the window is
- * the only reason the sync saw. The largest `ageMs` over a long run is the narrowest
- * window that would still have caught everything, and a value above this constant is a
- * page a 15-minute scan window would have reached late. `README.md` carries the query
- * under **Proving it works**.
+ * **Nothing observes whether this window is wide enough, and that is deliberate rather
+ * than an oversight.** A too-narrow section-scan window makes a section not a candidate,
+ * so `syncSection` never runs, no page listing is made, and no log line is written at all.
+ * The failure produces silence, not a large number. In particular it does **not** show up
+ * in `sync-overlap-save`: that line measures `WATERMARK_OVERLAP_MS`, the page-listing
+ * window, and an `ageMs` of twenty minutes there is ordinary. Reading it as evidence about
+ * this constant would argue for widening the one window this pass exists to narrow.
  *
- * Being wrong here costs a night rather than an edit: the nightly `/sync/sweep/full`
- * compares stamps and titles against every stored page, so a section this window declined
- * is reconciled then. A notebook just mirrored or just activated does not depend on this
- * window at all — `notebooksNeedingWideScan` covers that case.
+ * What covers being wrong here is the nightly `/sync/sweep/full`, which compares stamps
+ * and titles against every stored page whatever the timestamps say — so a section this
+ * window declined is reconciled by morning. That is the backstop, and it is why fifteen
+ * minutes is worth trying against measurements rather than a log line. A notebook just
+ * mirrored or just activated does not depend on this window at all —
+ * `notebooksNeedingWideScan` covers that case.
  */
 export const SECTION_SCAN_OVERLAP_MS = 900_000;
 
@@ -362,12 +370,14 @@ export function overlapFrom(
 /**
  * How far a page's stamp predates the watermark, when the overlap is why it was listed.
  *
- * Both overlap windows are margins against Graph's propagation lag and the gap between
- * its clock and this process's. A page whose stamp is older than the watermark is one
- * that only `overlapFrom`'s reach put in front of the sync; the largest age ever seen for
- * a page that turned out to have really changed is the narrowest window that would still
- * have caught everything, and it is the evidence `SECTION_SCAN_OVERLAP_MS` names for
- * whether fifteen minutes is too narrow.
+ * The watermark passed in is a *section's page-listing* watermark, so the age this returns
+ * is bounded by `WATERMARK_OVERLAP_MS` and is evidence about that constant alone. The
+ * largest age ever seen for a page that turned out to have really changed is the narrowest
+ * page-listing window that would still have caught everything.
+ *
+ * It says nothing about `SECTION_SCAN_OVERLAP_MS`. That window decides whether the section
+ * is listed at all, and a section it declines produces no listing and therefore no line
+ * here — the failure is silence rather than a large number.
  *
  * Returns null when the page is not one of those: a stamp at or after the watermark would
  * have been listed by a window of any width, a null watermark means the section asked for
