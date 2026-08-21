@@ -1489,6 +1489,12 @@ function staleSections(): StoredSection[] {
   ];
 }
 
+/**
+ * A state document with the cutoff already past the sections' timestamps.
+ *
+ * Every caller passes `mirroredNotebookIdsSeen`, because a null one is "never recorded"
+ * and takes the widen-nothing path whatever the selection says.
+ */
 function seenState(seen: Partial<MirrorSyncState>): MirrorSyncState {
   return {
     ...initialSyncState(),
@@ -1787,9 +1793,9 @@ test('an active list becoming null widens every mirrored notebook that was froze
 });
 
 test('the structure hash does not move when only the active set changed', () => {
-  // If it did, an activation edit would disable the timestamp filter for a pass and write
-  // a structure the documents say nothing about. The two changes need different
-  // responses, and `reconcileSelection` gives the selection lists their own.
+  // If it did, an activation edit would write a structure the documents say nothing about.
+  // The two changes need different responses, and `reconcileSelection` gives the selection
+  // lists their own.
   const base = structureHashOf(buildStructure(TREE, sel([NB])));
   assert.equal(structureHashOf(buildStructure(TREE, sel([NB], []))), base);
   assert.equal(structureHashOf(buildStructure(TREE, sel([NB], [NB]))), base);

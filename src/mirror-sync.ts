@@ -737,19 +737,6 @@ async function reconcileSelection(
 }
 
 /**
- * Which sections this run visits.
- *
- * With `sectionRollUpTrusted` — the default, on the strength of the 2026-08-19 probe —
- * only sections whose timestamp moved past the overlap window, plus any never synced.
- * Without it, or when the tree read failed so the stored timestamps are stale, every
- * mirrored section. `listSectionsToSync` already returns them oldest-watermark-first, so
- * a budget-bounded run round-robins rather than starving the tail.
- *
- * A section with no `graphLastModifiedDateTime` is always a candidate. "The field is
- * absent" and "the timestamp cannot be relied on" have to behave identically, or a
- * service that quietly stopped returning it would silently stop the mirror updating.
- */
-/**
  * Split sections into the ones this run may visit and a count of what it declined.
  *
  * A separate exported function rather than a parameter on `pickCandidates`, for two
@@ -809,11 +796,10 @@ export function withLiveMtimes(
 /**
  * The three decisions `pickCandidates` makes its filter from, named at the call site.
  *
- * An options object rather than three more positional parameters. A `ReadonlySet<string>`
- * beside a `boolean` and a state object has no self-evident order, and a bare `true` at a
- * call site says nothing about which question it answers. `sections` and `live` stay
- * positional because they are the data being filtered and the overlay applied to it, and
- * their types say which is which.
+ * An options object rather than three more positional parameters: a `ReadonlySet<string>`
+ * beside a `boolean` and a state object has no self-evident order. `sections` and `live`
+ * stay positional because they are the data being filtered and the overlay applied to it,
+ * and their types say which is which.
  */
 export interface CandidateOptions {
   readonly state: MirrorSyncState;
@@ -842,21 +828,40 @@ export interface CandidateOptions {
  *
  * Each reason a structure change used to need a wide pass is now covered by a narrower
  * rule. A section the tree just gained is created with `pagesSyncedThrough: null` from
- * `NEW_SECTION_DEFAULTS`, so the null-watermark clause below takes it. A renamed or moved
- * section keeps a watermark no structure write touches, and its pages did not change. A
- * section whose notebook just became mirrored or active is the wide-scan set's job. A
- * section moved out of a notebook that was never mirrored has never been synced, so its
- * watermark is null.
+ * `NEW_SECTION_DEFAULTS`, so the null-watermark clause below takes it. A section whose
+ * notebook just became mirrored or active is the wide-scan set's job. A section moved out
+ * of a notebook that was never mirrored has never been synced, so its watermark is null. A
+ * renamed section keeps a watermark no structure write touches, and a rename changes no
+ * page.
  *
- * One case is knowingly not covered: a section moved into a mirrored notebook out of one
- * that *used* to be mirrored keeps a stale non-null watermark, and the notebook it landed
- * in is not newly mirrored, so nothing widens it. It needs an operator to drop a notebook
- * from the selection and then move a section out of it in the OneNote client. Page creates
- * and deletes there are repaired by the weekly `sweep-full`, which applies no timestamp
- * filter; a page *edited* in that window waits until something next moves the section's
- * timestamp. Covering it exactly means `putStructure` returning the ids of the section
- * documents whose identity moved, so the widening is per section rather than per notebook.
- * That is a change to `SyncStore` and to a module with no test, and it is not this one.
+ * One class is knowingly not covered: a section moved into a mirrored notebook while
+ * carrying a watermark that is already in arrears. `sectionIdentity` includes
+ * `notebookId`, so the move rewrites the section document's tree fields — but
+ * `pagesSyncedThrough` is not among them, so the stale watermark survives, and the
+ * notebook it landed in is not newly mirrored or newly active, so nothing widens it. The
+ * arrears never sync. Two instances, in descending order of how reachable they are:
+ *
+ * - Out of a **mirrored but inactive** notebook. Such a notebook is backfilled once and
+ *   never re-listed, so its sections' watermarks are as old as that backfill. This needs
+ *   no `notebookIds` edit at all — only an inactive notebook, which is 53 of the 55 on
+ *   this account.
+ * - Out of a notebook that *used* to be mirrored. This one needs an operator to drop a
+ *   notebook from the selection and then move a section out of it in the OneNote client.
+ *
+ * Both rest on two premises about the service, and **neither is verified** — see
+ * `api-overview.md`, "Moving a section between notebooks". (a) A section moved in the
+ * OneNote client keeps its Graph id. If it does not, the old document is deleted by
+ * absence and the new one created with `pagesSyncedThrough: null`, and the whole class is
+ * unreachable. (b) The move does not bump the section's `lastModifiedDateTime`. If it
+ * does, tier 1 makes the section a candidate on the next run and there is no gap. Do not
+ * write code against this class until a live run settles both.
+ *
+ * What the gap costs while it stands: page creates and deletes in the moved section are
+ * repaired by the weekly `sweep-full`, which applies no timestamp filter; a page *edited*
+ * in that window waits until something next moves the section's timestamp. Covering it
+ * exactly means `putStructure` returning the ids of the section documents whose identity
+ * moved, so the widening is per section rather than per notebook. That is a change to
+ * `SyncStore` and to a module with no test, and it is not this one.
  *
  * Two sections are always candidates whatever the clock says: one never synced
  * (`pagesSyncedThrough === null`), and one Graph reports no timestamp for — "the field is

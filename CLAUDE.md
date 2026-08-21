@@ -1039,9 +1039,10 @@ is the only thing that reaches a frozen notebook, which is what it is for.
 tidiness.** Activity is not a field on any structure document, so a structure pass has
 nothing to say about it: the hash it moved would name no document to write, and
 `planStructureWrite` would skip every one of them on an unchanged identity. The two changes
-also need different responses — a structure change disables the timestamp filter for one
-pass, and an activation change widens the scan for the notebooks it named. So `active` is
-recorded separately, in `activeNotebookIdsSeen`, and `reconcileSelection` acts on it.
+also need different responses — a structure change is answered by the narrower rules listed
+under `mayFilterByTimestamp` below and widens nothing, and an activation change widens the
+scan for the notebooks it named. So `active` is recorded separately, in
+`activeNotebookIdsSeen`, and `reconcileSelection` acts on it.
 
 **A selection change widens the scan for the notebooks it named, and for no others.**
 Tier 1 of `pickCandidates` skips a section whose `graphLastModifiedDateTime` is older than
@@ -1061,13 +1062,21 @@ same bug through a second door.** `notebookIdentity` carries `mirrored`, so edit
 `notebookIds` moves the structure hash — and `pickCandidates` returned every observed
 section on a moved hash, before the wide-scan clause was evaluated. Each reason a structure
 change used to need a wide pass now has a narrower rule: a section the tree just gained is
-created with `pagesSyncedThrough: null`, a renamed or moved one keeps a watermark no
-structure write touches and its pages did not change, and a section whose notebook just
-became mirrored or active is the wide-scan set's job. One case is knowingly uncovered and
-the docstring on `pickCandidates` names it — a section moved into a mirrored notebook out
-of one that *used* to be mirrored keeps a stale watermark that nothing widens. Covering it
-exactly means `putStructure` returning the ids of the documents whose identity moved, so
-the widening is per section rather than per notebook.
+created with `pagesSyncedThrough: null`, a renamed one keeps a watermark no structure write
+touches and a rename changes no page, and a section whose notebook just became mirrored or
+active is the wide-scan set's job. One class is knowingly uncovered and the docstring on
+`pickCandidates` names it — a section moved into a mirrored notebook while already in
+arrears keeps a stale watermark that nothing widens, because `sectionIdentity` rewrites the
+tree fields on the document and `pagesSyncedThrough` is not one of them. The reachable
+instance needs no selection edit at all: a mirrored but **inactive** notebook is backfilled
+once and never re-listed, so its sections' watermarks are months old, and moving one into
+an active notebook carries those arrears across. It rests on two things about the service
+that **no run has measured** — whether a moved section keeps its Graph id, and whether the
+move bumps its `lastModifiedDateTime` — and either answering the other way makes the class
+unreachable. `api-overview.md`, "Moving a section between notebooks", records both and how
+to settle them; do not write code against this until one has. Covering it exactly means
+`putStructure` returning the ids of the documents whose identity moved, so the widening is
+per section rather than per notebook.
 
 Only *candidacy* is widened. Each named notebook's sections still list against their own
 `pagesSyncedThrough`, which no part of this touches, so a widened section costs one
@@ -1088,10 +1097,13 @@ Removal widens nothing and is still recorded, and those are two separate rules.
 there is no backlog to catch up on. `selectionMatchesSeen` is what decides whether to
 write, and it is a different question: a run that wrote only when it had something to widen
 would leave the deactivated notebook in `activeNotebookIdsSeen`, and re-activating it later
-would diff against a list it is already in and widen nothing. `selectionSeen` false is a
-state document written before these fields existed rather than a change to the lists — it
-records them and widens nothing, because treating it as a change would make the first run
-after the deploy a full-width scan.
+would diff against a list it is already in and widen nothing. A state document written
+before these fields existed carries `mirroredNotebookIdsSeen: null`, and both functions key
+on that one field: the diff answers `[]` and the match answers false, so such a run records
+the lists and widens nothing. There is no separate flag for it — treating it as a change
+would make the first run after the deploy a full-width scan, and a boolean saying which
+null it was would be a second answer to a question `mirroredNotebookIdsSeen` already
+settles.
 
 **Activity never touches the write path.** `resyncPage` consults `section.mirrored` and
 nothing else, so a write to a frozen notebook still marks the page stale, still reaches

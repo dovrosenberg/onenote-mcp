@@ -205,6 +205,15 @@ export function selectionMatchesSeen(
   return sameIds(previous.active, current.activeNotebookIds);
 }
 
+/**
+ * Do two id lists hold the same ids, order aside?
+ *
+ * Precondition: neither side holds duplicates. Length plus one-way containment is
+ * set-equality only under that — `sameIds(['a', 'y'], ['a', 'a'])` answers true. Both
+ * callers' inputs come through `readIdList`, which collapses duplicates, so the
+ * precondition holds today; a third caller reading a list from somewhere else has to
+ * check it.
+ */
 function sameIds(a: readonly string[], b: readonly string[]): boolean {
   if (a.length !== b.length) return false;
   const set = new Set(a);
@@ -842,6 +851,15 @@ export interface MirrorSyncState {
    * Stored rather than held for one run, because a run is budget-bounded and may stop
    * with sections outstanding. It is cleared in the same place `sectionsScannedThrough`
    * advances — only when every candidate was visited.
+   *
+   * `readSyncState` reads a malformed value here as `[]`, which is the opposite choice
+   * from `activeNotebookIds` in `readIdList`, and deliberately so. Failing open there
+   * means extra Graph requests and failing closed would freeze the mirror; here the
+   * asymmetry runs the other way — failing closed costs one pending widening, which is
+   * some sections not re-listed until their timestamps move, and failing open would mean
+   * inventing a notebook set to widen for out of a value nothing could parse. This field
+   * is written only by this service, so a malformed one is a bug rather than a
+   * hand-edit.
    */
   readonly wideScanNotebookIds: readonly string[];
   /** How many *active* ids matched no notebook. Same failure as `unknownNotebookIds`. */

@@ -146,6 +146,33 @@ unchanged. The field moves on a write and only on a write.
 
 A re-read of the deleted page answered `404`.
 
+## Moving a section between notebooks: **unmeasured**
+
+Nothing here has been run against the service, and the sync depends on it. Two questions,
+each with a stated consequence, so one live run can settle both:
+
+1. **Does a section moved between notebooks in the OneNote client keep its Graph id?**
+   If it does, the mirror's existing section document survives the move and keeps its
+   `pagesSyncedThrough` — `sectionIdentity` covers `notebookId` so the tree fields are
+   rewritten, but the watermark is not one of them. If it does not, the old id vanishes
+   from the tree, its document is deleted by absence, and a new one is created with
+   `pagesSyncedThrough: null`, which is a candidate on the next run whatever the clock
+   says.
+2. **Does the move bump the section's `lastModifiedDateTime`?** The field rolls up from
+   page writes (measured, above); whether a *move* counts as a write to it is not known.
+   If it does, tier 1 of `pickCandidates` makes the section a candidate on the next run
+   and question 1 stops mattering.
+
+Only "id stable **and** timestamp unmoved" leaves a gap: a section carrying months of
+arrears moved into a mirrored, active notebook is never widened and never re-listed. The
+`pickCandidates` docstring in `src/mirror-sync.ts` records that class as knowingly
+uncovered and points here.
+
+How to settle it: read `/me/onenote/sections/{id}?$select=id,displayName,`
+`lastModifiedDateTime,parentNotebook` for a scratch section, move it between two notebooks
+in the OneNote client, then read the same section id again and re-read the account-wide
+expanded tree. A 404 on the id answers question 1; a changed timestamp answers question 2.
+
 ## `$filter` on a datetime
 
 **Measured 2026-08-19.** Unquoted ISO-8601 UTC is accepted on a section's pages:
