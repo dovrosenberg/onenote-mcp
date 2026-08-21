@@ -1096,10 +1096,27 @@ page the watermark overlap re-read. But leaving the stored stamp alone means the
 disagrees with Graph again and fetches the same page for ever. So the short-circuit calls
 `MirrorStore.putPageMetadata`, which writes the metadata fields and refreshes
 `contentSyncedAt` — the caller has just confirmed the content against Graph, and
-`contentSyncedAt` is what `mirroredAt` reports to the model. It fires only when the two
-stamps differ, because it is a Firestore write per page and the overlap re-reads every page
-edited in the last hour on every run. A live stamp of `''` never overwrites a stored one:
-that is `toPageSummary`'s fallback for a field Graph did not send, not a timestamp.
+`contentSyncedAt` is what `mirroredAt` reports to the model.
+
+It fires on two conditions, not one, because it is a Firestore write per page and the
+overlap re-reads every page edited in the last hour on every run. The stamps differing is
+the first. The second is the stored copy failing the settle guard — `contentSyncedAt`
+absent, which every page document written before that field existed is, or within
+`TIMESTAMP_SETTLE_MS` of Graph's stamp. Without that second condition the guard had no
+exit: `storedPageIsCurrent` refused the copy, the content was fetched and found identical,
+the stamps agreed so nothing was written, `contentSyncedAt` never moved, and the guard
+refused it identically on the next run — one Graph content request per run per page for
+the whole hour-wide listing window, spent on the freshest pages in the account, with
+`pagesUpdated` and `pagesSkipped` both reading zero and only `graphRequests` moving. The
+exit is bounded rather than immediate: a page fetched five seconds after its stamp settles
+to a `contentSyncedAt` five seconds after it, and the *next* run's write puts it at that
+run's clock, past the margin. `contentCopyIsSettled` in `src/mirror-schema.ts` is the one
+place the guard is written, so the skip and this write cannot disagree about it.
+
+A live stamp of `''` never overwrites a stored one: that is `toPageSummary`'s fallback for
+a field Graph did not send, not a timestamp. Such a page fails the settle guard for ever
+and is re-read once per run — the documented price of never hiding an edit, which no page
+Graph stamps ever pays.
 
 **The sweep's reconciliation loop checks the request budget, and that check now guards
 Graph requests rather than only Firestore writes.** A disagreement costs a content fetch,

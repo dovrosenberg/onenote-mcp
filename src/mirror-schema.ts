@@ -965,10 +965,52 @@ export function pageListingDiffers(stored: PageStamp, live: PageStamp): boolean 
  * service, so a figure that turns out to be wrong shows up in the logs rather than as a
  * silent miss.
  *
- * Failing the guard only ever forces an extra fetch. It never defers work into a later
- * window, so it cannot interact with the watermark overlap.
+ * Failing the guard forces a fetch, and the fetch has to leave the copy *settled* or the
+ * same page is fetched again on the next run and every run after it. That is why
+ * `writePageFromRaw`'s short-circuit writes metadata when the stored copy would fail this
+ * guard as well as when the stamps differ: `putPageMetadata` refreshes `contentSyncedAt`,
+ * and without that refresh nothing ever moves the value the guard reads. The loop had no
+ * exit — the listing window is an hour wide, so a page edited an hour ago cost one Graph
+ * content request on every run for that hour, and a page document written before
+ * `contentSyncedAt` existed cost one for ever. It was invisible in a run report:
+ * `pagesUpdated` and `pagesSkipped` both stay at zero and only `graphRequests` moves.
+ *
+ * The exit is bounded rather than immediate. A page fetched five seconds after its stamp
+ * settles to a `contentSyncedAt` five seconds after it, which still fails the guard; the
+ * next run's write puts `contentSyncedAt` at that run's clock, which is past the margin.
+ * So a page edited during a run costs at most one further fetch, not an unbounded series.
  */
 export const TIMESTAMP_SETTLE_MS = 30_000;
+
+/**
+ * Has the stored copy been in hand long enough for its stamp to be trusted?
+ *
+ * Named and exported because two places need the same answer, and the second one is not
+ * obvious. `storedPageIsCurrent` asks it to decide whether the content fetch can be
+ * skipped. `writePageFromRaw`'s short-circuit asks it to decide whether to write metadata
+ * for a page whose content it just confirmed identical — a page the guard would refuse has
+ * to be *made* settleable there, because `putPageMetadata` is the only thing that refreshes
+ * `contentSyncedAt` on a page nothing rewrote, and a guard that keeps failing keeps
+ * spending a Graph request.
+ *
+ * Not `Math.abs`. A copy fetched *before* Graph stamped the edit is not settled by any
+ * margin — it predates the edit outright — and an absolute value would call it current.
+ *
+ * Answers false for anything it cannot measure: an absent `contentSyncedAt`, which is what
+ * a document written before the field existed carries, and a live stamp neither side can
+ * parse — `''`, `toPageSummary`'s fallback for a field Graph did not send — which makes the
+ * subtraction NaN, and NaN fails every comparison.
+ */
+export function contentCopyIsSettled(
+  contentSyncedAt: unknown,
+  liveModifiedIso: string,
+  settleMs: number = TIMESTAMP_SETTLE_MS,
+): boolean {
+  const syncedAt = timestampToIso(contentSyncedAt);
+  if (syncedAt === null) return false;
+
+  return Date.parse(syncedAt) - Date.parse(liveModifiedIso) > settleMs;
+}
 
 /**
  * Does the mirror already hold this page exactly as Graph describes it?
@@ -1014,19 +1056,7 @@ export function storedPageIsCurrent(
   if (pageListingDiffers(stored, live)) return false;
   if (stored.sectionId !== sectionId) return false;
 
-  // Null for an absent field, which is what a document written before `contentSyncedAt`
-  // existed carries. It cannot prove anything about when the copy was taken.
-  const syncedAt = timestampToIso(stored.contentSyncedAt);
-  if (syncedAt === null) return false;
-
-  // Not `Math.abs`. A copy fetched *before* Graph stamped the edit is not settled by any
-  // margin — it predates the edit outright — and an absolute value would call it current.
-  //
-  // A stamp neither side can parse — `''`, which is `toPageSummary`'s fallback for a field
-  // Graph did not send — makes this NaN, and NaN fails every comparison, so the page is
-  // fetched. That is the wanted answer and it is why there is no separate empty-stamp
-  // clause above; a guard that could never change the result would be untestable code.
-  return Date.parse(syncedAt) - Date.parse(live.lastModifiedDateTime) > settleMs;
+  return contentCopyIsSettled(stored.contentSyncedAt, live.lastModifiedDateTime, settleMs);
 }
 
 export interface MirrorPageContent {

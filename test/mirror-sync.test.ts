@@ -64,6 +64,7 @@ import {
   type CandidateOptions,
   runFullSweep,
   runIncremental,
+  writePageFromRaw,
   runSweep,
   runSweepAll,
   resyncPage,
@@ -443,16 +444,23 @@ function fakeStore(initial: Partial<StoreState> = {}): {
     // let "a second sweep after a re-fetch disagrees about nothing" pass against a mirror
     // that had forgotten the correction — which is the one property saying the re-fetch
     // converges rather than repeating every run.
+    // Both writes stamp `contentSyncedAt`, which is what the real store does with
+    // `FieldValue.serverTimestamp()` (src/mirror-store.ts). Modelled with the harness's
+    // fixed clock rather than a real one. Without it the settle guard in
+    // `storedPageIsCurrent` fails on every document this fake ever wrote, so no test could
+    // show a page becoming skippable — which is the property the metadata write buys.
     putPage: (page: MirrorPage, content: MirrorPageContent | null) => {
       calls.puts.push({ page, hasContent: content !== null });
-      data.pages.set(page.id, page);
+      data.pages.set(page.id, { ...page, contentSyncedAt: NOW_ISO });
       reproject(page.id, { title: page.title, lastModifiedDateTime: page.lastModifiedDateTime });
       return Promise.resolve();
     },
     putPageMetadata: (page) => {
       calls.metadata.push({ id: page.id, lastModifiedDateTime: page.lastModifiedDateTime });
       const existing = data.pages.get(page.id);
-      if (existing !== undefined) data.pages.set(page.id, { ...existing, ...page });
+      if (existing !== undefined) {
+        data.pages.set(page.id, { ...existing, ...page, contentSyncedAt: NOW_ISO });
+      }
       reproject(page.id, { title: page.title, lastModifiedDateTime: page.lastModifiedDateTime });
       return Promise.resolve();
     },
@@ -1531,6 +1539,88 @@ test('an unsettled copy is fetched even though the stamps match', async () => {
 
   assert.deepEqual(fetched, ['p1']);
   assert.equal(report.pagesSkipped, 0);
+});
+
+test('a copy that has never settled is fetched, and the fetch is what settles it', async () => {
+  // The loop this closes. A stored copy the settle guard refuses is fetched; the content
+  // turns out identical, so `writePageFromRaw` short-circuits; the stamps agree, so the
+  // metadata write used to be skipped; `contentSyncedAt` therefore never moved and the
+  // guard refused the same page on the next run, and the next, for the whole life of the
+  // hour-wide listing window. One Graph content request per run per page, against 400 an
+  // hour, spent on the freshest pages in the account — the ones the skip exists for.
+  //
+  // Every page document written before `contentSyncedAt` existed has this shape, so it is
+  // the common case immediately after a deploy rather than an edge case. It is also
+  // invisible in a run report: `pagesUpdated` and `pagesSkipped` both stay at zero and
+  // only `graphRequests` moves.
+  const first = fetchRecorder();
+  const h1 = harness(
+    { changed: { 'sec-1': [summary('p1', '2026-08-19T11:30:00Z')] } },
+    { sections: [section()], pages: new Map([['p1', storedPage()]]) },
+    first.content,
+  );
+
+  const report = await runIncremental(h1.deps, BUDGET);
+
+  assert.deepEqual(first.fetched, ['p1'], 'an unsettleable copy cannot be trusted');
+  assert.deepEqual(h1.storeCalls.puts, [], 'and the content turns out identical');
+  assert.deepEqual(
+    h1.storeCalls.metadata,
+    [{ id: 'p1', lastModifiedDateTime: '2026-08-19T11:30:00Z' }],
+    'so the one write that breaks the loop is the metadata write',
+  );
+  assert.equal(report.pagesUpdated, 0, 'settling a copy is not a page update');
+
+  const settledNow = h1.data.pages.get('p1');
+  assert.ok(settledNow);
+
+  const second = fetchRecorder();
+  const h2 = harness(
+    { changed: { 'sec-1': [summary('p1', '2026-08-19T11:30:00Z')] } },
+    { sections: [section()], pages: new Map([['p1', settledNow]]) },
+    second.content,
+  );
+  const later = await runIncremental(h2.deps, BUDGET);
+
+  assert.deepEqual(second.fetched, [], 'the next run skips it, which is the whole point');
+  assert.equal(later.pagesSkipped, 1);
+  assert.deepEqual(h2.storeCalls.metadata, [], 'and spends no second write on it either');
+});
+
+test('a copy taken inside the settle window is settled by the fetch too', async () => {
+  // The other way the guard fails: `contentSyncedAt` is present but within
+  // TIMESTAMP_SETTLE_MS of Graph's stamp, so an edit inside the second Graph names could
+  // have landed after the copy was read. Same loop, same fix.
+  const first = fetchRecorder();
+  const h1 = harness(
+    { changed: { 'sec-1': [summary('p1', '2026-08-19T11:30:00Z')] } },
+    {
+      sections: [section()],
+      pages: new Map([['p1', settledPage({ contentSyncedAt: '2026-08-19T11:30:05Z' })]]),
+    },
+    first.content,
+  );
+
+  await runIncremental(h1.deps, BUDGET);
+
+  assert.deepEqual(first.fetched, ['p1']);
+  assert.deepEqual(h1.storeCalls.puts, []);
+  assert.deepEqual(h1.storeCalls.metadata, [
+    { id: 'p1', lastModifiedDateTime: '2026-08-19T11:30:00Z' },
+  ]);
+
+  const settledNow = h1.data.pages.get('p1');
+  assert.ok(settledNow);
+
+  const second = fetchRecorder();
+  const h2 = harness(
+    { changed: { 'sec-1': [summary('p1', '2026-08-19T11:30:00Z')] } },
+    { sections: [section()], pages: new Map([['p1', settledNow]]) },
+    second.content,
+  );
+  await runIncremental(h2.deps, BUDGET);
+
+  assert.deepEqual(second.fetched, []);
 });
 
 test('a renamed page is fetched even though Graph moved no timestamp', async () => {
@@ -3066,19 +3156,68 @@ test('the timestamp alone never forces a rewrite, but it is written back', async
   assert.equal(report.pagesUpdated, 0, 'and correcting a stamp is not a page update');
 });
 
-test('a short-circuit whose stamps already match writes nothing at all', async () => {
+test('a short-circuit whose stamp agrees and whose copy is settled writes nothing at all', async () => {
   // The metadata write is a Firestore write per page, and the watermark overlap re-reads
-  // every page edited in the last hour on every run. Firing it on agreement would spend
+  // every page edited in the last hour on every run. Firing it unconditionally would spend
   // one on each of them for no change.
-  const h = harness(
-    { tree: TREE, changed: { 'sec-1': [summary('p1', '2026-08-19T11:30:00Z')] } },
-    { pages: new Map([['p1', storedPage({ lastModifiedDateTime: '2026-08-19T11:30:00Z' })]]) },
+  //
+  // Driven through `writePageFromRaw` rather than through `runIncremental`, because
+  // `storedPageIsCurrent` skips a page in exactly this state before any fetch happens, so
+  // the short-circuit is not reachable from the incremental pass with a stamp that agrees
+  // *and* a settled copy. `resyncPage` reaches it — it passes no stored document and does
+  // not run the pre-check — and so would any later caller of this function. The property
+  // belongs to the function, so it is asserted on the function.
+  const { store, calls } = fakeStore({
+    pages: new Map([['p1', settledPage({ lastModifiedDateTime: '2026-08-19T11:30:00Z' })]]),
+  });
+  const { blobs, calls: blobCalls } = fakeBlobs();
+
+  const written = await writePageFromRaw(
+    { store, blobs },
+    { sectionId: 'sec-1', notebookId: NB, sectionPath: '2026 / Daily' },
+    summary('p1', '2026-08-19T11:30:00Z'),
+    rawHtml(TYPED_HTML),
   );
 
-  await runIncremental(h.deps, BUDGET);
+  assert.equal(written, false);
+  assert.deepEqual(calls.puts, []);
+  assert.deepEqual(calls.metadata, []);
+  assert.deepEqual(blobCalls.ink, [], 'and no render, which is the expensive half');
+});
 
-  assert.deepEqual(h.storeCalls.puts, []);
-  assert.deepEqual(h.storeCalls.metadata, []);
+test('a short-circuit whose copy the settle guard refuses writes metadata even so', async () => {
+  // The two halves of the guard, at the level the branch lives on. Both leave the stored
+  // copy unsettleable, and `putPageMetadata` is the only thing that refreshes
+  // `contentSyncedAt`, so skipping the write here costs one Graph content request on every
+  // later run — see the harness-driven pair above for the loop itself.
+  const cases: [string, Partial<MirrorPage>][] = [
+    ['a document written before contentSyncedAt existed', { contentSyncedAt: undefined }],
+    ['a copy taken inside the settle window', { contentSyncedAt: '2026-08-19T11:30:05Z' }],
+  ];
+
+  for (const [why, overrides] of cases) {
+    const { store, calls } = fakeStore({
+      pages: new Map([
+        ['p1', settledPage({ lastModifiedDateTime: '2026-08-19T11:30:00Z', ...overrides })],
+      ]),
+    });
+    const { blobs } = fakeBlobs();
+
+    const written = await writePageFromRaw(
+      { store, blobs },
+      { sectionId: 'sec-1', notebookId: NB, sectionPath: '2026 / Daily' },
+      summary('p1', '2026-08-19T11:30:00Z'),
+      rawHtml(TYPED_HTML),
+    );
+
+    assert.equal(written, false, `${why}: the content is still identical`);
+    assert.deepEqual(calls.puts, [], why);
+    assert.deepEqual(
+      calls.metadata,
+      [{ id: 'p1', lastModifiedDateTime: '2026-08-19T11:30:00Z' }],
+      why,
+    );
+  }
 });
 
 test('an empty live stamp never overwrites a stored one', async () => {

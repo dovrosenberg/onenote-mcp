@@ -74,6 +74,7 @@ import {
   notebookIdentity,
   overlapFrom,
   overlapSaveAgeMs,
+  contentCopyIsSettled,
   pageListingDiffers,
   sectionIdentity,
   storedPageIsCurrent,
@@ -1154,18 +1155,32 @@ export async function writePageFromRaw(
     stored.title === summary.title &&
     stored.sectionId === placement.sectionId
   ) {
-    // The content is right. The stamp may not be, and it has to be corrected here or
-    // nowhere: `resyncPage` writes this process's clock into `lastModifiedDateTime`,
+    // The content is right. Two other things may not be, and both have to be corrected
+    // here or nowhere.
+    //
+    // The stamp: `resyncPage` writes this process's clock into `lastModifiedDateTime`,
     // nothing above compares that field, and the string is printed in every tool result.
     // The sweep re-fetches any page whose stored stamp disagrees with Graph's, so without
     // this write the local value is permanent and that page is fetched again on every
     // sweep, for ever.
     //
+    // `contentSyncedAt`: the settle guard in `storedPageIsCurrent` refuses a copy that
+    // cannot be shown to have been taken well after Graph's stamp, and `putPageMetadata`
+    // is the only thing that refreshes that field on a page nothing rewrote. Without this
+    // clause a refused copy was fetched, found identical, written nowhere, and refused
+    // again on the next run — one Graph content request per run per page for the whole
+    // hour-wide listing window, on the freshest pages in the account, invisible in a run
+    // report because `pagesUpdated` and `pagesSkipped` both stay at zero. Every page
+    // document written before `contentSyncedAt` existed has that shape.
+    //
     // An empty live stamp is `toPageSummary`'s fallback for a field Graph did not send and
-    // must not overwrite a good stored one.
+    // must not overwrite a good stored one. Such a page fails the settle guard for ever —
+    // `Date.parse('')` is NaN — and is re-read once per run; that is the documented price
+    // of never hiding an edit, and no page Graph stamps ever pays it.
     if (
       summary.lastModifiedDateTime !== '' &&
-      summary.lastModifiedDateTime !== stored.lastModifiedDateTime
+      (summary.lastModifiedDateTime !== stored.lastModifiedDateTime ||
+        !contentCopyIsSettled(stored.contentSyncedAt, summary.lastModifiedDateTime))
     ) {
       await deps.store.putPageMetadata({
         id: summary.id,
