@@ -230,6 +230,33 @@ irrelevant for the same reason — stored-ahead-of-live is the `resyncPage` loca
 recorded under **Writing page content**, and a re-fetch corrects it where the old stale
 mark destroyed it.
 
+### The shift is not path-dependent
+
+**Measured 2026-08-21**, after the shift above. The same page was read through two
+different query shapes against the same section:
+
+| Request | Reported `lastModifiedDateTime` |
+|---|---|
+| `GET /sections/{id}/pages?$select=id,title,lastModifiedDateTime&$orderby=lastModifiedDateTime desc&$top=N` | `2026-08-19T00:39:42Z` |
+| `GET /sections/{id}/pages?$select=id,title,lastModifiedDateTime&$filter=tolower(title) eq '…'` | `2026-08-19T00:39:42Z` |
+
+Same page, same value. Only two query shapes were tried; both are page listings on a
+section, and no other endpoint was probed. The stamps have also been stable across every
+read since the shift — the +1 second happened once and has not recurred.
+
+Two things this does not establish. The mechanism of the original shift is still unknown;
+the flooring-versus-ceiling explanation above remains a guess. And the shift was
+correlated in time with the OneNote client first opening that notebook, which is a
+correlation observed once and not a demonstrated cause.
+
+Why it matters: the re-fetch design depends on the disagreement being transient. If two
+query shapes reported the same page differently, then two sync passes reading through
+different shapes would disagree permanently, `pageStampDiffers` would be true on every
+run, and every page would be re-fetched every run — against a 400-request hourly budget,
+with the mirror never converging. These two reads agree, so the design converges: a page
+caught by the wobble is fetched once, its stored stamp is corrected to Graph's, and the
+next run agrees.
+
 ## A section's page listing reports a title immediately; `GET /pages/{id}` does not
 
 **Measured 2026-08-21.** `GET /sections/{id}/pages?$select=id,title,lastModifiedDateTime`

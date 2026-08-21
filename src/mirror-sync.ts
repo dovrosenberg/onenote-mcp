@@ -70,6 +70,7 @@ import {
   inkmlObjectName,
   notebookIdentity,
   overlapFrom,
+  overlapSaveAgeMs,
   pageStampDiffers,
   sectionIdentity,
   utf8Bytes,
@@ -917,7 +918,15 @@ async function syncSection(ctx: PassContext, section: MirrorSection): Promise<vo
       ctx.tally.done = false;
       return;
     }
-    await syncPage(ctx, section, summary);
+    const written = await syncPage(ctx, section, summary);
+
+    // Only a page that was *written* counts. One the overlap re-read and found unchanged
+    // is what the window costs, not what it saves, and logging it here would produce
+    // evidence arguing to keep a window that is catching nothing.
+    if (written) {
+      const ageMs = overlapSaveAgeMs(section.pagesSyncedThrough, summary.lastModifiedDateTime);
+      if (ageMs !== null) logEvent('sync-overlap-save', { ageMs });
+    }
   }
 
   await ctx.deps.store.setSectionWatermark(section.id, ctx.startedAtIso);
@@ -973,12 +982,16 @@ function cutOffAt(pages: readonly PageSummary[], since: string): PageSummary[] {
  *
  * A 404 is not an error. The page was deleted between the listing and the fetch, which
  * is the issue's "lazy tombstoning" and comes free on this path.
+ *
+ * Returns true only when a page document was written. A deletion, a failure, and a copy
+ * the short-circuit found already current are all false. `syncSection` reads it to decide
+ * whether the watermark overlap earned its cost on this page.
  */
 async function syncPage(
   ctx: PassContext,
   section: MirrorSection,
   summary: PageSummary,
-): Promise<void> {
+): Promise<boolean> {
   ctx.budget.take();
 
   let raw: RawPageContent;
@@ -987,21 +1000,24 @@ async function syncPage(
   } catch (err) {
     if (err instanceof GraphRequestError && err.status === 404) {
       await deletePage(ctx, summary.id, section, 'not-found');
-      return;
+      return false;
     }
     logEvent('mirror-page-failed', { pageId: summary.id, reason: reasonOf(err) });
     ctx.tally.pagesFailed += 1;
-    return;
+    return false;
   }
 
   try {
     // Only counted when something was actually written. A page re-read because it fell
     // inside the watermark overlap and found unchanged is not an update, and reporting
     // it as one would make every run look busy and hide a sync that had stopped working.
-    if (await storePage(ctx, section, summary, raw)) ctx.tally.pagesUpdated += 1;
+    if (!(await storePage(ctx, section, summary, raw))) return false;
+    ctx.tally.pagesUpdated += 1;
+    return true;
   } catch (err) {
     logEvent('mirror-page-failed', { pageId: summary.id, reason: reasonOf(err) });
     ctx.tally.pagesFailed += 1;
+    return false;
   }
 }
 

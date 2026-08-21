@@ -306,6 +306,34 @@ export function overlapFrom(
   return new Date(Math.min(watermark, watermark - overlapMs)).toISOString();
 }
 
+/**
+ * How far a page's stamp predates the watermark, when the overlap is why it was listed.
+ *
+ * `WATERMARK_OVERLAP_MS` is a margin against Graph's propagation lag and the gap between
+ * its clock and this process's, and it was chosen rather than measured. A page whose
+ * stamp is older than the watermark is one that only `overlapFrom`'s reach put in front
+ * of the sync; the largest age ever seen for a page that turned out to have really
+ * changed is the narrowest window that would still have caught everything.
+ *
+ * Returns null when the page is not one of those: a stamp at or after the watermark would
+ * have been listed by a window of any width, a null watermark means the section asked for
+ * everything from the epoch, and an unparseable value on either side is a measurement
+ * that cannot be taken rather than one to guess at.
+ *
+ * The answer is a number of milliseconds. It names no page and no section, which is what
+ * makes it safe in a log line.
+ */
+export function overlapSaveAgeMs(watermarkIso: string | null, modifiedIso: string): number | null {
+  if (watermarkIso === null) return null;
+
+  const watermark = Date.parse(watermarkIso);
+  const modified = Date.parse(modifiedIso);
+  if (Number.isNaN(watermark) || Number.isNaN(modified)) return null;
+  if (modified >= watermark) return null;
+
+  return watermark - modified;
+}
+
 // ---------------------------------------------------------------------------
 // Page HTML placement
 // ---------------------------------------------------------------------------

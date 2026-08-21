@@ -33,6 +33,7 @@ import {
   LISTING_HOLD_EXPIRY_MS,
   notebookIdentity,
   overlapFrom,
+  overlapSaveAgeMs,
   pageStampDiffers,
   planStructureWrite,
   isActive,
@@ -228,6 +229,33 @@ test('the overlap is an hour, and it is subtracted rather than added', () => {
     Date.parse(overlapFrom('2026-08-19T12:00:00.000Z')) <
       Date.parse('2026-08-19T12:00:00.000Z'),
   );
+});
+
+test('an overlap save is a page whose stamp predates the watermark', () => {
+  // The whole reason the window exists: this page is in the listing only because
+  // `overlapFrom` reached back past the watermark, and the age is how far back.
+  assert.equal(
+    overlapSaveAgeMs('2026-08-19T10:00:00.000Z', '2026-08-19T09:30:00.000Z'),
+    1_800_000,
+  );
+
+  // A page at or after the watermark would have been listed by a window of any width, so
+  // it is not something the overlap saved. The boundary is closed on the watermark: a
+  // stamp equal to it is inside the range a zero-width window asks for.
+  assert.equal(overlapSaveAgeMs('2026-08-19T10:00:00.000Z', '2026-08-19T10:00:00.000Z'), null);
+  assert.equal(overlapSaveAgeMs('2026-08-19T10:00:00.000Z', '2026-08-19T10:30:00.000Z'), null);
+});
+
+test('an absent or unreadable stamp is not an overlap save', () => {
+  // A never-synced section asked for everything from the epoch, so no page in its
+  // listing was rescued by the overlap and the age would be meaningless.
+  assert.equal(overlapSaveAgeMs(null, '2026-08-19T09:30:00.000Z'), null);
+
+  // Either side unparseable yields no number rather than a NaN in a log line. This is a
+  // measurement, and a measurement that cannot be taken is absent rather than guessed.
+  assert.equal(overlapSaveAgeMs('not a date', '2026-08-19T09:30:00.000Z'), null);
+  assert.equal(overlapSaveAgeMs('2026-08-19T10:00:00.000Z', 'not a date'), null);
+  assert.equal(overlapSaveAgeMs('', ''), null);
 });
 
 // ---------------------------------------------------------------------------

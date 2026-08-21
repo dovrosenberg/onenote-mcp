@@ -1244,6 +1244,110 @@ test('an unchanged content hash writes nothing and renders no ink', async () => 
   assert.deepEqual(second.storeCalls.watermarks, [{ sectionId: 'sec-1', watermark: NOW_ISO }]);
 });
 
+/** Every `sync-overlap-save` line this run wrote, parsed. */
+function overlapSaves(lines: readonly string[]): unknown[] {
+  return lines
+    .map((line) => JSON.parse(line) as { event: string })
+    .filter((entry) => entry.event === 'sync-overlap-save');
+}
+
+test('a page only the overlap surfaced is logged with its age', async () => {
+  const lines: string[] = [];
+  setEventSink((line) => lines.push(line));
+
+  // The watermark is 10:00 and the page's stamp is 09:30, so the only reason this page is
+  // in the listing at all is the hour `overlapFrom` reaches back. It is also genuinely
+  // changed — nothing is stored for it — so the window earned its cost here.
+  const h = harness(
+    { changed: { 'sec-1': [summary('p1', '2026-08-19T09:30:00Z')] } },
+    { sections: [section({ pagesSyncedThrough: '2026-08-19T10:00:00Z' })] },
+  );
+
+  const report = await runIncremental(h.deps, BUDGET);
+  setEventSink(() => {});
+
+  assert.equal(report.pagesUpdated, 1, 'the page really was written');
+  assert.deepEqual(overlapSaves(lines), [{ event: 'sync-overlap-save', ageMs: 1_800_000 }]);
+});
+
+test('a page inside the watermark is not logged as an overlap save', async () => {
+  const lines: string[] = [];
+  setEventSink((line) => lines.push(line));
+
+  // 10:30 is after the 10:00 watermark, so a window of any width would have listed it.
+  const h = harness(
+    { changed: { 'sec-1': [summary('p1', '2026-08-19T10:30:00Z')] } },
+    { sections: [section({ pagesSyncedThrough: '2026-08-19T10:00:00Z' })] },
+  );
+
+  const report = await runIncremental(h.deps, BUDGET);
+  setEventSink(() => {});
+
+  assert.equal(report.pagesUpdated, 1, 'it was written, and still is not a save');
+  assert.deepEqual(overlapSaves(lines), []);
+});
+
+test('a page the overlap re-read and found unchanged is not a save', async () => {
+  const lines: string[] = [];
+  setEventSink((line) => lines.push(line));
+
+  // This is the case the event must never claim. The page's stamp predates the watermark,
+  // so the overlap is why it was listed — but the stored copy already matched, so a
+  // narrower window would have lost nothing. Counting it as a save would produce evidence
+  // arguing to keep a window that is doing no work.
+  const h = harness(
+    { changed: { 'sec-1': [summary('p1', '2026-08-19T09:30:00Z')] } },
+    {
+      sections: [section({ pagesSyncedThrough: '2026-08-19T10:00:00Z' })],
+      pages: new Map([['p1', storedPage()]]),
+    },
+  );
+
+  const report = await runIncremental(h.deps, BUDGET);
+  setEventSink(() => {});
+
+  assert.equal(report.pagesUpdated, 0, 'nothing was written');
+  assert.deepEqual(overlapSaves(lines), []);
+});
+
+test('an overlap save carries a number and nothing that could name the page', async () => {
+  const lines: string[] = [];
+  setEventSink((line) => lines.push(line));
+
+  // The event is read off a log-based metric as a distribution of ages. Everything else
+  // in scope at the call site is user content: the page's title, the section's name, the
+  // notebook path it sits under. This asserts none of it travels.
+  const title = 'Contoso renewal — pricing';
+  const sectionName = 'Board minutes';
+  const h = harness(
+    { changed: { 'sec-1': [{ id: 'p1', title, lastModifiedDateTime: '2026-08-19T09:30:00Z' }] } },
+    {
+      sections: [
+        section({
+          displayName: sectionName,
+          path: `2026 / ${sectionName}`,
+          pagesSyncedThrough: '2026-08-19T10:00:00Z',
+        }),
+      ],
+    },
+  );
+
+  await runIncremental(h.deps, BUDGET);
+  setEventSink(() => {});
+
+  const raw = lines.filter((line) => line.includes('sync-overlap-save'));
+  assert.equal(raw.length, 1);
+  const line = raw[0] as string;
+
+  // The exact object: a `deepEqual` against two keys is what forbids a third being added
+  // later without this test noticing.
+  assert.deepEqual(JSON.parse(line), { event: 'sync-overlap-save', ageMs: 1_800_000 });
+
+  for (const secret of [title, sectionName, '2026 / ', 'p1', 'sec-1', NB, 'http']) {
+    assert.equal(line.includes(secret), false, `the line quotes ${secret}`);
+  }
+});
+
 test('a section whose listing failed keeps its old watermark', async () => {
   // The next run has to retry it. Advancing here would skip every page the failed listing
   // never reported, permanently.
