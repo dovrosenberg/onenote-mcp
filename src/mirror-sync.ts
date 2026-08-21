@@ -844,39 +844,22 @@ export interface CandidateOptions {
  * Each reason a structure change used to need a wide pass is now covered by a narrower
  * rule. A section the tree just gained is created with `pagesSyncedThrough: null` from
  * `NEW_SECTION_DEFAULTS`, so the null-watermark clause below takes it. A section whose
- * notebook just became mirrored or active is the wide-scan set's job. A section moved out
- * of a notebook that was never mirrored has never been synced, so its watermark is null. A
- * renamed section keeps a watermark no structure write touches, and a rename changes no
- * page.
+ * notebook just became mirrored or active is the wide-scan set's job. A renamed section
+ * keeps a watermark no structure write touches, and a rename changes no page.
  *
- * One class is knowingly not covered: a section moved into a mirrored notebook while
- * carrying a watermark that is already in arrears. `sectionIdentity` includes
- * `notebookId`, so the move rewrites the section document's tree fields — but
- * `pagesSyncedThrough` is not among them, so the stale watermark survives, and the
- * notebook it landed in is not newly mirrored or newly active, so nothing widens it. The
- * arrears never sync. Two instances, in descending order of how reachable they are:
+ * A section moved between notebooks brings no watermark with it. Measured 2026-08-21 and
+ * recorded in `api-overview.md`, "Moving a section reissues its id across notebooks and
+ * keeps it within one": the OneNote client reissues a section's Graph id when it changes
+ * notebook, and keeps it when the section is only reparented under a section group in the
+ * same notebook. So the old id is absent from the next tree read, its document is deleted
+ * by absence, and the new id creates a document with `pagesSyncedThrough: null` — the
+ * null-watermark clause below, which no cutoff and no activity filter can decline. The
+ * class this docstring used to record as knowingly uncovered, a section carrying arrears
+ * into a mirrored active notebook, is unreachable.
  *
- * - Out of a **mirrored but inactive** notebook. Such a notebook is backfilled once and
- *   never re-listed, so its sections' watermarks are as old as that backfill. This needs
- *   no `notebookIds` edit at all — only an inactive notebook, which is 53 of the 55 on
- *   this account.
- * - Out of a notebook that *used* to be mirrored. This one needs an operator to drop a
- *   notebook from the selection and then move a section out of it in the OneNote client.
- *
- * Both rest on two premises about the service, and **neither is verified** — see
- * `api-overview.md`, "Moving a section between notebooks". (a) A section moved in the
- * OneNote client keeps its Graph id. If it does not, the old document is deleted by
- * absence and the new one created with `pagesSyncedThrough: null`, and the whole class is
- * unreachable. (b) The move does not bump the section's `lastModifiedDateTime`. If it
- * does, tier 1 makes the section a candidate on the next run and there is no gap. Do not
- * write code against this class until a live run settles both.
- *
- * What the gap costs while it stands: page creates and deletes in the moved section are
- * repaired by the weekly `sweep-full`, which applies no timestamp filter; a page *edited*
- * in that window waits until something next moves the section's timestamp. Covering it
- * exactly means `putStructure` returning the ids of the section documents whose identity
- * moved, so the widening is per section rather than per notebook. That is a change to
- * `SyncStore` and to a module with no test, and it is not this one.
+ * The cost that replaces it: a cross-notebook move re-backfills that section in full, every
+ * page fetched again under its new id and every page document under the old id deleted.
+ * Correct and self-healing, and a section's worth of requests against the hourly budget.
  *
  * Two sections are always candidates whatever the clock says: one never synced
  * (`pagesSyncedThrough === null`), and one Graph reports no timestamp for — "the field is

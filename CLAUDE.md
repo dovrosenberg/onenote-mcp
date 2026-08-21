@@ -1125,19 +1125,20 @@ section on a moved hash, before the wide-scan clause was evaluated. Each reason 
 change used to need a wide pass now has a narrower rule: a section the tree just gained is
 created with `pagesSyncedThrough: null`, a renamed one keeps a watermark no structure write
 touches and a rename changes no page, and a section whose notebook just became mirrored or
-active is the wide-scan set's job. One class is knowingly uncovered and the docstring on
-`pickCandidates` names it — a section moved into a mirrored notebook while already in
-arrears keeps a stale watermark that nothing widens, because `sectionIdentity` rewrites the
-tree fields on the document and `pagesSyncedThrough` is not one of them. The reachable
-instance needs no selection edit at all: a mirrored but **inactive** notebook is backfilled
-once and never re-listed, so its sections' watermarks are months old, and moving one into
-an active notebook carries those arrears across. It rests on two things about the service
-that **no run has measured** — whether a moved section keeps its Graph id, and whether the
-move bumps its `lastModifiedDateTime` — and either answering the other way makes the class
-unreachable. `api-overview.md`, "Moving a section between notebooks", records both and how
-to settle them; do not write code against this until one has. Covering it exactly means
-`putStructure` returning the ids of the documents whose identity moved, so the widening is
-per section rather than per notebook.
+active is the wide-scan set's job.
+
+**A section moved between notebooks brings no watermark with it, and that is measured.**
+Measured 2026-08-21 and recorded in `api-overview.md`: the OneNote client reissues a
+section's Graph id when the section changes notebook, and keeps the id when the section is
+only reparented under a section group in the same notebook. So a cross-notebook move leaves
+the old id absent from the next tree read, its document is deleted by absence, and the new
+id creates a document with `pagesSyncedThrough: null` — which is backfill-eligible whatever
+the tier-1 cutoff says and whatever its notebook's activity says. The class the
+`pickCandidates` docstring used to record as knowingly uncovered, a section carrying arrears
+into a mirrored active notebook, is unreachable. The cost that replaces it is a full
+re-backfill of that section: every page fetched again under its new id, every page document
+under the old id deleted. Correct and self-healing, and a section's worth of requests
+against the hourly budget, so it is visible in a run report rather than free.
 
 Only *candidacy* is widened. Each named notebook's sections still list against their own
 `pagesSyncedThrough`, which no part of this touches, so a widened section costs one

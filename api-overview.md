@@ -285,32 +285,55 @@ watermark overlap is sized against, so an overlap of minutes has room. A tighter
 needs the telemetry that reports the difference from inside the service on every run.
 
 
-## Moving a section between notebooks: **unmeasured**
+## Moving a section reissues its id across notebooks and keeps it within one
 
-Nothing here has been run against the service, and the sync depends on it. Two questions,
-each with a stated consequence, so one live run can settle both:
+**Measured 2026-08-21**, moving one scratch section twice in the OneNote client. The
+section held 3 pages and none of them was touched during either move.
 
-1. **Does a section moved between notebooks in the OneNote client keep its Graph id?**
-   If it does, the mirror's existing section document survives the move and keeps its
-   `pagesSyncedThrough` — `sectionIdentity` covers `notebookId` so the tree fields are
-   rewritten, but the watermark is not one of them. If it does not, the old id vanishes
-   from the tree, its document is deleted by absence, and a new one is created with
-   `pagesSyncedThrough: null`, which is a candidate on the next run whatever the clock
-   says.
-2. **Does the move bump the section's `lastModifiedDateTime`?** The field rolls up from
-   page writes (measured, above); whether a *move* counts as a write to it is not known.
-   If it does, tier 1 of `pickCandidates` makes the section a candidate on the next run
-   and question 1 stops mattering.
+**Move 1, into a section group in the same notebook.** The section id was unchanged:
+`0-583EFEEEF6E35B4B!sc42d54e6be164de4b3b13f4a50c4160e` before and after. Its 3 pages kept
+their ids and their `lastModifiedDateTime` values. The section went from being a direct
+child of the notebook to a child of a section group named `test`.
 
-Only "id stable **and** timestamp unmoved" leaves a gap: a section carrying months of
-arrears moved into a mirrored, active notebook is never widened and never re-listed. The
-`pickCandidates` docstring in `src/mirror-sync.ts` records that class as knowingly
-uncovered and points here.
+**Move 2, into a different notebook.** The section id changed:
 
-How to settle it: read `/me/onenote/sections/{id}?$select=id,displayName,`
-`lastModifiedDateTime,parentNotebook` for a scratch section, move it between two notebooks
-in the OneNote client, then read the same section id again and re-read the account-wide
-expanded tree. A 404 on the id answers question 1; a changed timestamp answers question 2.
+```
+before: 0-583EFEEEF6E35B4B!sc42d54e6be164de4b3b13f4a50c4160e
+after:  0-583EFEEEF6E35B4B!s7d0fdb0d111d440dbdba64cfcd92602e
+```
+
+Its 3 pages were reissued too, and the shape of the change is narrower than a page move's.
+The GUID stayed the same and only the trailing section component followed the section:
+
+```
+before: 0-754d222de05c49a687a41a6d7d51c456!6-…!sc42d54e6…
+after:  0-754d222de05c49a687a41a6d7d51c456!6-…!s7d0fdb0d…
+```
+
+Contrast a *page* moved between sections, above, where both the GUID and the section
+component change. Page `lastModifiedDateTime` values were unchanged throughout both moves.
+
+**A section id is stable across a move within a notebook and is reissued on a move between
+notebooks.** That asymmetry is the non-obvious part: the id survives being reparented under
+a section group, and does not survive changing notebook.
+
+The consequence for the mirror is that the id change does the work on its own. The old
+section id is absent from the next tree read, so its document is deleted by absence along
+with its pages, and the new id creates a section document with `pagesSyncedThrough: null`,
+which `pickCandidates` treats as a candidate whatever the tier-1 cutoff says and whatever
+its notebook's activity says. The gap this section previously warned about — a section
+carrying months of arrears moved into a mirrored active notebook and never widened —
+**cannot occur**, because no watermark crosses a notebook boundary.
+
+The cost that replaces it: a cross-notebook section move re-backfills that section in full.
+Every page is fetched again under its new id and every page document under the old id is
+deleted. Correct and self-healing, and it shows up in a run report as a section's worth of
+requests against the hourly budget.
+
+**Whether the move bumps the section's own `lastModifiedDateTime` was not measured.** The
+section listing this account's tooling reads does not return that field, so the run that
+settled the ids could not answer it. It no longer decides anything: the id change alone
+makes the section a fresh backfill candidate, so tier 1 never gets the chance to skip it.
 
 ## `$filter` on a datetime
 
