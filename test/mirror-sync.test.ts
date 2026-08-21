@@ -1838,6 +1838,27 @@ test('sectionsScannedThrough advances only when every candidate completed', asyn
   );
 });
 
+test('a section whose listing failed holds the scan cutoff where it is', async () => {
+  // `sectionsScannedThrough` only moves forward, and tier 1 of `pickCandidates` reaches
+  // back `SECTION_SCAN_OVERLAP_MS` beyond it. Advancing it past a section this run never
+  // listed gives that section one 15-minute window to be retried in, after which it drops
+  // out of the candidate set for good and its watermark stays behind its real edits until
+  // the nightly full sweep.
+  const h = harness({ tree: TREE, changed: { 'sec-1': [] } });
+  h.deps.graph.listPagesChangedSince = () => Promise.reject(graphError(429));
+
+  const report = await runIncremental(h.deps, BUDGET);
+
+  assert.equal(report.pagesFailed, 1);
+  // Not `budget-exhausted`: one 429 is not that, and saying so would send the scheduler
+  // to retry immediately and spend the next hour's Graph budget inside this one.
+  assert.equal(report.outcome, 'complete');
+  assert.equal(
+    h.storeCalls.patches.some((p) => p.sectionsScannedThrough !== undefined),
+    false,
+  );
+});
+
 test('a budget-exhausted run keeps the watermarks it earned', async () => {
   // The backfill is five hours of slices. Losing a slice's progress would make it never
   // finish.
@@ -2905,6 +2926,33 @@ test('the sweep does not advance a section watermark', async () => {
 
   assert.deepEqual(h.storeCalls.watermarks, []);
   assert.deepEqual(h.storeCalls.sweepResults, ['sec-1']);
+});
+
+test('a sweep cut short inside a section resumes at that section, not the next one', async () => {
+  // The cursor used to be written only at the top of the loop, so a section `sweepSection`
+  // returned early from was recorded as finished and the *following* one became the resume
+  // point. The interrupted section — the one the budget ran out inside, because it had the
+  // most to reconcile — was then not looked at again until the cursor reached the end of
+  // the list and reset, several runs later.
+  const h = harness(
+    { summaries: { 'sec-1': [], 'sec-2': [] } },
+    {
+      sections: [section({ id: 'sec-1' }), section({ id: 'sec-2', path: '2026 / Other' })],
+      digestsBySection: new Map([['sec-1', [digest('p-gone')]]]),
+    },
+  );
+
+  // tree + sec-1's enumeration = 2, leaving nothing for sec-1's reconciliation.
+  const report = await runSweep(h.deps, { requestBudget: 2 });
+
+  assert.equal(report.done, false);
+  assert.deepEqual(h.storeCalls.deletes, [], 'sec-1 was left half reconciled');
+  assert.deepEqual(
+    h.storeCalls.patches.flatMap((p) =>
+      p.sweepCursorSectionId === undefined ? [] : [p.sweepCursorSectionId],
+    ),
+    ['sec-1'],
+  );
 });
 
 test('a budget-exhausted sweep records where to resume', async () => {

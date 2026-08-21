@@ -582,6 +582,27 @@ test('an unscoped search says how many notebooks are frozen', async () => {
   assert.equal(active.body['source'], 'onenote');
 });
 
+test('a section-scoped search describes the section, not the account', async () => {
+  // The account counts and their advice — "give sectionId to search one of them directly"
+  // — describe a breadth this caller never asked for and tell it to pass the argument it
+  // has already passed. Worse, the frozen count used to be account-wide, so this answer
+  // carried a staleness warning about nb-2026 beside a `source` of onenote.
+  const { body } = await run('search_pages', { query: 'held', sectionId: 'sec-daily' });
+
+  assert.equal(body['source'], 'onenote');
+  assert.equal(body['inactiveNotebooks'], 0);
+  assert.equal(body['notebooksSearched'], undefined);
+  assert.equal(body['notebooksInAccount'], undefined);
+  assert.match(String(body['note']), /section you named was searched in full/);
+  assert.doesNotMatch(String(body['note']), /not re-checked/);
+
+  // The section's own notebook being frozen is still reported, because that one really is
+  // a claim about this answer.
+  const frozen = await run('search_pages', { query: 'held', sectionId: 'sec-daily' }, FROZEN);
+  assert.equal(frozen.body['inactiveNotebooks'], 1);
+  assert.match(String(frozen.body['note']), /not re-checked/);
+});
+
 test('get_page_content warns in prose that a frozen notebook is not re-checked', async () => {
   const { body } = await run('get_page_content', { pageId: 'p-held' }, FROZEN);
   assert.equal(body['source'], 'best-available');

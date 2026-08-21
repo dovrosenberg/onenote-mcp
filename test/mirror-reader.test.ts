@@ -425,8 +425,73 @@ test('a title scan reports its own scope, matched and scanned counts', async () 
   assert.equal(found?.pagesScanned, 2);
   // The scope is the thing a model has to be told: page content is held for one of two
   // notebooks, so "no match" does not mean "no such page".
-  assert.equal(found?.notebooksSearched, 1);
-  assert.equal(found?.notebooksInAccount, 2);
+  assert.equal(found?.accountCoverage?.searched, 1);
+  assert.equal(found?.accountCoverage?.inAccount, 2);
+});
+
+test('a section-scoped scan counts the notebook it searched, not the account', async () => {
+  // The contradiction this exists to prevent: `inactiveCoverage` resolves through
+  // `coverageOfSection`, so a search scoped into an active notebook reports
+  // `source: onenote` — and an account-wide `inactiveNotebooks` beside that label warns
+  // that an edit may be missing from a notebook the query never touched.
+  const fx = {
+    notebooks: [notebook(), notebook({ id: 'nb-2', displayName: 'Frozen' })],
+    sections: [
+      section(),
+      section({ id: 'sec-2', notebookId: 'nb-2', parentId: 'nb-2', path: 'Frozen / Daily' }),
+    ],
+    pages: [
+      page({ id: 'p-1', title: 'Monday' }),
+      page({ id: 'p-2', title: 'Monday', sectionId: 'sec-2', notebookId: 'nb-2' }),
+    ],
+    activeNotebookIds: [NB],
+  };
+
+  const { reader: active } = reader(fx);
+  const inActive = await active.searchTitles(() => true, { sectionId: 'sec-1' });
+  assert.equal(inActive?.inactiveNotebooks, 0);
+  // Dropped rather than reported: the account pair describes a breadth a scoped search
+  // never claimed, and the advice that rides with it is to pass the sectionId the caller
+  // has already passed.
+  assert.equal(inActive?.accountCoverage, null);
+
+  const { reader: frozen } = reader(fx);
+  const inFrozen = await frozen.searchTitles(() => true, { sectionId: 'sec-2' });
+  assert.equal(inFrozen?.inactiveNotebooks, 1);
+
+  // The account-wide count is still account-wide when nothing scoped the search.
+  const { reader: all } = reader(fx);
+  const unscoped = await all.searchTitles(() => true);
+  assert.equal(unscoped?.inactiveNotebooks, 1);
+  assert.equal(unscoped?.accountCoverage?.searched, 2);
+});
+
+test('a selection read that failed weakens the scan, and does not discard it', async () => {
+  // The whole point: this answer reaching `readSourced` as a rejection sends an unscoped
+  // `search_pages` to Graph at up to 61 requests, over a decoration.
+  const { store } = fakeStore({ notebooks: [notebook(), notebook({ id: 'nb-2' })] });
+  store.getSelection = () => Promise.reject(new Error('firestore down'));
+  const r = new MirrorReader(store, fakeBlobs());
+
+  const found = await r.searchTitles(() => true);
+  assert.equal(found?.totalMatches, 1);
+  assert.equal(found?.inactiveNotebooks, 2, 'a selection it cannot read counts as frozen');
+});
+
+test('list_notebooks reads the notebook collection once', async () => {
+  // It used to read it twice — directly, and again inside the memoised activity snapshot.
+  // Two identical reads of every notebook in the account, on a request a person is
+  // waiting on, which is the cost the memo was added to remove.
+  const { store } = fakeStore();
+  let reads = 0;
+  const inner = store.listNotebooks;
+  store.listNotebooks = () => {
+    reads += 1;
+    return inner.call(store);
+  };
+
+  await new MirrorReader(store, fakeBlobs()).listNotebooks();
+  assert.equal(reads, 1);
 });
 
 test('a truncated scan says so', async () => {
@@ -911,16 +976,19 @@ test('the selection is read once per window, not once per question', async () =>
   assert.equal(reads, 2, 'and it does expire, so an operator edit is not pinned for ever');
 });
 
-test('a failed selection read is not cached', async () => {
-  // A cached rejection would pin every later answer to the pessimistic label for the
-  // whole window over one Firestore blip.
+test('a failed selection read is pessimistic, and is not cached', async () => {
+  // Two properties in one test because they are the same decision. The read is caught, so
+  // a selection this could not fetch never discards the mirror answer beside it — an
+  // unscoped `search_pages` sent to Graph costs up to 61 requests. And the catch is not
+  // cached, because a cached one would pin every later answer to the pessimistic label
+  // for the whole 30-second window over one Firestore blip.
   let fail = true;
   const { store } = fakeStore();
   const inner = store.getSelection;
   store.getSelection = () => (fail ? Promise.reject(new Error('firestore down')) : inner.call(store));
   const r = new MirrorReader(store, fakeBlobs());
 
-  await assert.rejects(() => r.accountActivity());
+  assert.equal(await r.accountActivity(), 'some');
   fail = false;
   assert.equal(await r.accountActivity(), 'none');
 });

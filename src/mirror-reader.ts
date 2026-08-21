@@ -17,8 +17,8 @@
 // and section names do not. Without that, both tools would answer confidently and
 // partially from a mirror holding three notebooks out of fifty-five, and a partial answer
 // that cannot be detected as partial is the failure CLAUDE.md names about truncated
-// searches. Unscoped `search_pages` still reports `notebooksSearched` against
-// `notebooksInAccount`, because its *pages* really are a subset.
+// searches. Unscoped `search_pages` still reports `accountCoverage.searched` against
+// `accountCoverage.inAccount`, because its *pages* really are a subset.
 //
 // The branch lives in the tool modules rather than behind an adapter implementing
 // `StructureClient`. An adapter returning `PageSummary[]` has nowhere to say who
@@ -111,7 +111,7 @@ export type ReadOrigin = 'mirror' | 'graph';
  * A discriminated union over two type parameters rather than one, because the two stores
  * do not always answer with the same shape: `search_pages` from Graph reports
  * `sectionsSearched` and `stoppedEarly` about a walk, and from the mirror reports
- * `notebooksSearched` and `scanTruncated` about a scan. Narrowing on `origin` is what
+ * `accountCoverage` and `scanTruncated` about a scan. Narrowing on `origin` is what
  * lets a handler read the right one without a cast — and a cast is exactly how a field
  * that means nothing on one path ends up in the other path's result.
  *
@@ -190,9 +190,26 @@ export interface MirroredSearch {
   readonly pagesScanned: number;
   /** True when SCAN_LIMIT was reached, so the answer is a sample and must say so. */
   readonly scanTruncated: boolean;
-  readonly notebooksSearched: number;
-  readonly notebooksInAccount: number;
-  /** How many of the searched notebooks are frozen. `best-available` says a skip happened; this says how large it was. */
+  /**
+   * How much of the account the scan covered, or `null` when the caller named a section.
+   *
+   * The pair exists because an *unscoped* search silently covers only the mirrored
+   * notebooks, and a model that read "no matches" without knowing that would conclude the
+   * page does not exist. A scoped search covers exactly what it was asked for, so the
+   * same pair there describes a breadth the answer never claimed — and the advice that
+   * goes with it, "give sectionId to search one of them directly", is advice the caller
+   * has already taken.
+   */
+  readonly accountCoverage: { readonly searched: number; readonly inAccount: number } | null;
+  /**
+   * How many of the notebooks **in scope** are frozen. `best-available` says a skip
+   * happened; this says how large it was.
+   *
+   * In scope, not account-wide: a search scoped into an active notebook resolves
+   * `inactiveCoverage` through `coverageOfSection`, which reports `'none'` and a `source`
+   * of `onenote`. An account-wide count beside that label warns about a notebook the
+   * query never touched, next to a claim that the answer is confirmed current.
+   */
   readonly inactiveNotebooks: number;
 }
 
@@ -235,16 +252,17 @@ export class MirrorReader {
    * would be indistinguishable from an account with none.
    */
   async listNotebooks(): Promise<MirroredNotebook[] | null> {
-    const notebooks = await this.#store.listNotebooks();
+    // The snapshot's own notebooks, not a second `listNotebooks()` beside it. The two
+    // reads returned the same ~55 documents, on the first call in each memo window, on a
+    // request a person is waiting on — which is the cost the memo exists to remove.
+    const { selection, notebooks } = await this.#activitySnapshot();
     if (notebooks.length === 0) return null;
-
-    const { selection } = await this.#activitySnapshot();
 
     return notebooks.map((notebook) => ({
       id: notebook.id,
       displayName: notebook.displayName,
       pagesMirrored: notebook.mirrored,
-      pagesActive: notebook.mirrored && isActive(selection, notebook.id),
+      pagesActive: notebook.mirrored && selection !== null && isActive(selection, notebook.id),
     }));
   }
 
@@ -254,7 +272,8 @@ export class MirrorReader {
    * The promise is memoised rather than its result, so two calls arriving together share
    * one pair of reads. A failure is not cached: the entry is dropped so the next call
    * tries again, because a Firestore blip must not pin every later answer to the
-   * pessimistic label for 30 seconds.
+   * pessimistic label for 30 seconds. Both failures count — the rejection, and a
+   * selection the read caught and turned into `null`.
    */
   async #activitySnapshot(): Promise<ActivitySnapshot> {
     const now = this.#now();
@@ -263,16 +282,24 @@ export class MirrorReader {
 
     const snapshot = (async () => {
       const [selection, notebooks] = await Promise.all([
-        this.#store.getSelection(),
+        // Caught here and nowhere else. Only the activity label depends on the selection,
+        // and a read that failed must not discard an otherwise-good mirror answer: an
+        // unscoped `search_pages` sent to Graph costs up to 61 requests, a seventh of the
+        // hourly budget. The notebooks read is deliberately not caught — that one failing
+        // means the mirror is unreadable, and Graph is then the right answer.
+        this.#store.getSelection().catch(() => null),
         this.#store.listNotebooks(),
       ]);
       return { selection, notebooks };
     })();
 
     this.#activity = { at: now, snapshot };
-    snapshot.catch(() => {
+    const forget = (): void => {
       if (this.#activity?.snapshot === snapshot) this.#activity = null;
-    });
+    };
+    void snapshot.then((held) => {
+      if (held.selection === null) forget();
+    }, forget);
 
     return snapshot;
   }
@@ -302,11 +329,14 @@ export class MirrorReader {
    *
    * Measured against the *mirrored* notebooks, not every notebook in the account: a
    * notebook whose pages were never mirrored is not something this answer skipped, it is
-   * something the answer never claimed to cover — `notebooksSearched` against
-   * `notebooksInAccount` already says that.
+   * something the answer never claimed to cover — `accountCoverage` already says that.
    */
   async accountActivity(): Promise<InactiveCoverage> {
     const { selection, notebooks } = await this.#activitySnapshot();
+    // The pessimistic value for a *label*, and it is the weaker of the two: `'all'` maps
+    // to `best-available` whatever the refresh did, so answering it from a selection this
+    // could not read would claim more than the data supports.
+    if (selection === null) return 'some';
     const mirrored = notebooks.filter((notebook) => notebook.mirrored);
     if (mirrored.length === 0) return 'none';
 
@@ -317,6 +347,7 @@ export class MirrorReader {
 
   async #coverageOfNotebook(notebookId: string): Promise<InactiveCoverage> {
     const { selection } = await this.#activitySnapshot();
+    if (selection === null) return 'some';
     return isActive(selection, notebookId) ? 'none' : 'all';
   }
 
@@ -431,10 +462,14 @@ export class MirrorReader {
     matcher: (title: string) => boolean,
     scope: { notebookId?: string; sectionId?: string } = {},
   ): Promise<MirroredSearch | null> {
+    // The one notebook a scoped search covers, which is what its counts describe.
+    // `MirrorSection` carries `notebookId`, so the section scope costs no extra read.
+    let scopedNotebookId: string | null = scope.notebookId ?? null;
     if (scope.sectionId !== undefined) {
       const section = await this.#store.getSection(scope.sectionId);
       if (section === null || !section.mirrored) return null;
       if (listingIsHeld(section, Date.now())) return null;
+      scopedNotebookId = section.notebookId;
     } else if (await this.#heldInScope(scope.notebookId)) return null;
 
     const { selection, notebooks } = await this.#activitySnapshot();
@@ -442,16 +477,27 @@ export class MirrorReader {
 
     const scan = await this.#store.scanPages(scope);
     const matches = scan.pages.filter((page) => matcher(page.title)).map(toMatch);
-    const mirrored = notebooks.filter((notebook) => notebook.mirrored);
+    // A selection that could not be read counts as frozen, which is the pessimistic
+    // direction for this field — see `ActivitySnapshot`.
+    const frozen = (notebookId: string): boolean =>
+      selection === null || !isActive(selection, notebookId);
 
-    return {
+    const found = {
       matches,
       totalMatches: matches.length,
       pagesScanned: scan.pages.length,
       scanTruncated: scan.truncated,
-      notebooksSearched: mirrored.length,
-      notebooksInAccount: notebooks.length,
-      inactiveNotebooks: mirrored.filter((notebook) => !isActive(selection, notebook.id)).length,
+    };
+
+    if (scopedNotebookId !== null) {
+      return { ...found, accountCoverage: null, inactiveNotebooks: frozen(scopedNotebookId) ? 1 : 0 };
+    }
+
+    const mirrored = notebooks.filter((notebook) => notebook.mirrored);
+    return {
+      ...found,
+      accountCoverage: { searched: mirrored.length, inAccount: notebooks.length },
+      inactiveNotebooks: mirrored.filter((notebook) => frozen(notebook.id)).length,
     };
   }
 
@@ -635,7 +681,19 @@ export interface SourcedRead<M, G> {
 
 /** The selection and the notebook list, read together and memoised together. */
 interface ActivitySnapshot {
-  readonly selection: NotebookSelection;
+  /**
+   * `null` when the selection document could not be read.
+   *
+   * Nullable rather than a pessimistic stand-in value, because the two kinds of caller
+   * are pessimistic in opposite directions. A *decoration* — `pagesActive`,
+   * `inactiveNotebooks` — is weakened by "nothing is active", so an unreadable selection
+   * degrades it and the answer survives. A *source label* is not: `accountActivity`
+   * answering `'all'` there would be a **stronger** claim than the `'some'` that
+   * `readSourced`'s own catch produces, because `sourceFor` maps `'all'` to
+   * `best-available` whatever the refresh did. So those two callers read the null and
+   * answer `'some'` themselves.
+   */
+  readonly selection: NotebookSelection | null;
   readonly notebooks: MirrorNotebook[];
 }
 

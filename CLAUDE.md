@@ -948,6 +948,17 @@ produce `onenote`, and it cannot produce `mirror` on an answer whose refresh was
 whole account on every run whatever the active set says — weakening their label would
 report a staleness they do not have.
 
+**A selection the mirror could not read weakens a decoration and fails a label, and those
+are opposite directions.** `ActivitySnapshot.selection` is nullable: the `getSelection`
+read is caught inside the snapshot, so `pagesActive` and `inactiveNotebooks` degrade to
+"frozen" and the answer beside them survives — a Firestore blip on the selection document
+must not send an unscoped `search_pages` to Graph at 61 requests over a decoration.
+`accountActivity` and `#coverageOfNotebook` read that null and answer `'some'` themselves
+rather than treating it as "nothing is active", because `sourceFor` maps `'all'` to
+`best-available` whatever the refresh did — which is a **stronger** claim than the `'some'`
+`readSourced`'s own catch produces. A snapshot whose selection is null is dropped from the
+memo, for the reason a rejected one is.
+
 **The activity snapshot is memoised for `ACTIVITY_MEMO_MS`, and a failure is not cached.**
 Every covered tool call asks about activity, so without the memo each would add a Firestore
 document read to a request a person is waiting on. The promise is memoised rather than its
@@ -1014,9 +1025,19 @@ mirrored for the whole account.** Neither takes an argument the mirror could fai
 so both would answer confidently and partially from a mirror holding three notebooks out
 of fifty-five. The tree read returns every notebook and section for the same one request,
 so storing all of it is free; `mirrored` on each document records which have their *pages*
-held. Unscoped `search_pages` still reports `notebooksSearched` against
-`notebooksInAccount`, because its pages really are a subset — and it drops
+held. Unscoped `search_pages` still reports `accountCoverage.searched` against
+`accountCoverage.inAccount`, because its pages really are a subset — and it drops
 `stoppedEarly` and the section counts, which describe a walk that did not happen.
+
+**A scoped `search_pages` reports on the section it searched, and on nothing else.**
+`accountCoverage` is `null` when the caller named a section, so the tool omits
+`notebooksSearched` and `notebooksInAccount` and `mirrorSearchNote` drops the clause that
+tells the caller to pass a `sectionId` it has already passed. `inactiveNotebooks` is
+counted over the notebooks *in scope* for the same reason, and that one is not cosmetic: a
+search scoped into an active notebook resolves `inactiveCoverage` through
+`coverageOfSection`, reports `source: "onenote"`, and used to carry an account-wide frozen
+count beside it — a staleness warning about a notebook the query never touched, next to a
+claim that the answer is confirmed current.
 
 **A `NameLookupError` from the mirror is a miss, not an answer.** The mirror's structure
 equals Graph's expanded tree by construction but is only as fresh as the last sync, so a
@@ -1204,6 +1225,25 @@ the lists and widens nothing. There is no separate flag for it — treating it a
 would make the first run after the deploy a full-width scan, and a boolean saying which
 null it was would be a second answer to a question `mirroredNotebookIdsSeen` already
 settles.
+
+**The sweep's resume cursor names the section the budget stopped inside, not the one after
+it.** `sweepSection` returns false when it ran out part-way through a section's pages, and
+`sweepPass` writes that section's own id. Recording the *next* one — which is what a cursor
+written only at the top of the loop does — leaves the interrupted section half reconciled,
+and nothing returns to it until the cursor reaches the end of the list and resets, several
+runs later. It is the section that most needed the visit, because the budget ran out inside
+it. A failed enumeration returns true instead: it reconciled nothing, it is logged, and the
+sweep carries on past it exactly as before.
+
+**A section whose page listing failed holds `sectionsScannedThrough` where it is, and that
+is `sectionListingFailed` rather than `done`.** The two are separate because `done: false`
+is what makes `runMode` report `budget-exhausted`, and a 429 on one listing is not that —
+reporting it as that sends the scheduler to retry immediately and spend the next hour's
+Graph budget inside this one. What they share is the consequence: the run did not scan
+every candidate, and the cutoff only moves forward, so advancing past the missed section
+leaves it one `SECTION_SCAN_OVERLAP_MS` window to be retried in and then drops it from the
+candidate set for good — watermark stuck behind its real edits until the nightly full
+sweep. Holding the cutoff costs the next run a re-list of the sections inside the window.
 
 **There are two overlap windows and they are different widths on purpose.**
 `WATERMARK_OVERLAP_MS` (an hour) is how far back a *section's page listing* reaches beyond

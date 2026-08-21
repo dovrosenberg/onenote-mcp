@@ -468,6 +468,15 @@ interface Tally {
   sectionsSkippedInactive: number;
   treeRead: boolean;
   done: boolean;
+  /**
+   * Did any candidate section's page listing fail?
+   *
+   * Separate from `done` because the two say different things in the report: `done` false
+   * is what makes `runMode` answer `budget-exhausted`, and a 429 on one listing is not
+   * that. What they share is the consequence — this run did not scan every candidate, so
+   * `sectionsScannedThrough` must not advance past the section it missed.
+   */
+  sectionListingFailed: boolean;
 }
 
 /**
@@ -501,6 +510,7 @@ async function runMode(
     sectionsSkippedInactive: 0,
     treeRead: false,
     done: true,
+    sectionListingFailed: false,
   };
 
   // Outside the try: a held lease must not be followed by a release that clears the
@@ -599,8 +609,9 @@ async function incrementalPass(ctx: PassContext): Promise<void> {
 
   // Only when every candidate completed. `sectionsScannedThrough` is what tier 1 compares
   // against, so advancing it after a partial run would make the next run skip the
-  // sections this one never reached.
-  if (ctx.tally.done && ctx.tally.treeRead) {
+  // sections this one never reached — whether the run stopped early (`done`) or carried
+  // on past a section whose listing failed (`sectionListingFailed`).
+  if (ctx.tally.done && ctx.tally.treeRead && !ctx.tally.sectionListingFailed) {
     await ctx.deps.store.patchSyncState({
       sectionsScannedThrough: ctx.startedAtIso,
       // Cleared on exactly the condition that advances the cutoff, and for the same
@@ -932,6 +943,13 @@ async function syncSection(ctx: PassContext, section: MirrorSection): Promise<vo
   } catch (err) {
     logEvent('sync-section-failed', { sectionId: section.id, reason: reasonOf(err) });
     ctx.tally.pagesFailed += 1;
+    // Recorded, because otherwise the section-scan cutoff advances past a section this
+    // run never listed. Tier 1 of `pickCandidates` then has `SECTION_SCAN_OVERLAP_MS` to
+    // catch it, and a section whose Graph timestamp is older than that window drops out
+    // of the candidate set for good — its watermark stuck behind its real edits until the
+    // nightly full sweep. Holding the cutoff costs the next run a re-list of the sections
+    // inside the window, which is the price of one transient 429.
+    ctx.tally.sectionListingFailed = true;
     return;
   }
 
@@ -1336,12 +1354,27 @@ async function sweepPass(
 
   for (let index = start; index < sections.length; index += 1) {
     const section = sections[index] as MirrorSection;
+
+    // Nothing started here, so the cursor names this section and the next run begins with
+    // it.
     if (ctx.budget.exhausted) {
       ctx.tally.done = false;
       await ctx.deps.store.patchSyncState({ sweepCursorSectionId: section.id });
       return;
     }
-    await sweepSection(ctx, section);
+
+    // Started and cut short part-way through its pages, so the cursor has to name *this*
+    // section too. Writing the next one — which is what recording the cursor only at the
+    // top of the loop did — leaves the interrupted section half reconciled, and nothing
+    // returns to it until the cursor reaches the end of the list and resets, several runs
+    // later. It is the section that most needed the visit: the budget ran out inside it
+    // because it had the most to do. The first `/sync/sweep/full` after a deploy is when
+    // that is likeliest, because every page `resyncPage` ever wrote carries a local
+    // `…000Z` stamp that disagrees with Graph's spelling and so costs a content fetch.
+    if (!(await sweepSection(ctx, section))) {
+      await ctx.deps.store.patchSyncState({ sweepCursorSectionId: section.id });
+      return;
+    }
   }
 
   await ctx.deps.store.patchSyncState({ sweepCursorSectionId: null });
@@ -1381,8 +1414,13 @@ async function learnNestedGroups(ctx: PassContext): Promise<void> {
  * **A failed enumeration deletes nothing and fetches nothing.** An auth failure or a 500
  * would otherwise empty the mirror one section at a time, and nothing about a deleted
  * page is recoverable from here. That is the single most important line in this file.
+ *
+ * Returns false only when the budget cut the section short part-way through its pages,
+ * which is what `sweepPass` needs to write a resume cursor that names this section rather
+ * than the next one. A failed enumeration returns true: it is logged, it reconciled
+ * nothing, and the sweep carries on to the sections after it exactly as before.
  */
-async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<void> {
+async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<boolean> {
   ctx.budget.take();
 
   let live: PageSummary[];
@@ -1391,7 +1429,7 @@ async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<v
   } catch (err) {
     logEvent('sync-section-failed', { sectionId: section.id, reason: reasonOf(err) });
     ctx.tally.pagesFailed += 1;
-    return;
+    return true;
   }
 
   ctx.tally.sectionsVisited += 1;
@@ -1410,7 +1448,7 @@ async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<v
     // pass.
     if (ctx.budget.exhausted) {
       ctx.tally.done = false;
-      return;
+      return false;
     }
 
     const match = liveById.get(stored.id);
@@ -1461,7 +1499,7 @@ async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<v
   for (const page of liveById.values()) {
     if (ctx.budget.exhausted) {
       ctx.tally.done = false;
-      return;
+      return false;
     }
     await syncPage(ctx, section, page);
   }
@@ -1470,6 +1508,7 @@ async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<v
     pageCount: live.length,
     lastSweptAt: ctx.startedAtIso,
   });
+  return true;
 }
 
 /** A reason string for a log line. Never a message, which can carry a request body. */
