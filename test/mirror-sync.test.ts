@@ -2050,6 +2050,70 @@ test('a scoped and a full sweep skip inactive sections; sweep-all visits them', 
   assert.equal(report.sectionsSkippedInactive, 0);
 });
 
+test('no sweep backfills a never-synced section in a frozen notebook', async () => {
+  // `sweepPass` passes `includeBackfill: false` to `splitByActivity`, and that argument is
+  // the whole of the active-notebook saving on the sweep side. Flipping it to true is
+  // invisible to every other test here, because they all use a section that is already
+  // filled — and a section with `pagesSyncedThrough === null` is eligible whatever its
+  // notebook's activity says, so it is the only shape that can show the difference.
+  //
+  // Flipped, every scoped sweep and every nightly `/sync/sweep/full` would backfill the
+  // frozen notebooks in full: a section's worth of page enumerations and content fetches
+  // per frozen section, against 400 requests an hour, which is the work freezing a notebook
+  // exists to prevent.
+  const init = {
+    selection: sel([NB, NB2], [NB]),
+    sections: [otherSection({ pagesSyncedThrough: null })],
+    state: { ...initialSyncState(), sectionsScannedThrough: '2020-01-01T00:00:00.000Z' },
+  };
+  const script = { tree: TREE, summaries: { 'sec-other': [] } };
+
+  const scoped = harness(script, structuredClone(init));
+  await runSweep(scoped.deps, BUDGET);
+  assert.deepEqual(scoped.graphCalls.pageSummaries, [], 'a scoped sweep leaves it frozen');
+
+  const full = harness(script, structuredClone(init));
+  const fullReport = await runFullSweep(full.deps, BUDGET);
+  assert.deepEqual(full.graphCalls.pageSummaries, [], 'and so does the nightly backstop');
+  assert.equal(fullReport.sectionsSkippedInactive, 1);
+
+  // The incremental pass is what fills it, exactly once — `splitByActivity`'s
+  // `includeBackfill` is true there and false here, and that asymmetry is the feature.
+  const incremental = harness(
+    { tree: TREE, changed: { 'sec-other': [] } },
+    structuredClone(init),
+  );
+  await runIncremental(incremental.deps, BUDGET);
+  assert.deepEqual(incremental.graphCalls.changedSince, ['sec-other']);
+});
+
+test('a stale tree makes every section a sweep candidate, whatever its stored timestamp', async () => {
+  // The sweep's own copy of the rule the incremental pass has at
+  // "a stale tree makes every section a candidate". `mayFilterByTimestamp` is
+  // `ctx.tally.treeRead` on both call sites and must be: with the tree read failed,
+  // `liveMtimes` is empty, so the filter would compare stored timestamps that only move
+  // when a structure rewrite happens. A section really edited an hour ago would be declined
+  // by a value frozen months earlier, and the sweep is what notices a page deleted or
+  // renamed in the OneNote client.
+  const h = harness(
+    {
+      tree: () => {
+        throw graphError(500);
+      },
+      summaries: { ancient: [] },
+    },
+    {
+      state: { ...initialSyncState(), sectionsScannedThrough: '2026-08-19T11:59:00.000Z' },
+      sections: [section({ id: 'ancient', graphLastModifiedDateTime: '2020-01-01T00:00:00Z' })],
+    },
+  );
+
+  const report = await runSweep(h.deps, BUDGET);
+
+  assert.equal(report.treeRead, false);
+  assert.deepEqual(h.graphCalls.pageSummaries, ['ancient']);
+});
+
 /**
  * Two mirrored notebooks, one section each, both last touched in 2020.
  *
