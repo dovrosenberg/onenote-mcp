@@ -10,14 +10,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  CLOCK_SKEW_LOG_INTERVAL_MS,
+  CLOCK_SKEW_LOG_THRESHOLD_MS,
   MAX_CONCURRENT,
   MAX_RETRY_WAIT_MS,
   MIN_INTERVAL_MS,
   UNGATED,
   createGate,
   parseRetryAfter,
+  recordClockSkew,
+  resetClockSkewThrottle,
   retryWait,
 } from '../src/graph-throttle.ts';
+import { setEventSink } from '../src/logging.ts';
 
 /** A clock that only moves when something sleeps. */
 function fakeClock(): {
@@ -314,4 +319,97 @@ test('UNGATED runs immediately and the production defaults match the documented 
   // 5 concurrent and 120 a minute are the documented limits; these stay under both.
   assert.ok(MAX_CONCURRENT < 5);
   assert.ok(MIN_INTERVAL_MS >= 500);
+});
+
+// ---------------------------------------------------------------------------
+// recordClockSkew
+// ---------------------------------------------------------------------------
+
+/** Collect the event lines one block writes, and put the sink back afterwards. */
+async function events(body: () => void | Promise<void>): Promise<Record<string, unknown>[]> {
+  const lines: string[] = [];
+  setEventSink((line) => lines.push(line));
+  try {
+    await body();
+  } finally {
+    setEventSink(() => {});
+  }
+  return lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+const at = (iso: string): Headers => new Headers({ date: new Date(iso).toUTCString() });
+const clockAt = (iso: string) => () => Date.parse(iso);
+
+test('recordClockSkew reads the Date header and logs only a large gap', async () => {
+  const logged = await events(() => {
+    resetClockSkewThrottle();
+
+    // HTTP dates carry whole seconds, so anything under a second is not measurable here.
+    assert.equal(recordClockSkew(at('2026-08-19T12:00:00Z'), clockAt('2026-08-19T12:00:02Z')), 2000);
+
+    assert.equal(
+      recordClockSkew(at('2026-08-19T12:00:00Z'), clockAt('2026-08-19T12:00:30Z')),
+      30_000,
+    );
+
+    assert.equal(recordClockSkew(new Headers(), clockAt('2026-08-19T13:00:00Z')), null);
+    assert.equal(
+      recordClockSkew(new Headers({ date: 'not a date' }), clockAt('2026-08-19T13:00:00Z')),
+      null,
+    );
+  });
+
+  assert.deepEqual(logged, [{ event: 'graph-clock-skew', skewMs: 30_000 }]);
+});
+
+test('recordClockSkew reports the sign, so a clock behind Graph is not read as ahead', async () => {
+  const logged = await events(() => {
+    resetClockSkewThrottle();
+    assert.equal(
+      recordClockSkew(at('2026-08-19T12:00:30Z'), clockAt('2026-08-19T12:00:00Z')),
+      -30_000,
+    );
+  });
+
+  assert.deepEqual(logged, [{ event: 'graph-clock-skew', skewMs: -30_000 }]);
+});
+
+test('a persistently skewed clock logs once per interval, not once per response', async () => {
+  const logged = await events(() => {
+    resetClockSkewThrottle();
+
+    // Every response carries a `Date`, and this service makes hundreds of requests an
+    // hour. Without the interval a clock that is simply wrong writes an event per
+    // response and buries graph-auth-failure and token-cache-write-refused.
+    const skewed = (iso: string): void => {
+      recordClockSkew(at('2026-08-19T12:00:00Z'), clockAt(iso));
+    };
+
+    skewed('2026-08-19T12:00:30Z');
+    skewed('2026-08-19T12:00:31Z');
+    skewed('2026-08-19T12:05:00Z');
+    // Past the interval, so the skew is reported again.
+    skewed('2026-08-19T12:30:00Z');
+  });
+
+  assert.equal(logged.length, 2);
+  assert.ok(CLOCK_SKEW_LOG_INTERVAL_MS > 60_000, 'an interval under a minute is not a limit');
+});
+
+test('the skew threshold is above what an HTTP Date header can resolve', () => {
+  // A `Date` header is whole seconds and the value is read after a round trip, so a
+  // threshold at or below a second would fire on rounding rather than on skew.
+  assert.ok(CLOCK_SKEW_LOG_THRESHOLD_MS > 1000);
+});
+
+test('the skew event carries a number and nothing else', async () => {
+  const logged = await events(() => {
+    resetClockSkewThrottle();
+    recordClockSkew(at('2026-08-19T12:00:00Z'), clockAt('2026-08-19T12:01:00Z'));
+  });
+
+  assert.equal(logged.length, 1);
+  const line = logged[0] as Record<string, unknown>;
+  assert.deepEqual(Object.keys(line).sort(), ['event', 'skewMs']);
+  assert.equal(typeof line['skewMs'], 'number');
 });

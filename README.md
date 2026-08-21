@@ -653,6 +653,11 @@ on this account — and the inline refresh's 12-request budget would take weeks 
 Delete the job once `sync/state.backfillComplete` is true, which is when every mirrored
 section has a non-null `pagesSyncedThrough`. Nothing else calls `POST /sync`.
 
+**The first structure write after upgrading rewrites every document once.** Structure
+documents carry an `identity` string that says what the tree said about them, and a
+document written before that field existed has none — so it does not match and is written.
+It is one pass of Firestore writes and no Graph requests, and it happens once.
+
 **An inactive notebook is backfilled once and then frozen.** `activeNotebookIds` in the
 selection document is what draws that line — see **Choosing what to mirror**. A selected
 notebook that is not active is filled by the backfill and served from the mirror for ever
@@ -683,11 +688,25 @@ notebooks and 202 sections are mirrored, and 2 notebooks and 70 sections are act
 | Run | Requests |
 |---|---|
 | Inline refresh, nothing changed | 1 — the expanded tree, and nothing else |
-| Inline refresh, a few edited pages | 3–12; 12 is a hard budget |
+| Inline refresh, a few edited pages | 2–12; a fetch only for a page that really changed, and 12 is a hard budget |
 | Nightly `/sync/sweep/full` over the active notebooks | ~70 here, plus one per changed page |
 | `/sync/sweep` over sections whose timestamp moved | one per section visited |
 | `/sync/sweep/all` over every mirrored notebook | ~202 here — half the hourly budget |
 | One backfill run | 49–120 measured; it stops on whichever budget binds first |
+
+**A page that has not changed costs no request.** The changed-page listing carries every
+page's stamp and title, and a stored copy that matches both is not fetched again. So a
+run's cost tracks the pages that really changed rather than the pages edited in the last
+hour, and `pagesSkipped` in the run report is how many it declined that way.
+
+**The two overlap windows are different widths, and that is deliberate.**
+`WATERMARK_OVERLAP_MS` is an hour and decides which pages a section's listing returns;
+nothing it surfaces costs a request, so it keeps the margin. `SECTION_SCAN_OVERLAP_MS` is
+fifteen minutes and decides how long a section that was edited once keeps being visited,
+at one listing request per run — an hour of that was the last term worth cutting. Both are
+margins against Graph's propagation lag and the gap between its clock and this service's;
+the two log queries under **Proving it works** are what say whether fifteen minutes is
+right.
 
 `MIRROR_SYNC_REQUEST_BUDGET` (default 120) is a hard stop. A run that reaches it commits
 what it did, answers 200 with `"done": false`, and resumes on the next schedule. That is
@@ -703,13 +722,14 @@ the clock, on sections whose pages were cheaper to render.
 | Cadence | Requests/hour at budget 120 | |
 |---|---|---|
 | `*/20` | up to 360 | the fastest cadence that cannot exceed the limit |
+| `*/15` | up to 480 | under it while runs stay clock-bound, over it when they are not |
 | `*/10` | up to 720 | over the limit whenever runs are request-bound |
-| `*/5` | up to 1440 | **over the limit** — what is running today, by explicit choice |
+| `*/5` | up to 1440 | measured against this account on 2026-08-20: 429s within 45 minutes |
 
 Past 400 an hour Graph answers 429 with OData code `10007`. A refused request does no work
 and still spends the attempt, the section's watermark does not advance, and the penalty
 outlasts a short backoff — five retries spanning three minutes were all refused after one
-burst, recorded in the `Graph request budget` section of `CLAUDE.md`. Exceeding the limit
+burst, recorded in `docs/graph.md`. Exceeding the limit
 therefore does not finish the backfill sooner. Halving `MIRROR_SYNC_REQUEST_BUDGET` buys a
 halved interval at the same hourly spend, at the cost of one extra tree read per run.
 
@@ -761,8 +781,10 @@ gcloud scheduler jobs delete onenote-mcp-sync \
   --project="$GCP_PROJECT" --location="$GCP_REGION"
 ```
 
-The backfill job on the deployed account is at `*/5` rather than the `*/20` above, which
-puts it over the hourly limit deliberately — see **What it costs** for what that trades.
+The backfill job on the deployed account is at `*/15`. That is under the limit while runs
+stay clock-bound — measured at 61–81 requests per run on 2026-08-20 — and over it if they
+start spending the full 120-request budget again. `*/20` is the cadence that cannot exceed
+it either way; dropping `MIRROR_SYNC_REQUEST_BUDGET` to 100 makes `*/15` safe as well.
 
 Retries are safe on both: every mode is idempotent, and a retry after a budget-exhausted
 run is actively useful during the backfill. While both jobs exist, the run lease makes an
@@ -795,9 +817,11 @@ changes is that no incremental pass and no sweep re-checks it once its backfill 
 an edit made in the OneNote client to an inactive notebook does not reach the mirror until
 the notebook is made active again or `/sync/sweep/all` is run by hand.
 
-Moving a notebook back into `activeNotebookIds` is safe: the next run notices the active set
-changed, clears `sectionsScannedThrough`, and re-lists every active section against its own
-per-section watermark. Only pages that genuinely changed are fetched.
+Moving a notebook back into `activeNotebookIds` is safe, and it costs only that notebook:
+the next run diffs the stored lists, finds the one id that became active, and re-lists that
+notebook's sections against their own per-section watermarks. Every other notebook keeps its
+watermark and is not listed. Only pages that genuinely changed are fetched. Adding a notebook
+to `notebookIds` behaves the same way.
 
 An id in `notebookIds` matching no notebook is reported as `unknownNotebookIds` in every run
 report. An id in `activeNotebookIds` naming no *mirrored* notebook — a typo, or a real
@@ -827,6 +851,31 @@ A 200 is not proof on its own. The three things that are:
 - **`sectionsSkippedInactive` is the number you expect.** A count covering every mirrored
   section means the active set is empty or mistyped; `unknownActiveNotebookIds` in the same
   report says which.
+
+Two log-based numbers say whether the overlap windows are the right width. Neither is
+urgent; read them after the service has been running for a week.
+
+```bash
+# How far back the page-listing overlap actually reached to catch a page that had really
+# changed. The largest ageMs over a day is the narrowest WATERMARK_OVERLAP_MS that would
+# still have caught every one of them; approaching 3600000 means that hour is too narrow.
+# Tens of minutes is ordinary. Nothing logged at all means the overlap has never caught
+# anything.
+#
+# It says nothing about SECTION_SCAN_OVERLAP_MS. A section that window declines is never
+# listed, so it produces no line here at all -- that failure is silence, not a large
+# number, and nothing observes it. The nightly /sync/sweep/full is the backstop for it.
+gcloud logging read \
+  'resource.type="cloud_run_revision" AND jsonPayload.event="sync-overlap-save"' \
+  --project="$GCP_PROJECT" --limit=50 --freshness=1d --format='value(jsonPayload.ageMs)'
+
+# How far this service's clock is from Graph's, in milliseconds, signed. Both overlap
+# windows and the settle guard are sized against this being seconds rather than minutes.
+# Nothing logged means it stayed under the threshold, which is the expected reading.
+gcloud logging read \
+  'resource.type="cloud_run_revision" AND jsonPayload.event="graph-clock-skew"' \
+  --project="$GCP_PROJECT" --limit=50 --freshness=1d --format='value(jsonPayload.skewMs)'
+```
 
 Watch the backfill by re-running the job and reading `done` in successive reports: `false`
 with a rising `pagesUpdated`, then `true`. `sync/state.backfillComplete` says the same

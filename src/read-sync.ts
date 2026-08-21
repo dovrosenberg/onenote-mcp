@@ -9,10 +9,15 @@
 //
 // **It is the incremental sync, not a sweep.** `runIncremental` costs one Graph request
 // when nothing has changed — the expanded tree — plus one per changed section and one per
-// changed page. A sweep enumerates page ids section by section and a full sweep visits
-// every selected section regardless of timestamps; either would take tens of seconds and
-// tens of requests on a tool call a human is waiting on. Deletions are still the sweep's
-// job, on the scheduler, which is unchanged.
+// changed page. A sweep enumerates every page of a section, section by section, and a
+// full sweep visits every selected section regardless of timestamps; either would take
+// tens of seconds and tens of requests on a tool call a human is waiting on. What stays
+// the sweep's job, on the scheduler, is reconciling a section's stored pages against its
+// live listing: deleting pages Graph no longer returns, discovering pages moved in under a
+// stamp no watermark reaches, and re-fetching a page whose stored stamp or title disagrees
+// with the listing. Nothing there marks a page — a mark deletes the page-content document
+// and nothing re-fetches a marked page, so the sweep's answer to a disagreement is always
+// a re-fetch.
 //
 // **Everything here is bounded twice, and the second bound is the one that matters.**
 // The per-run budget caps what one refresh may spend. The interval caps how often a
@@ -98,8 +103,20 @@ export interface ReadSync {
  * - `treeRead`, because a failed expanded-tree read is *not* fatal to a sync — it carries
  *   on against the structure already in Firestore — and a notebook or section created
  *   since the last successful tree read is absent from that structure.
- * - `pagesFailed` zero, because a page whose content fetch failed keeps whatever copy the
- *   mirror already held.
+ * - `pagesFailed` zero. It counts four causes across five increment sites in
+ *   ./mirror-sync.ts, and each leaves part of the mirror where it was or mis-describes it:
+ *   a page whose content fetch failed keeps whatever copy was stored; a section whose page
+ *   enumeration failed is reconciled not at all, which is counted from the incremental
+ *   pass and from the sweep separately; a page whose Firestore write threw kept its old
+ *   document, and that now includes the short-circuit's `putPageMetadata`, so a transient
+ *   Firestore error on a page whose content was confirmed *identical* labels every read
+ *   `source: "mirror"` for `INLINE_SYNC_RETRY_INTERVAL_MS`; and a page whose ink render
+ *   failed, which is the one cause where the page itself is fine — its text is stored and
+ *   only the handwriting is missing, and the label degrades anyway.
+ *
+ *   The last two are pessimistic on purpose. Neither is worth a separate freshness value:
+ *   the tools do the same thing with every `behind`, and a run reporting one of them has
+ *   demonstrated that something in the write path is failing.
  *
  * Exported so the rule is asserted directly rather than through a fake sync.
  */

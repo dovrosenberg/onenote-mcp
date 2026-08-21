@@ -393,8 +393,12 @@ export function createStructureTools(
           returned: matches.length,
           pagesScanned: found.pagesScanned,
           scanTruncated: found.scanTruncated,
-          notebooksSearched: found.notebooksSearched,
-          notebooksInAccount: found.notebooksInAccount,
+          ...(found.accountCoverage === null
+            ? {}
+            : {
+                notebooksSearched: found.accountCoverage.searched,
+                notebooksInAccount: found.accountCoverage.inAccount,
+              }),
           inactiveNotebooks: found.inactiveNotebooks,
           note: mirrorSearchNote(found, matches.length),
         });
@@ -613,10 +617,16 @@ function jsonResult(payload: unknown): CallToolResult {
 function mirrorSearchNote(found: MirroredSearch, returned: number): string {
   const parts: string[] = [];
 
-  if (found.notebooksSearched < found.notebooksInAccount) {
-    const unsearched = found.notebooksInAccount - found.notebooksSearched;
+  const coverage = found.accountCoverage;
+  if (coverage === null) {
+    // The account clause is not merely redundant on a scoped search, it is wrong twice
+    // over: the caller restricted the search itself, and its advice is to pass the
+    // sectionId they already passed.
+    parts.push('The section you named was searched in full.');
+  } else if (coverage.searched < coverage.inAccount) {
+    const unsearched = coverage.inAccount - coverage.searched;
     parts.push(
-      `Only ${found.notebooksSearched} of ${found.notebooksInAccount} notebooks have their ` +
+      `Only ${coverage.searched} of ${coverage.inAccount} notebooks have their ` +
         `pages held locally, so pages in the other ${unsearched} were not searched. Give ` +
         'sectionId to search one of them directly in OneNote.',
     );

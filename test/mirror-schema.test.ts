@@ -20,8 +20,10 @@ import {
   LEASE_EXPIRY_MS,
   MirrorSchemaError,
   SCHEMA_VERSION,
+  SECTION_SCAN_OVERLAP_MS,
   WATERMARK_OVERLAP_MS,
   encodeMirrorId,
+  groupIdentity,
   htmlObjectName,
   htmlPlacement,
   initialSyncState,
@@ -30,11 +32,23 @@ import {
   leaseIsHeld,
   listingIsHeld,
   LISTING_HOLD_EXPIRY_MS,
+  notebookIdentity,
   overlapFrom,
+  overlapSaveAgeMs,
+  pageListingDiffers,
+  pageStampDiffers,
+  planStructureWrite,
+  storedPageIsCurrent,
+  TIMESTAMP_SETTLE_MS,
   isActive,
+  notebooksNeedingWideScan,
   readSelection,
   readSyncState,
+  sectionIdentity,
+  selectionMatchesSeen,
   utf8Bytes,
+  type MirrorPage,
+  type PageStamp,
 } from '../src/mirror-schema.ts';
 
 // A real OneNote page id, shape-wise: two GUID-ish halves joined by an exclamation mark.
@@ -223,6 +237,53 @@ test('the overlap is an hour, and it is subtracted rather than added', () => {
   );
 });
 
+test('the section scan window is fifteen minutes, and narrower than the page listing', () => {
+  // Two constants because the two windows cost different things: a page the listing
+  // surfaces unchanged costs no request, and a section the scan surfaces costs one
+  // `listPagesChangedSince` every run. Collapsing them back into one is the mistake this
+  // asserts against, from both directions — the value, and the relation between them.
+  assert.equal(SECTION_SCAN_OVERLAP_MS, 900_000);
+  assert.ok(
+    SECTION_SCAN_OVERLAP_MS < WATERMARK_OVERLAP_MS,
+    'the scan window must stay the narrower of the two',
+  );
+
+  // `overlapFrom`'s default is the page-listing window, so a caller that passes nothing
+  // gets the hour. That is what makes the scan the side that has to name its constant.
+  assert.equal(
+    overlapFrom('2026-08-19T12:00:00.000Z'),
+    overlapFrom('2026-08-19T12:00:00.000Z', WATERMARK_OVERLAP_MS),
+  );
+  assert.equal(overlapFrom('2026-08-19T12:00:00.000Z', SECTION_SCAN_OVERLAP_MS), '2026-08-19T11:45:00.000Z');
+});
+
+test('an overlap save is a page whose stamp predates the watermark', () => {
+  // The whole reason the window exists: this page is in the listing only because
+  // `overlapFrom` reached back past the watermark, and the age is how far back.
+  assert.equal(
+    overlapSaveAgeMs('2026-08-19T10:00:00.000Z', '2026-08-19T09:30:00.000Z'),
+    1_800_000,
+  );
+
+  // A page at or after the watermark would have been listed by a window of any width, so
+  // it is not something the overlap saved. The boundary is closed on the watermark: a
+  // stamp equal to it is inside the range a zero-width window asks for.
+  assert.equal(overlapSaveAgeMs('2026-08-19T10:00:00.000Z', '2026-08-19T10:00:00.000Z'), null);
+  assert.equal(overlapSaveAgeMs('2026-08-19T10:00:00.000Z', '2026-08-19T10:30:00.000Z'), null);
+});
+
+test('an absent or unreadable stamp is not an overlap save', () => {
+  // A never-synced section asked for everything from the epoch, so no page in its
+  // listing was rescued by the overlap and the age would be meaningless.
+  assert.equal(overlapSaveAgeMs(null, '2026-08-19T09:30:00.000Z'), null);
+
+  // Either side unparseable yields no number rather than a NaN in a log line. This is a
+  // measurement, and a measurement that cannot be taken is absent rather than guessed.
+  assert.equal(overlapSaveAgeMs('not a date', '2026-08-19T09:30:00.000Z'), null);
+  assert.equal(overlapSaveAgeMs('2026-08-19T10:00:00.000Z', 'not a date'), null);
+  assert.equal(overlapSaveAgeMs('', ''), null);
+});
+
 // ---------------------------------------------------------------------------
 // Page HTML placement
 // ---------------------------------------------------------------------------
@@ -312,11 +373,154 @@ test('a well-formed sync-state document reads back verbatim', () => {
     runningMode: 'sweep',
     runningSince: '2026-08-19T12:05:00Z',
     unknownNotebookIds: 1,
-    activeSelectionHash: 'def456',
+    mirroredNotebookIdsSeen: ['nb-1', 'nb-2'],
+    activeNotebookIdsSeen: ['nb-1'],
+    wideScanNotebookIds: ['nb-2'],
     unknownActiveNotebookIds: 2,
   };
 
   assert.deepEqual(readSyncState(stored), stored);
+});
+
+test('notebooksNeedingWideScan names only what became mirrored or active', () => {
+  const mirroredIds = ['a', 'b', 'c'];
+
+  // Adding one notebook to the selection widens that one.
+  assert.deepEqual(
+    notebooksNeedingWideScan(
+      { mirrored: ['a', 'b'], active: ['a', 'b'] },
+      { notebookIds: ['a', 'b', 'c'], activeNotebookIds: ['a', 'b'] },
+      mirroredIds,
+    ),
+    ['c'],
+  );
+
+  // Activating one widens that one.
+  assert.deepEqual(
+    notebooksNeedingWideScan(
+      { mirrored: ['a', 'b'], active: ['a'] },
+      { notebookIds: ['a', 'b'], activeNotebookIds: ['a', 'b'] },
+      ['a', 'b'],
+    ),
+    ['b'],
+  );
+
+  // Removing widens nothing: nothing has to be caught up on.
+  assert.deepEqual(
+    notebooksNeedingWideScan(
+      { mirrored: ['a', 'b'], active: ['a', 'b'] },
+      { notebookIds: ['a'], activeNotebookIds: ['a'] },
+      ['a'],
+    ),
+    [],
+  );
+
+  // `null` means every mirrored notebook is active, so a list becoming null activates
+  // everything that was not already in the list.
+  assert.deepEqual(
+    notebooksNeedingWideScan(
+      { mirrored: ['a', 'b', 'c'], active: ['a'] },
+      { notebookIds: ['a', 'b', 'c'], activeNotebookIds: null },
+      mirroredIds,
+    ),
+    ['b', 'c'],
+  );
+
+  // ...and null becoming a subset activates nothing new.
+  assert.deepEqual(
+    notebooksNeedingWideScan(
+      { mirrored: ['a', 'b'], active: null },
+      { notebookIds: ['a', 'b'], activeNotebookIds: ['a'] },
+      ['a', 'b'],
+    ),
+    [],
+  );
+
+  // Never recorded — a state document written before these fields existed. Nothing was
+  // skipped under it, so there is nothing to widen; recording is the whole job.
+  assert.deepEqual(
+    notebooksNeedingWideScan(
+      { mirrored: null, active: null },
+      { notebookIds: ['a', 'b'], activeNotebookIds: null },
+      ['a', 'b'],
+    ),
+    [],
+  );
+});
+
+test('a null active list resolves through the tree, not through the selection', () => {
+  // The third parameter is the notebooks the tree actually returned as mirrored, which is
+  // not `current.notebookIds`: a selected id naming no notebook is in the second list and
+  // not the first. `activeNotebookIds: null` means "every mirrored notebook is active", so
+  // resolving it through the selection would widen for a notebook that does not exist.
+  const previous = { mirrored: ['a', 'b', 'ghost'], active: ['a'] };
+  const current = { notebookIds: ['a', 'b', 'ghost'], activeNotebookIds: null };
+
+  assert.deepEqual(notebooksNeedingWideScan(previous, current, ['a', 'b']), ['b']);
+  // What the selection-resolved answer would have been, for contrast.
+  assert.deepEqual(notebooksNeedingWideScan(previous, current, current.notebookIds), [
+    'b',
+    'ghost',
+  ]);
+});
+
+test('a state document written before the selection fields reads as never recorded', () => {
+  // What is actually deployed: `activeSelectionHash` and none of the fields that replaced
+  // it. `mirroredNotebookIdsSeen` null is what makes the first run after this deploy
+  // record the lists and widen nothing — reading the absent lists as "the selection was
+  // empty" would widen every mirrored notebook on that run instead.
+  const state = readSyncState({
+    schemaVersion: 1,
+    structureHash: 'abc123',
+    sectionsScannedThrough: '2026-08-19T12:00:00Z',
+    activeSelectionHash: 'def456',
+  });
+
+  assert.equal(state.mirroredNotebookIdsSeen, null);
+  assert.equal(state.activeNotebookIdsSeen, null);
+  assert.deepEqual(state.wideScanNotebookIds, []);
+  assert.deepEqual(
+    notebooksNeedingWideScan(
+      { mirrored: state.mirroredNotebookIdsSeen, active: state.activeNotebookIdsSeen },
+      { notebookIds: ['a', 'b'], activeNotebookIds: null },
+      ['a', 'b'],
+    ),
+    [],
+  );
+});
+
+test('selectionMatchesSeen asks a different question from the wide-scan diff', () => {
+  // A removal widens nothing and still has to be recorded, so "nothing to widen" cannot
+  // be the test for "nothing to write".
+  const removed = { mirrored: ['a', 'b'], active: ['a', 'b'] };
+  const now = { notebookIds: ['a', 'b'], activeNotebookIds: ['a'] };
+  assert.deepEqual(notebooksNeedingWideScan(removed, now, ['a', 'b']), []);
+  assert.equal(selectionMatchesSeen(removed, now), false);
+
+  // Order is not a change; nothing was typed that was not already there.
+  assert.equal(
+    selectionMatchesSeen(
+      { mirrored: ['a', 'b'], active: ['b', 'a'] },
+      { notebookIds: ['b', 'a'], activeNotebookIds: ['a', 'b'] },
+    ),
+    true,
+  );
+
+  // `null` and a list naming every mirrored notebook are the same active set today and
+  // different ones the moment a notebook is added, so they are not the same record.
+  assert.equal(
+    selectionMatchesSeen(
+      { mirrored: ['a', 'b'], active: null },
+      { notebookIds: ['a', 'b'], activeNotebookIds: ['a', 'b'] },
+    ),
+    false,
+  );
+
+  // Never recorded is never a match, whatever the selection says.
+  assert.equal(
+    selectionMatchesSeen({ mirrored: null, active: null }, { notebookIds: [], activeNotebookIds: null }),
+    false,
+  );
 });
 
 test('an empty string reads as null, so a cleared field is not a cursor', () => {
@@ -398,5 +602,473 @@ test('a lease with no mode, or an unreadable timestamp, is not held', () => {
   assert.equal(
     leaseIsHeld({ ...initialSyncState(), runningMode: 'sweep', runningSince: 'nonsense' }, now),
     false,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Structure document identities
+// ---------------------------------------------------------------------------
+
+const NOTEBOOK_FIELDS = {
+  id: 'nb-1',
+  displayName: '2026',
+  mirrored: true,
+  sectionCount: 3,
+  sectionGroupCount: 1,
+  graphLastModifiedDateTime: '2026-08-19T11:00:00Z',
+};
+
+const GROUP_FIELDS = {
+  id: 'grp-1',
+  displayName: '062 - February',
+  notebookId: 'nb-1',
+  parentId: 'nb-1',
+  parentKind: 'notebook' as const,
+  path: '2026 / 062 - February',
+  mirrored: true,
+};
+
+test('a section identity covers the tree fields and excludes the timestamp', () => {
+  const base = {
+    id: 'sec-1',
+    displayName: 'Daily',
+    notebookId: 'nb-1',
+    parentId: 'nb-1',
+    parentKind: 'notebook' as const,
+    path: '2026 / Daily',
+    mirrored: true,
+    graphLastModifiedDateTime: '2026-08-19T11:00:00Z',
+  };
+
+  // The timestamp moves whenever anyone edits a page. Including it would rewrite every
+  // section document on every structure change, which is the cost this whole task removes.
+  assert.equal(
+    sectionIdentity(base),
+    sectionIdentity({ ...base, graphLastModifiedDateTime: '2026-08-19T23:59:00Z' }),
+  );
+
+  // Each of these is a real structural change and must produce a different identity.
+  assert.notEqual(sectionIdentity(base), sectionIdentity({ ...base, displayName: 'Weekly' }));
+  assert.notEqual(sectionIdentity(base), sectionIdentity({ ...base, mirrored: false }));
+  assert.notEqual(sectionIdentity(base), sectionIdentity({ ...base, parentId: 'grp-1' }));
+  assert.notEqual(sectionIdentity(base), sectionIdentity({ ...base, path: '2026 / Other' }));
+  assert.notEqual(
+    sectionIdentity(base),
+    sectionIdentity({ ...base, parentKind: 'sectionGroup' as const }),
+  );
+});
+
+test('a section group identity covers the tree fields and not childGroupsKnown', () => {
+  // `childGroupsKnown` is sync-owned: the sweep sets it true after enumerating the nested
+  // groups, and a structure write that carried it would put it back to false and send
+  // every `list_sections` on that group to Graph until the next sweep re-learned them.
+  const base = groupIdentity(GROUP_FIELDS);
+  assert.notEqual(base, groupIdentity({ ...GROUP_FIELDS, displayName: 'March' }));
+  assert.notEqual(base, groupIdentity({ ...GROUP_FIELDS, mirrored: false }));
+  assert.notEqual(base, groupIdentity({ ...GROUP_FIELDS, parentId: 'grp-0' }));
+  assert.notEqual(base, groupIdentity({ ...GROUP_FIELDS, path: '2026 / Other' }));
+
+  // A group carries no timestamp at all, so nothing here can be confused with one.
+  assert.equal(base, groupIdentity({ ...GROUP_FIELDS }));
+});
+
+test('a notebook identity covers the counts and excludes the timestamp', () => {
+  assert.equal(
+    notebookIdentity(NOTEBOOK_FIELDS),
+    notebookIdentity({ ...NOTEBOOK_FIELDS, graphLastModifiedDateTime: '2099-01-01T00:00:00Z' }),
+  );
+
+  assert.notEqual(
+    notebookIdentity(NOTEBOOK_FIELDS),
+    notebookIdentity({ ...NOTEBOOK_FIELDS, displayName: '2027' }),
+  );
+  assert.notEqual(
+    notebookIdentity(NOTEBOOK_FIELDS),
+    notebookIdentity({ ...NOTEBOOK_FIELDS, mirrored: false }),
+  );
+  // The counts are what a `list_notebooks` answer prints, so a section added to a notebook
+  // has to reach the stored document even though nothing else about the notebook moved.
+  assert.notEqual(
+    notebookIdentity(NOTEBOOK_FIELDS),
+    notebookIdentity({ ...NOTEBOOK_FIELDS, sectionCount: 4 }),
+  );
+  assert.notEqual(
+    notebookIdentity(NOTEBOOK_FIELDS),
+    notebookIdentity({ ...NOTEBOOK_FIELDS, sectionGroupCount: 0 }),
+  );
+});
+
+const SEPARATOR_FIELDS = {
+  id: 'sec-1',
+  displayName: 'a b',
+  notebookId: 'c',
+  parentId: 'nb-1',
+  parentKind: 'notebook' as const,
+  path: '2026 / Daily',
+  mirrored: true,
+  graphLastModifiedDateTime: null,
+};
+
+test('a display name holding the separator cannot forge another split of the fields', () => {
+  // The failure a space separator has: `{displayName: 'a b', notebookId: 'c'}` and
+  // `{displayName: 'a', notebookId: 'b c'}` join to the same string, so a rename that
+  // moved a space across a field boundary would be invisible and the document would never
+  // be rewritten. A OneNote display name can hold a space; it cannot hold a NUL.
+  const left = sectionIdentity({ ...SEPARATOR_FIELDS, displayName: 'a b', notebookId: 'c' });
+  const right = sectionIdentity({ ...SEPARATOR_FIELDS, displayName: 'a', notebookId: 'b c' });
+  assert.notEqual(left, right);
+});
+
+// ---------------------------------------------------------------------------
+// planStructureWrite
+//
+// This is `#replaceCollection`'s whole judgement, extracted so a test can reach it:
+// src/mirror-store.ts needs a Firestore backend and has none here, so a branch left in
+// that file is a branch nothing checks. Every test below is a mutation that used to pass.
+// ---------------------------------------------------------------------------
+
+const SECTION_DEFAULTS = { pagesSyncedThrough: null, pageCount: 0 };
+
+function incoming(id: string, identity: string): { id: string; identity: string } {
+  return { id, identity };
+}
+
+test('a document whose stored identity matches is not written at all', () => {
+  // The failure without it: renaming one section moves the tree hash, and every one of the
+  // account's 568 section documents is rewritten with the tree's idea of it.
+  const plan = planStructureWrite(
+    new Map([
+      ['sec-1', 'same'],
+      ['sec-2', 'same'],
+    ]),
+    [incoming('sec-1', 'same'), incoming('sec-2', 'moved')],
+    SECTION_DEFAULTS,
+  );
+
+  assert.deepEqual(plan.writes.map((w) => w.documentId), ['sec-2']);
+  assert.deepEqual(plan.deletes, []);
+});
+
+test('a document that already existed is merged, and carries no creation default', () => {
+  // The defaults are the reset this whole split removes. `pagesSyncedThrough` absent from
+  // the written fields is what makes the stored watermark survive a `set(…, {merge:true})`.
+  const plan = planStructureWrite(
+    new Map([['sec-1', 'old']]),
+    [incoming('sec-1', 'new')],
+    SECTION_DEFAULTS,
+  );
+
+  const write = plan.writes[0];
+  assert.equal(write?.created, false);
+  assert.equal('pagesSyncedThrough' in (write?.fields ?? {}), false);
+  assert.equal('pageCount' in (write?.fields ?? {}), false);
+  assert.deepEqual(write?.fields, { id: 'sec-1', identity: 'new' });
+});
+
+test('a document that was not there is created with the defaults', () => {
+  const plan = planStructureWrite(new Map(), [incoming('sec-1', 'new')], SECTION_DEFAULTS);
+
+  const write = plan.writes[0];
+  assert.equal(write?.created, true);
+  // Not decoration: `listSectionsToSync` orders by this field, and an `orderBy` drops a
+  // document that lacks it — so a section created without it is never synced and nothing
+  // says so.
+  // Strict, because `assert.equal` is `==`: a default of `'0'` for `pageCount`, or of `0`
+  // for a field Firestore then orders on, would pass a loose comparison.
+  assert.strictEqual(write?.fields['pagesSyncedThrough'], null);
+  assert.strictEqual(write?.fields['pageCount'], 0);
+});
+
+test('a stored document with no identity is merged, not created', () => {
+  // What every document looks like on the first run after this field was introduced. It
+  // exists, so it must not take the create branch — that would null every watermark in the
+  // account, which is the failure the identity exists to prevent — and it does not match,
+  // so it is written once.
+  const plan = planStructureWrite(
+    new Map([['sec-1', undefined]]),
+    [incoming('sec-1', 'new')],
+    SECTION_DEFAULTS,
+  );
+
+  assert.equal(plan.writes[0]?.created, false);
+  assert.equal('pagesSyncedThrough' in (plan.writes[0]?.fields ?? {}), false);
+});
+
+test('a document the tree no longer names is deleted, and the skip does not reach it', () => {
+  // Deletion is by absence from the incoming set, which is a fact rather than an
+  // inference: the caller has just read the whole tree in one request.
+  const plan = planStructureWrite(
+    new Map([
+      ['sec-1', 'same'],
+      ['gone', 'whatever'],
+    ]),
+    [incoming('sec-1', 'same')],
+    SECTION_DEFAULTS,
+  );
+
+  assert.deepEqual(plan.writes, []);
+  assert.deepEqual(plan.deletes, ['gone']);
+});
+
+test('a plan keys its writes by the Firestore document id, not the Graph id', () => {
+  // A OneNote id can contain a `/`, which Firestore forbids in a document id. The stored
+  // map is keyed by the encoded form, so the plan has to encode before it compares — a
+  // comparison against the raw id would find nothing stored and create every document.
+  const graphId = '0-abc/def!1-ghi';
+  const documentId = encodeMirrorId(graphId);
+  assert.notEqual(documentId, graphId);
+
+  const plan = planStructureWrite(
+    new Map([[documentId, 'same']]),
+    [incoming(graphId, 'same')],
+    SECTION_DEFAULTS,
+  );
+
+  assert.deepEqual(plan.writes, []);
+  assert.deepEqual(plan.deletes, [], 'and it is not read as a document the tree dropped');
+});
+
+// ---------------------------------------------------------------------------
+// Stamp comparison
+// ---------------------------------------------------------------------------
+
+test('stamps that disagree in either direction disagree, at any size', () => {
+  // Direction carried meaning while the sweep's response was `markPageStale`, which
+  // deletes the content document. `resyncPage` stamps `lastModifiedDateTime` from this
+  // process's clock after a write returns, so a page written through this server is
+  // stored *ahead* of the stamp Graph recorded for the same edit — and a symmetric test
+  // destroyed exactly the most-used pages in the account, permanently, because no read
+  // path writes to the mirror. The response is now a re-fetch, which replaces the local
+  // stamp with Graph's. That is the repair rather than the damage, so both directions
+  // belong here and neither is an error.
+  const stored = { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00Z' };
+  const live = { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00Z' };
+
+  assert.equal(pageStampDiffers(stored, live), false, 'identical stamps agree');
+  assert.equal(
+    pageStampDiffers(stored, { ...live, lastModifiedDateTime: '2026-08-19T12:00:01Z' }),
+    true,
+    'one second later disagrees — no margin, so no real edit is discarded',
+  );
+  assert.equal(
+    pageStampDiffers(stored, { ...live, lastModifiedDateTime: '2026-08-20T12:00:00Z' }),
+    true,
+    'and a day later disagrees',
+  );
+  assert.equal(
+    pageStampDiffers({ ...stored, lastModifiedDateTime: '2026-08-19T12:00:02.481Z' }, live),
+    true,
+    'stored ahead of live is the resyncPage shape, and it disagrees like any other',
+  );
+});
+
+test('the comparison is on the strings, and nothing is parsed', () => {
+  // Two spellings of one instant disagree, and that is the intended answer rather than a
+  // wart. Graph's measured format carries no fractional seconds (`2026-08-19T19:32:39Z`,
+  // api-overview.md) while `Date.prototype.toISOString` always carries three, so a page
+  // `resyncPage` stamped can hold the second spelling. Re-fetching it costs one Graph
+  // request and ends with Graph's own spelling stored, which is what makes the next sweep
+  // agree. A `Date.parse` compare would leave the local spelling in place for ever, and
+  // that string is printed in every tool result.
+  const stored = { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00.000Z' };
+  const live = { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00Z' };
+
+  assert.equal(pageStampDiffers(stored, live), true);
+});
+
+test('an unparseable or empty stamp is a disagreement like any other', () => {
+  // Nothing is parsed, so there is no shape to reject. An empty live stamp is
+  // `toPageSummary`'s fallback for a field Graph did not send; re-fetching on it costs one
+  // request and tells the truth, where treating it as agreement would hide every edit to a
+  // page Graph declines to stamp.
+  const stored = { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00Z' };
+
+  assert.equal(pageStampDiffers(stored, { ...stored, lastModifiedDateTime: '' }), true);
+  assert.equal(pageStampDiffers(stored, { ...stored, lastModifiedDateTime: 'not-a-date' }), true);
+  assert.equal(
+    pageStampDiffers({ ...stored, lastModifiedDateTime: '' }, { ...stored, lastModifiedDateTime: '' }),
+    false,
+    'two empty stamps still agree, so a page Graph never stamps is fetched once and left alone',
+  );
+});
+
+test('a page the old sweep stored unstamped disagrees with every live stamp', () => {
+  // Before 2026-08-21 a page the sweep discovered was written with `title: ''` and
+  // `new Date(0).toISOString()`. Both reach the calling model. There is no separate
+  // predicate for them any more: the epoch disagrees with anything Graph sends, so the
+  // same branch re-fetches them and the repair writes both fields from Graph's listing.
+  const stored = { id: 'p1', title: '', lastModifiedDateTime: '1970-01-01T00:00:00.000Z' };
+
+  assert.equal(
+    pageStampDiffers(stored, { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00Z' }),
+    true,
+  );
+});
+
+test('pageListingDiffers fires on the stamp or the title, and on nothing else', () => {
+  // The rule the sweep and `storedPageIsCurrent` share. It is one function because a
+  // stamp-only comparison is permanently blind to a rename — measured 2026-08-21 — and the
+  // sweep is the one pass that ever looks at a page whose stamp has not moved.
+  const stored: PageStamp = { id: 'p1', title: 'Monday', lastModifiedDateTime: '2026-08-19T12:00:00Z' };
+
+  assert.equal(pageListingDiffers(stored, { ...stored }), false, 'identical is identical');
+  assert.equal(
+    pageListingDiffers(stored, { ...stored, lastModifiedDateTime: '2026-08-19T12:00:01Z' }),
+    true,
+    'an edit moves the stamp',
+  );
+  assert.equal(
+    pageListingDiffers(stored, { ...stored, title: 'Tuesday' }),
+    true,
+    'and a rename moves only the title',
+  );
+  assert.equal(
+    pageListingDiffers(stored, { ...stored, title: 'monday' }),
+    true,
+    'case included: `titleLower` is derived from the stored title, so a case-only rename changes what is stored',
+  );
+  assert.equal(
+    pageListingDiffers(stored, { ...stored, id: 'p2' }),
+    false,
+    'the id is how the two were paired, not part of the comparison',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The content-fetch skip
+// ---------------------------------------------------------------------------
+
+/** A stored page document in the state that makes the skip fire. */
+function currentPage(overrides: Partial<MirrorPage> = {}): MirrorPage {
+  return {
+    id: 'p1',
+    title: 'Page',
+    titleLower: 'page',
+    sectionId: 'sec-1',
+    notebookId: 'nb-1',
+    sectionPath: '2026 / Daily',
+    lastModifiedDateTime: '2026-08-19T12:00:00Z',
+    contentState: 'present',
+    contentHash: 'h',
+    htmlLocation: 'firestore',
+    htmlObject: null,
+    htmlBytes: 10,
+    ink: null,
+    contentSyncedAt: '2026-08-19T12:01:00Z',
+    ...overrides,
+  };
+}
+
+const LIVE: PageStamp = { id: 'p1', title: 'Page', lastModifiedDateTime: '2026-08-19T12:00:00Z' };
+
+test('storedPageIsCurrent needs an identical stamp and a settled copy', () => {
+  const stored = currentPage();
+
+  assert.equal(storedPageIsCurrent(stored, LIVE, 'sec-1'), true);
+
+  // Each of these is a way a careless simplification would answer "current" wrongly.
+  assert.equal(
+    storedPageIsCurrent(stored, { ...LIVE, lastModifiedDateTime: '2026-08-19T12:00:01Z' }, 'sec-1'),
+    false,
+    'one second later is a real edit',
+  );
+  assert.equal(
+    storedPageIsCurrent(stored, { ...LIVE, title: 'Renamed' }, 'sec-1'),
+    false,
+    'a rename changes no content and every listing',
+  );
+  assert.equal(storedPageIsCurrent(stored, LIVE, 'sec-2'), false, 'the page moved section');
+  assert.equal(
+    storedPageIsCurrent(currentPage({ contentState: 'stale' }), LIVE, 'sec-1'),
+    false,
+    'a write marked it stale',
+  );
+  assert.equal(
+    storedPageIsCurrent(currentPage({ contentState: 'missing' }), LIVE, 'sec-1'),
+    false,
+    'and a page whose content was never stored has none to serve',
+  );
+  assert.equal(
+    storedPageIsCurrent(currentPage({ contentSyncedAt: '2026-08-19T12:00:05Z' }), LIVE, 'sec-1'),
+    false,
+    'fetched five seconds after the stamp, so an edit inside that second is possible',
+  );
+  assert.equal(
+    storedPageIsCurrent(currentPage({ contentSyncedAt: undefined }), LIVE, 'sec-1'),
+    false,
+    'a document written before the field existed cannot prove it settled',
+  );
+  assert.equal(
+    storedPageIsCurrent(stored, { ...LIVE, lastModifiedDateTime: '' }, 'sec-1'),
+    false,
+    'an absent live stamp proves nothing',
+  );
+  assert.equal(
+    storedPageIsCurrent(
+      currentPage({ lastModifiedDateTime: '' }),
+      { ...LIVE, lastModifiedDateTime: '' },
+      'sec-1',
+    ),
+    false,
+    'and two absent stamps agree as strings without proving anything either',
+  );
+});
+
+test('the stamp equality is a string comparison, never a window', () => {
+  // The tempting simplification is "within a second or two is the same page", because
+  // api-overview.md records Graph reporting one unchanged page exactly one second apart on
+  // two reads. That would be the wrong repair. A window discards every real edit made
+  // inside it, and the incremental sync then advances the section watermark past that edit,
+  // so the page is never listed again and the mirror serves superseded content for ever.
+  // Disagreeing costs one Graph request and self-corrects. Do not widen this.
+  const stored = currentPage();
+
+  for (const drift of ['2026-08-19T12:00:01Z', '2026-08-19T11:59:59Z', '2026-08-19T12:00:00.000Z']) {
+    assert.equal(
+      storedPageIsCurrent(stored, { ...LIVE, lastModifiedDateTime: drift }, 'sec-1'),
+      false,
+      `${drift} is not the stored string, so the page is fetched`,
+    );
+  }
+});
+
+test('the settle guard is a strict margin measured from Graph\'s stamp', () => {
+  const at = (contentSyncedAt: string): boolean =>
+    storedPageIsCurrent(currentPage({ contentSyncedAt }), LIVE, 'sec-1');
+
+  // The stamp is 12:00:00Z, so the boundary is exactly TIMESTAMP_SETTLE_MS after it.
+  const boundary = new Date(Date.parse(LIVE.lastModifiedDateTime) + TIMESTAMP_SETTLE_MS);
+  assert.equal(at(boundary.toISOString()), false, 'the boundary itself is not settled');
+  assert.equal(at(new Date(boundary.getTime() + 1).toISOString()), true, 'one ms past it is');
+
+  // Fetched *before* Graph stamped the edit: the copy in hand predates it outright.
+  assert.equal(at('2026-08-19T11:59:00Z'), false);
+  assert.equal(at('not-a-date'), false, 'an unparseable stamp proves nothing');
+});
+
+test('the settle guard reads the Firestore timestamp shapes, not just strings', () => {
+  // contentSyncedAt is written with FieldValue.serverTimestamp() and comes back as a
+  // Timestamp object. A guard that only understood strings would answer false for every
+  // page in the real mirror, and the skip would never fire in production while every test
+  // here passed.
+  const settled = Date.parse('2026-08-19T12:01:00Z');
+
+  assert.equal(
+    storedPageIsCurrent(
+      currentPage({ contentSyncedAt: { toDate: () => new Date(settled) } }),
+      LIVE,
+      'sec-1',
+    ),
+    true,
+    'a Firestore Timestamp',
+  );
+  assert.equal(
+    storedPageIsCurrent(
+      currentPage({ contentSyncedAt: { _seconds: settled / 1000, _nanoseconds: 0 } }),
+      LIVE,
+      'sec-1',
+    ),
+    true,
+    'and its serialised form',
   );
 });

@@ -2,7 +2,7 @@
 //
 // Nothing here touches Firestore, Cloud Storage, or the network. That is the point:
 // ./mirror-store.ts and ./mirror-blobs.ts cannot be tested on this machine — there is no
-// Firestore emulator here and CLAUDE.md rules out an in-memory fake, because what is at
+// Firestore emulator here and test/README.md rules out an in-memory fake, because what is at
 // stake in those files is transaction behaviour and FieldValue.serverTimestamp() and a
 // fake would assert the fake. So everything that is a *decision* rather than a call
 // lives here, where it runs in a plain unit test: document ids, the field shapes, the
@@ -125,6 +125,102 @@ export function isActive(selection: NotebookSelection, notebookId: string): bool
 }
 
 /**
+ * The two selection lists a previous run recorded, as `MirrorSyncState` holds them.
+ *
+ * `mirrored` is null only when nothing was ever recorded; `active` is null both for that
+ * and for "every mirrored notebook is active". `notebooksNeedingWideScan` is given the
+ * pair so the caller does not have to decide which null it is looking at.
+ */
+export interface SeenSelection {
+  readonly mirrored: readonly string[] | null;
+  readonly active: readonly string[] | null;
+}
+
+/**
+ * Which notebooks a selection change has to widen the next scan for.
+ *
+ * A notebook that has just been added to `notebookIds`, or has just become active, holds
+ * sections whose `graphLastModifiedDateTime` may be months old. Tier 1 of
+ * `pickCandidates` in ./mirror-sync.ts skips a section older than the cutoff derived from
+ * `sectionsScannedThrough`, and that cutoff advances on every completed run, so nothing
+ * else would ever make those sections candidates again.
+ *
+ * Removal widens nothing. A notebook dropped from either list is one this run does less
+ * work for, and there is no backlog to catch up on.
+ *
+ * Only *candidacy* is widened. Each named notebook's sections still list against their own
+ * `pagesSyncedThrough`, which nothing here touches, so a widened section costs one
+ * `listPagesChangedSince` and re-fetches only the pages that actually changed.
+ *
+ * `previous.mirrored === null` means no run has ever recorded these lists — a state
+ * document written before the fields existed. Nothing was skipped for inactivity under it
+ * that a recorded list would have caught, so the answer is empty and the caller's job is
+ * to record.
+ *
+ * The active set of a `null` list is every mirrored notebook, so a list becoming null
+ * names everything that was not already in it. The result is deduped and sorted, because
+ * it is stored and compared and the order a diff produced it in is not information.
+ */
+export function notebooksNeedingWideScan(
+  previous: SeenSelection,
+  current: NotebookSelection,
+  mirroredNotebookIds: readonly string[],
+): string[] {
+  if (previous.mirrored === null) return [];
+
+  const wasMirrored = new Set(previous.mirrored);
+  const newlyMirrored = current.notebookIds.filter((id) => !wasMirrored.has(id));
+
+  const wasActive = new Set(previous.active ?? previous.mirrored);
+  const nowActive = current.activeNotebookIds ?? mirroredNotebookIds;
+  const newlyActive = nowActive.filter((id) => !wasActive.has(id));
+
+  return [...new Set([...newlyMirrored, ...newlyActive])].sort();
+}
+
+/**
+ * Do the recorded lists already say what the selection document says?
+ *
+ * `notebooksNeedingWideScan` answering `[]` is not the same question, and using it as one
+ * loses a re-activation. Deactivating a notebook widens nothing, so a run that only wrote
+ * when it had something to widen would leave `activeNotebookIdsSeen` naming the notebook
+ * that was just frozen — and re-activating it later would then diff against a list it is
+ * already in and widen nothing, which is the case the widening exists for.
+ *
+ * Order is not a change: `readSelection` preserves the order an operator typed, and
+ * retyping the same ids in another order means nothing here. A `null` active list is
+ * compared as a value rather than as a set, because `null` and a list naming every
+ * mirrored notebook are the same active set today and different ones the moment a
+ * notebook is added.
+ */
+export function selectionMatchesSeen(
+  previous: SeenSelection,
+  current: NotebookSelection,
+): boolean {
+  if (previous.mirrored === null) return false;
+  if (!sameIds(previous.mirrored, current.notebookIds)) return false;
+  if (previous.active === null || current.activeNotebookIds === null) {
+    return previous.active === null && current.activeNotebookIds === null;
+  }
+  return sameIds(previous.active, current.activeNotebookIds);
+}
+
+/**
+ * Do two id lists hold the same ids, order aside?
+ *
+ * Precondition: neither side holds duplicates. Length plus one-way containment is
+ * set-equality only under that — `sameIds(['a', 'y'], ['a', 'a'])` answers true. Both
+ * callers' inputs come through `readIdList`, which collapses duplicates, so the
+ * precondition holds today; a third caller reading a list from somewhere else has to
+ * check it.
+ */
+function sameIds(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const set = new Set(a);
+  return b.every((id) => set.has(id));
+}
+
+/**
  * Read the selection document, tolerating anything a person might leave in it.
  *
  * A missing document, an absent `notebookIds`, a non-array, or an array holding
@@ -177,14 +273,71 @@ function readIdList(raw: unknown): string[] | null {
 // ---------------------------------------------------------------------------
 
 /**
- * How far back a re-query reaches beyond the stored watermark.
+ * How far back a *section's page listing* reaches beyond that section's watermark.
  *
  * Graph's clock and this service's clock are not the same clock, and the watermark is
- * the time a pass *started* rather than the newest page it saw. A re-fetch of an
- * unchanged page is idempotent and nearly free — `contentHash` short-circuits it — and a
- * missed page is neither.
+ * the time a pass *started* rather than the newest page it saw. A page this window pulls
+ * into a listing costs nothing on its own: the listing already carries the page's stamp
+ * and title, and `storedPageIsCurrent` skips a stored copy that matches without a Graph
+ * request. So the hour buys margin and spends bytes.
+ *
+ * Not the window that decides which *sections* are listed at all. That one costs one
+ * request per section per run and is `SECTION_SCAN_OVERLAP_MS`, below.
+ *
+ * **This is the window the `sync-overlap-save` log line measures.** `overlapSaveAgeMs` is
+ * called with `section.pagesSyncedThrough`, so the `ageMs` it reports is how far a page's
+ * stamp predates that section's page-listing watermark — bounded by this hour and by
+ * nothing else. An `ageMs` approaching 3600000 is what would say the hour is too narrow.
+ * Values in the tens of minutes are ordinary and say nothing.
  */
 export const WATERMARK_OVERLAP_MS = 3_600_000;
+
+/**
+ * How far back the *section scan* reaches beyond `sectionsScannedThrough`.
+ *
+ * Separate from `WATERMARK_OVERLAP_MS` because the two windows cost different things.
+ * That one pulls unchanged pages into a listing that is already being made. This one
+ * keeps an edited section a candidate, and every candidate costs one
+ * `listPagesChangedSince` on every run for as long as the window lasts — so an hour here
+ * re-listed a section edited once on every run for the next hour, against a budget of 400
+ * requests an hour shared with the interactive tools.
+ *
+ * Fifteen minutes. Both windows cover the same two things, and both are now measured
+ * rather than guessed at:
+ *
+ * - **Clock skew.** `api-overview.md` bounds it at seconds rather than minutes — a page
+ *   created inside a 15-second local bracket was stamped by Graph inside that bracket.
+ *   `recordClockSkew` in ./graph-throttle.ts reports it continuously from the running
+ *   service, and `graph-clock-skew` in the logs is the number to read.
+ * - **Propagation.** A section's `lastModifiedDateTime` rolls up from page creates, edits
+ *   and deletes, measured 2026-08-19. The largest movement ever seen in a stamp that had
+ *   nothing done to it is one second, and that shift was not path-dependent.
+ *
+ * What the window has to cover is the sum of those two, and nothing else. The cutoff is
+ * derived from the start of the last *completed* run, so an edit made between two runs
+ * carries a stamp after that instant and is a candidate under a window of any width. The
+ * case the window exists for is an edit made *before* a run started that the run's tree
+ * read did not yet reflect: the next cutoff has to still be behind it, which it is
+ * whenever the lag is under the window. Fifteen minutes is about sixty times the largest
+ * effect either measurement above shows. The lag itself has never been measured directly,
+ * which is why the log line below is the thing to watch rather than an argument.
+ *
+ * **Nothing observes whether this window is wide enough, and that is deliberate rather
+ * than an oversight.** A too-narrow section-scan window makes a section not a candidate,
+ * so `syncSection` never runs, no page listing is made, and no log line is written at all.
+ * The failure produces silence, not a large number. In particular it does **not** show up
+ * in `sync-overlap-save`: that line measures `WATERMARK_OVERLAP_MS`, the page-listing
+ * window, and an `ageMs` of twenty minutes there is ordinary. Reading it as evidence about
+ * this constant would argue for widening the one window this pass exists to narrow.
+ *
+ * What covers being wrong here is the nightly `/sync/sweep/full`, which compares stamps
+ * and titles against every stored page whatever the timestamps say — so a section this
+ * window declined is reconciled by morning. That is the backstop, and it is why fifteen
+ * minutes is worth trying against measurements rather than a log line. A notebook just
+ * mirrored or just activated does not depend on this window at all —
+ * `notebooksNeedingWideScan` covers that case.
+ */
+export const SECTION_SCAN_OVERLAP_MS = 900_000;
 
 /**
  * The instant a re-query should start from, given a watermark.
@@ -192,6 +345,10 @@ export const WATERMARK_OVERLAP_MS = 3_600_000;
  * A null watermark means the section has never been synced, which asks for everything:
  * the epoch. Overlap is subtracted rather than added, and the result is clamped to never
  * exceed the watermark itself, so a negative or absurd overlap cannot skip a window.
+ *
+ * The default is the page-listing window, because that is the call with a watermark of
+ * its own to reach back from. The section scan passes `SECTION_SCAN_OVERLAP_MS`
+ * explicitly.
  */
 export function overlapFrom(
   watermarkIso: string | null,
@@ -208,6 +365,37 @@ export function overlapFrom(
   }
 
   return new Date(Math.min(watermark, watermark - overlapMs)).toISOString();
+}
+
+/**
+ * How far a page's stamp predates the watermark, when the overlap is why it was listed.
+ *
+ * The watermark passed in is a *section's page-listing* watermark, so the age this returns
+ * is bounded by `WATERMARK_OVERLAP_MS` and is evidence about that constant alone. The
+ * largest age ever seen for a page that turned out to have really changed is the narrowest
+ * page-listing window that would still have caught everything.
+ *
+ * It says nothing about `SECTION_SCAN_OVERLAP_MS`. That window decides whether the section
+ * is listed at all, and a section it declines produces no listing and therefore no line
+ * here — the failure is silence rather than a large number.
+ *
+ * Returns null when the page is not one of those: a stamp at or after the watermark would
+ * have been listed by a window of any width, a null watermark means the section asked for
+ * everything from the epoch, and an unparseable value on either side is a measurement
+ * that cannot be taken rather than one to guess at.
+ *
+ * The answer is a number of milliseconds. It names no page and no section, which is what
+ * makes it safe in a log line.
+ */
+export function overlapSaveAgeMs(watermarkIso: string | null, modifiedIso: string): number | null {
+  if (watermarkIso === null) return null;
+
+  const watermark = Date.parse(watermarkIso);
+  const modified = Date.parse(modifiedIso);
+  if (Number.isNaN(watermark) || Number.isNaN(modified)) return null;
+  if (modified >= watermark) return null;
+
+  return watermark - modified;
 }
 
 // ---------------------------------------------------------------------------
@@ -345,14 +533,274 @@ export interface MirrorSection {
    * moves the page within an ordering — no listing becomes wrong about what exists or
    * what it is called.
    *
-   * A structure replacement clears it, because `putStructure` writes each section
-   * document whole. That runs only when the tree hash moves — someone added or renamed a
-   * notebook — so it is a rare race with an in-flight write, and it fails in the same
-   * direction as the expiry below rather than in a new one.
+   * A structure write does not clear it. `putStructure` sends the tree-owned fields and
+   * merges, and this is not one of them — see `SectionTreeFields`. It used to, which was
+   * a rare race with an in-flight write; the expiry below is what still covers a hold
+   * nothing lowers.
    */
   readonly pendingWrites?: number;
   /** When the most recent hold was taken, so a hold a dead process left expires. */
   readonly pendingWritesSince?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Tree-owned fields, and the identity that says whether one changed
+//
+// A structure document has two owners. `buildStructure` in ./mirror-sync.ts knows what
+// the expanded tree said — a name, a parent, a path, whether the notebook is in the
+// selection. The sync and the write tools own everything else — a section's watermark and
+// page count, a group's `childGroupsKnown`, a section's listing hold. Those are learned
+// over hours of Graph requests and the tree read knows nothing about them.
+//
+// Before this split a structure write sent whole documents built from the tree alone, so
+// every one of the sync-owned fields was reset to its creation default whenever the tree
+// hash moved — for a section renamed in the OneNote client, or a notebook created in a
+// part of the account that is not even mirrored. A reset watermark is a full re-backfill
+// of the selection; a reset `childGroupsKnown` sends every `list_sections` on a section
+// group to Graph until the next sweep.
+// ---------------------------------------------------------------------------
+
+export type NotebookTreeFields = Pick<
+  MirrorNotebook,
+  | 'id'
+  | 'displayName'
+  | 'mirrored'
+  | 'sectionCount'
+  | 'sectionGroupCount'
+  | 'graphLastModifiedDateTime'
+>;
+
+export type SectionGroupTreeFields = Pick<
+  MirrorSectionGroup,
+  'id' | 'displayName' | 'notebookId' | 'parentId' | 'parentKind' | 'path' | 'mirrored'
+>;
+
+export type SectionTreeFields = Pick<
+  MirrorSection,
+  | 'id'
+  | 'displayName'
+  | 'notebookId'
+  | 'parentId'
+  | 'parentKind'
+  | 'path'
+  | 'mirrored'
+  | 'graphLastModifiedDateTime'
+>;
+
+/** The `identity` field every structure document carries, so the store can skip a write. */
+export interface StructureIdentity {
+  readonly identity: string;
+}
+
+export type NotebookStructureWrite = NotebookTreeFields & StructureIdentity;
+export type SectionGroupStructureWrite = SectionGroupTreeFields & StructureIdentity;
+export type SectionStructureWrite = SectionTreeFields & StructureIdentity;
+
+/**
+ * What a structure document is created with the first time it appears, and never again.
+ *
+ * `pagesSyncedThrough: null` is what makes a brand new section a backfill candidate —
+ * `pickCandidates` in ./mirror-sync.ts treats it as "never synced" and reads it whatever
+ * its timestamp says. Re-sending it to a section that already exists is the reset this
+ * split removes, so the store applies these only on a document it just created.
+ *
+ * The field is not optional, and the reason is a Firestore rule rather than a convention.
+ * `listSectionsToSync` orders by `pagesSyncedThrough`, and an `orderBy` excludes every
+ * document that does not carry the field — so a section created without it is absent from
+ * the sync's own listing for ever, and nothing reports a section it never enumerated.
+ * `buildStructure` used to guarantee the field by sending it on every write; now the only
+ * thing that guarantees it is this default being applied on a create.
+ */
+export const NEW_SECTION_DEFAULTS = { pagesSyncedThrough: null, pageCount: 0 } as const satisfies
+  Pick<MirrorSection, 'pagesSyncedThrough' | 'pageCount'>;
+
+/**
+ * `childGroupsKnown: false` is what a group is created with, for the reason the field's
+ * own docstring gives: `$expand` reaches one level of section group, so a new group's
+ * nested groups are absent from the response rather than known to be empty.
+ */
+export const NEW_GROUP_DEFAULTS = { childGroupsKnown: false } as const satisfies
+  Pick<MirrorSectionGroup, 'childGroupsKnown'>;
+
+/**
+ * The separator between fields in an identity string.
+ *
+ * A NUL, because a OneNote display name can hold every other plausible separator. With a
+ * space, `{displayName: 'a b', notebookId: 'c'}` and `{displayName: 'a', notebookId: 'b c'}`
+ * join to the same string, so a rename that moved a space across a field boundary would
+ * produce an unchanged identity and the document would never be rewritten.
+ */
+const IDENTITY_SEPARATOR = '\0';
+
+/**
+ * What the tree said about this notebook, as one string.
+ *
+ * Two documents with the same identity are the same as far as a structure write is
+ * concerned, so the store skips the second one. `structureHashOf` in ./mirror-sync.ts
+ * hashes these same strings, which is what stops "the hash moved" and "this document
+ * changed" from ever disagreeing.
+ *
+ * `graphLastModifiedDateTime` is deliberately absent from all three identities. It moves
+ * whenever anyone edits a page, so including it would rewrite every document in the
+ * account on nearly every run — and nothing reads the stored copy for freshness anyway:
+ * `withLiveMtimes` overlays what this run's tree read saw before `pickCandidates` filters
+ * on it.
+ */
+export function notebookIdentity(fields: NotebookTreeFields): string {
+  const {
+    id,
+    displayName,
+    mirrored,
+    sectionCount,
+    sectionGroupCount,
+    graphLastModifiedDateTime,
+    ...rest
+  } = fields;
+  everyFieldConsidered(rest, graphLastModifiedDateTime);
+
+  return [
+    'n',
+    id,
+    displayName,
+    String(mirrored),
+    String(sectionCount),
+    String(sectionGroupCount),
+  ].join(IDENTITY_SEPARATOR);
+}
+
+/** See `notebookIdentity`. `childGroupsKnown` is sync-owned and is not a tree field. */
+export function groupIdentity(fields: SectionGroupTreeFields): string {
+  const { id, displayName, notebookId, parentId, parentKind, path, mirrored, ...rest } = fields;
+  everyFieldConsidered(rest);
+
+  return ['g', id, displayName, notebookId, parentId, parentKind, path, String(mirrored)].join(
+    IDENTITY_SEPARATOR,
+  );
+}
+
+/** See `notebookIdentity`. The watermark and the page count are sync-owned. */
+export function sectionIdentity(fields: SectionTreeFields): string {
+  const {
+    id,
+    displayName,
+    notebookId,
+    parentId,
+    parentKind,
+    path,
+    mirrored,
+    graphLastModifiedDateTime,
+    ...rest
+  } = fields;
+  everyFieldConsidered(rest, graphLastModifiedDateTime);
+
+  return ['s', id, displayName, notebookId, parentId, parentKind, path, String(mirrored)].join(
+    IDENTITY_SEPARATOR,
+  );
+}
+
+/**
+ * A compile-time check that an identity function has looked at every field of its input.
+ *
+ * Each of the three above destructures its parameter completely — the fields that go into
+ * the string, then the ones deliberately left out, then a rest binding — and passes the
+ * rest here. A field added to one of the tree-field types and not named in the
+ * destructuring lands in `rest`, and `Record<string, never>` refuses it.
+ *
+ * Without this, adding a field to `SectionTreeFields` is a type error in `buildStructure`,
+ * where the object literal is checked, and *not* in `sectionIdentity`, which would keep
+ * compiling while ignoring it. A section whose only change was that field would then have
+ * an unchanged identity and would never be written — the silent-skip failure this whole
+ * design is built to avoid, arriving through the one door the types left open.
+ *
+ * `omitted` takes the deliberate exclusions so a destructured-but-unused binding is a use.
+ * Nothing here runs for any other reason; the parameter types are the whole point.
+ */
+function everyFieldConsidered(_rest: Record<string, never>, ..._omitted: unknown[]): void {}
+
+// ---------------------------------------------------------------------------
+// What a structure write does to one collection
+// ---------------------------------------------------------------------------
+
+/** One document to write, already keyed by its Firestore document id. */
+export interface PlannedStructureWrite {
+  readonly documentId: string;
+  /** Ready to `set(…, { merge: true })`. Creation defaults are already folded in. */
+  readonly fields: Record<string, unknown>;
+  /**
+   * True when no document with this id was there. Only a create carries the defaults.
+   *
+   * Nothing in `src/` reads it — `#reconcileCollection` sends every write the same way. It
+   * is here for the tests, which cannot otherwise tell a create from a merge on a notebook:
+   * `createDefaults` is `{}` there, so the written fields are identical either way. Do not
+   * delete it as dead, and do not log from it expecting the store to have branched on it.
+   */
+  readonly created: boolean;
+}
+
+export interface StructureWritePlan {
+  readonly writes: readonly PlannedStructureWrite[];
+  /** Document ids the tree no longer holds. */
+  readonly deletes: readonly string[];
+}
+
+/**
+ * Decide what one structure collection needs, given what it holds and what the tree says.
+ *
+ * This is the whole of `#replaceCollection`'s judgement, and it lives here because
+ * ./mirror-store.ts cannot be tested on this machine — the rule stated at the top of this
+ * file. That module is left holding the Firestore query, the batching and the calls; every
+ * branch below is reachable from a plain unit test.
+ *
+ * Four outcomes, and each one exists because its absence is a specific failure:
+ *
+ * - **Skip** a document whose stored `identity` equals the incoming one. Without it,
+ *   renaming a single section rewrites all 568 section documents in the account.
+ * - **Merge** a document whose identity differs, by sending the tree fields and nothing
+ *   else. The fields the tree does not know — `pagesSyncedThrough`, `pageCount`,
+ *   `lastSweptAt`, `childGroupsKnown`, `pendingWrites`, `pendingWritesSince` — are absent
+ *   from `fields`, so a merging write leaves them where they are. A cleared watermark is a
+ *   full re-backfill of that section.
+ * - **Create** with `createDefaults` a document that was not there. See
+ *   `NEW_SECTION_DEFAULTS` for what a missing `pagesSyncedThrough` costs.
+ * - **Delete** a document the incoming set does not name. By absence rather than by a
+ *   `lastSeenAt` sweep, because the caller has just read the complete tree in one request
+ *   — so absence is a fact rather than an inference, and it must not be reached by the
+ *   skip above.
+ *
+ * One consequence of merging that the old wholesale write did not have: a field dropped
+ * from `buildStructure` is no longer removed from the stored documents. `set(…, { merge:
+ * true })` leaves a field it does not mention exactly where it is, so a retired field
+ * lingers until a `FieldValue.delete()` or a one-off pass clears it. Retiring a field is
+ * therefore a migration now, not an edit.
+ *
+ * `storedIdentities` maps document id to whatever the stored `identity` field held. A
+ * present key with an `undefined` value is a document written before that field existed:
+ * it exists, so it is merged rather than created, and it does not match, so it is written
+ * once. That is the one-off pass every deployment of this change pays.
+ */
+export function planStructureWrite(
+  storedIdentities: ReadonlyMap<string, unknown>,
+  documents: readonly (StructureIdentity & { id: string })[],
+  createDefaults: object,
+): StructureWritePlan {
+  const unseen = new Set(storedIdentities.keys());
+  const writes: PlannedStructureWrite[] = [];
+
+  for (const document of documents) {
+    const documentId = encodeMirrorId(document.id);
+    const existed = storedIdentities.has(documentId);
+    unseen.delete(documentId);
+
+    if (existed && storedIdentities.get(documentId) === document.identity) continue;
+
+    writes.push({
+      documentId,
+      fields: { ...(existed ? {} : createDefaults), ...document },
+      created: !existed,
+    });
+  }
+
+  return { writes, deletes: [...unseen] };
 }
 
 export type ContentState = 'present' | 'stale' | 'missing';
@@ -424,6 +872,203 @@ export function timestampToIso(value: unknown): string | null {
   return null;
 }
 
+/**
+ * The three fields a page listing carries. `PageSummary` from ./graph-structure.ts
+ * satisfies it.
+ *
+ * Declared structurally rather than imported, so this module keeps its property of having
+ * no imports at all.
+ */
+export interface PageStamp {
+  readonly id: string;
+  readonly title: string;
+  readonly lastModifiedDateTime: string;
+}
+
+/**
+ * Do the mirror's stamp and Graph's stamp for one page disagree?
+ *
+ * A hint, not a verdict. It says the two strings are not the same string; it does not
+ * claim the page changed, and the name says so — the sweep's answer to a disagreement is
+ * to re-fetch the page, and `writePageFromRaw`'s content-hash comparison is what decides
+ * whether anything is written. That is why there is no margin, no direction test and no
+ * `Date.parse` here:
+ *
+ * - **No margin.** A tolerance buys jitter-safety by discarding every real edit inside the
+ *   window, and an edit the sweep never notices is served as current for ever. A false
+ *   positive costs one Graph request.
+ * - **No direction.** Stored-ahead-of-live is the signature of a page written through this
+ *   server: `resyncPage` stamps `new Date().toISOString()` from this process's clock,
+ *   because Graph's page *metadata* read is measured-unreliable (`api-overview.md`:
+ *   `GET /pages/{id}?$select=title` answers `""` for a page created seconds earlier). Under
+ *   the old response — `markPageStale`, which deletes the page-content document — firing on
+ *   that direction destroyed the mirrored copy of exactly the most-used pages in the
+ *   account, and nothing put it back, because no read path ever writes to the mirror. A
+ *   re-fetch does the opposite: it replaces the local stamp with Graph's own. **Do not put
+ *   a mark back in that branch.**
+ * - **No parsing.** Two spellings of one instant (`…:00Z` and `…:00.000Z`) disagree, and
+ *   that is wanted: the second is what `resyncPage` writes, `lastModifiedDateTime` is
+ *   printed in every tool result, and a re-fetch is what replaces it with Graph's spelling.
+ *   A parsed compare would leave the local spelling stored for ever.
+ *
+ * A page the pre-2026-08-21 sweep discovered carries `title: ''` and `new Date(0)`, and
+ * needs no predicate of its own: the epoch disagrees with anything Graph sends, so the same
+ * branch re-fetches it and the repair writes both fields from Graph's listing.
+ *
+ * An empty live stamp is `toPageSummary`'s fallback for a field Graph did not send. It
+ * disagrees like any other value, so such a page is re-fetched once per sweep and the
+ * short-circuit declines to store the empty string over a good one. That is the price of
+ * never hiding an edit, and no page Graph stamps ever pays it.
+ *
+ * `storedPageIsCurrent` delegates its stamp clause here rather than restating the
+ * comparison. Both callers answer a disagreement by fetching the page, so one rule serves
+ * both, and a change made to this one — a margin, a parse, a direction test — cannot reach
+ * only one of them.
+ */
+export function pageStampDiffers(stored: PageStamp, live: PageStamp): boolean {
+  return stored.lastModifiedDateTime !== live.lastModifiedDateTime;
+}
+
+/**
+ * Does the mirror's copy of this page disagree with what a page listing says about it?
+ *
+ * The stamp **or** the title. It is one predicate rather than two comparisons written out
+ * at each call site because the two callers have to answer identically, and the reason is
+ * measured: a rename moves no `lastModifiedDateTime` (api-overview.md, "A page rename does
+ * not move the page's `lastModifiedDateTime`"), so a stamp-only comparison is permanently
+ * blind to one. Both callers answer a disagreement the same way, by fetching the page:
+ *
+ * - `storedPageIsCurrent` below, which decides whether the incremental pass may skip the
+ *   content fetch for a page the changed-page listing returned.
+ * - `sweepSection` in ./mirror-sync.ts, which compares a stored digest against the
+ *   section's live page listing. That one is the only pass that ever looks at a page whose
+ *   stamp has not moved, so it is where a missed rename becomes permanent: the incremental
+ *   will not list a page whose stamp is below the section watermark, and no read path
+ *   writes to the mirror.
+ *
+ * Written out twice, a margin or a parse added to one would not reach the other, and the
+ * sweep is the copy where the omission has no upper bound on how long it lasts.
+ *
+ * A `PageStamp` is all a caller needs on either side: `listPageDigestsInSection` projects
+ * one out of the page documents and `listPageSummaries` already selects the same three
+ * fields, so neither comparison costs a request or a field.
+ */
+export function pageListingDiffers(stored: PageStamp, live: PageStamp): boolean {
+  return pageStampDiffers(stored, live) || stored.title !== live.title;
+}
+
+/**
+ * How long a stored copy must have been in hand before its stamp is trusted.
+ *
+ * Graph stamps `lastModifiedDateTime` to the whole second — measured 2026-08-21 and
+ * recorded in api-overview.md under "Page timestamps have whole-second resolution". So a
+ * content fetch landing in the same second as a concurrent edit stores the older content
+ * under a stamp that never moves, and `storedPageIsCurrent` would then skip that page on
+ * every later run. Requiring the stored copy to have been fetched well after the stamp
+ * closes that window.
+ *
+ * Unlike the stamp equality, this comparison **does** cross clocks: Firestore's
+ * `serverTimestamp()` on one side, Graph's stamp on the other. That is why it is 30
+ * seconds rather than 2. The size is bounded by measurement rather than chosen blind —
+ * api-overview.md records the Graph-to-service skew as seconds rather than minutes, and
+ * `recordClockSkew` in ./graph-throttle.ts measures it continuously from the deployed
+ * service, so a figure that turns out to be wrong shows up in the logs rather than as a
+ * silent miss.
+ *
+ * Failing the guard forces a fetch, and the fetch has to leave the copy *settled* or the
+ * same page is fetched again on the next run and every run after it. That is why
+ * `writePageFromRaw`'s short-circuit writes metadata when the stored copy would fail this
+ * guard as well as when the stamps differ: `putPageMetadata` refreshes `contentSyncedAt`,
+ * and without that refresh nothing ever moves the value the guard reads. The loop had no
+ * exit — the listing window is an hour wide, so a page edited an hour ago cost one Graph
+ * content request on every run for that hour, and a page document written before
+ * `contentSyncedAt` existed cost one for ever. It was invisible in a run report:
+ * `pagesUpdated` and `pagesSkipped` both stay at zero and only `graphRequests` moves.
+ *
+ * The exit is bounded rather than immediate. A page fetched five seconds after its stamp
+ * settles to a `contentSyncedAt` five seconds after it, which still fails the guard; the
+ * next run's write puts `contentSyncedAt` at that run's clock, which is past the margin.
+ * So a page edited during a run costs at most one further fetch, not an unbounded series.
+ */
+export const TIMESTAMP_SETTLE_MS = 30_000;
+
+/**
+ * Has the stored copy been in hand long enough for its stamp to be trusted?
+ *
+ * Named and exported because two places need the same answer, and the second one is not
+ * obvious. `storedPageIsCurrent` asks it to decide whether the content fetch can be
+ * skipped. `writePageFromRaw`'s short-circuit asks it to decide whether to write metadata
+ * for a page whose content it just confirmed identical — a page the guard would refuse has
+ * to be *made* settleable there, because `putPageMetadata` is the only thing that refreshes
+ * `contentSyncedAt` on a page nothing rewrote, and a guard that keeps failing keeps
+ * spending a Graph request.
+ *
+ * Not `Math.abs`. A copy fetched *before* Graph stamped the edit is not settled by any
+ * margin — it predates the edit outright — and an absolute value would call it current.
+ *
+ * Answers false for anything it cannot measure: an absent `contentSyncedAt`, which is what
+ * a document written before the field existed carries, and a live stamp neither side can
+ * parse — `''`, `toPageSummary`'s fallback for a field Graph did not send — which makes the
+ * subtraction NaN, and NaN fails every comparison.
+ */
+export function contentCopyIsSettled(
+  contentSyncedAt: unknown,
+  liveModifiedIso: string,
+  settleMs: number = TIMESTAMP_SETTLE_MS,
+): boolean {
+  const syncedAt = timestampToIso(contentSyncedAt);
+  if (syncedAt === null) return false;
+
+  return Date.parse(syncedAt) - Date.parse(liveModifiedIso) > settleMs;
+}
+
+/**
+ * Does the mirror already hold this page exactly as Graph describes it?
+ *
+ * True means the content fetch can be skipped, which is the point: the changed-page
+ * listing already carried the stamp and the title, so re-reading the content would spend
+ * one of the hourly 400 Graph requests to learn what the listing already said.
+ *
+ * Every clause is a way that answering true carelessly would serve superseded content as
+ * current:
+ *
+ * - `contentState` — a write already marked this stale, or its content was never stored.
+ * - the stamp and the title together, delegated to `pageListingDiffers` so the sweep and
+ *   the skip cannot drift into two different rules for one comparison. The stamp is exact
+ *   string equality; an empty or unparseable live stamp needs no clause of its own,
+ *   because `Date.parse` answers NaN for it and every comparison against NaN is false, so
+ *   the settle guard below refuses the page. The title is there because a rename moves no
+ *   timestamp — measured 2026-08-21 and recorded in api-overview.md: a `PATCH
+ *   /pages/{id}/content` replacing the title left `lastModifiedDateTime` at its old value,
+ *   still unchanged two minutes later. The title is the field `find_page_by_name` and
+ *   `search_pages` match on, so a mirror that missed a rename answers by the wrong name
+ *   indefinitely. Do not drop this comparison as redundant with the stamp.
+ * - the section — page ids survive a rename of their placement, so only the placement
+ *   changed and the stored `sectionId` is what every listing query filters on.
+ * - the settle guard — see `TIMESTAMP_SETTLE_MS`.
+ *
+ * **There is no tolerance on the stamp, and a future reader must not add one.** The
+ * tempting justification is api-overview.md's record of Graph reporting four unchanged
+ * pages exactly one second later across two reads — a window of a second or two would
+ * absorb that. It would also discard every genuine edit made inside the window, and the
+ * incremental sync advances the section watermark past an edit it did not act on, so such
+ * a page is never listed again. The failure directions are not symmetric: a stamp that
+ * disagrees for no reason costs one Graph request and then agrees, because the re-fetch
+ * writes Graph's own string back.
+ */
+export function storedPageIsCurrent(
+  stored: MirrorPage,
+  live: PageStamp,
+  sectionId: string,
+  settleMs: number = TIMESTAMP_SETTLE_MS,
+): boolean {
+  if (stored.contentState !== 'present') return false;
+  if (pageListingDiffers(stored, live)) return false;
+  if (stored.sectionId !== sectionId) return false;
+
+  return contentCopyIsSettled(stored.contentSyncedAt, live.lastModifiedDateTime, settleMs);
+}
+
 export interface MirrorPageContent {
   readonly pageId: string;
   /** Raw and untrimmed. `trimPageHtml` runs at read time so the trimmer can change. */
@@ -476,14 +1121,36 @@ export interface MirrorSyncState {
   /** How many selected notebook ids matched no notebook. A mistyped id is silent otherwise. */
   readonly unknownNotebookIds: number;
   /**
-   * sha256 over the active notebook ids, so a change to them is detectable.
+   * The two selection lists this service last reconciled, so a change can be diffed.
    *
-   * It is not folded into `structureHash`, and that is deliberate: `putStructure`
-   * replaces documents wholesale and `buildStructure` emits `pagesSyncedThrough: null`,
-   * so anything entering that hash resets every section's watermark when it changes. An
-   * activation edit would then trigger a full re-backfill of the whole selection.
+   * A hash could say *that* they changed and not *which* notebook, and which notebook is
+   * the whole point: widening the scan for every notebook when one was activated costs a
+   * listing request per section of the account. `activeNotebookIdsSeen` is `null` for
+   * "every mirrored notebook is active", exactly as in the selection document;
+   * `mirroredNotebookIdsSeen` null is the one that means "never recorded", and it is the
+   * field both `notebooksNeedingWideScan` and `selectionMatchesSeen` key on. A recorded
+   * empty list reads back as `[]` rather than as null, because `readIdList` returns an
+   * array for any array, so the two cannot be confused.
    */
-  readonly activeSelectionHash: string | null;
+  readonly mirroredNotebookIdsSeen: readonly string[] | null;
+  readonly activeNotebookIdsSeen: readonly string[] | null;
+  /**
+   * Notebooks whose sections bypass the tier-1 timestamp cutoff until a run completes.
+   *
+   * Stored rather than held for one run, because a run is budget-bounded and may stop
+   * with sections outstanding. It is cleared in the same place `sectionsScannedThrough`
+   * advances — only when every candidate was visited.
+   *
+   * `readSyncState` reads a malformed value here as `[]`, which is the opposite choice
+   * from `activeNotebookIds` in `readIdList`, and deliberately so. Failing open there
+   * means extra Graph requests and failing closed would freeze the mirror; here the
+   * asymmetry runs the other way — failing closed costs one pending widening, which is
+   * some sections not re-listed until their timestamps move, and failing open would mean
+   * inventing a notebook set to widen for out of a value nothing could parse. This field
+   * is written only by this service, so a malformed one is a bug rather than a
+   * hand-edit.
+   */
+  readonly wideScanNotebookIds: readonly string[];
   /** How many *active* ids matched no notebook. Same failure as `unknownNotebookIds`. */
   readonly unknownActiveNotebookIds: number;
 }
@@ -506,7 +1173,9 @@ export function initialSyncState(): MirrorSyncState {
     runningMode: null,
     runningSince: null,
     unknownNotebookIds: 0,
-    activeSelectionHash: null,
+    mirroredNotebookIdsSeen: null,
+    activeNotebookIdsSeen: null,
+    wideScanNotebookIds: [],
     unknownActiveNotebookIds: 0,
   };
 }
@@ -543,7 +1212,9 @@ export function readSyncState(data: Record<string, unknown> | undefined): Mirror
     runningMode: syncModeOrNull(data['runningMode']),
     runningSince: stringOrNull(data['runningSince']),
     unknownNotebookIds: numberOr(data['unknownNotebookIds'], 0),
-    activeSelectionHash: stringOrNull(data['activeSelectionHash']),
+    mirroredNotebookIdsSeen: readIdList(data['mirroredNotebookIdsSeen']),
+    activeNotebookIdsSeen: readIdList(data['activeNotebookIdsSeen']),
+    wideScanNotebookIds: readIdList(data['wideScanNotebookIds']) ?? [],
     unknownActiveNotebookIds: numberOr(data['unknownActiveNotebookIds'], 0),
   };
 }

@@ -18,17 +18,16 @@ import {
   UNGATED,
   createGate,
   parseRetryAfter,
+  recordClockSkew,
   type RequestGate,
 } from './graph-throttle.ts';
 // Decoding lives in ./graph-decode.ts. That module imports GraphResponseError and the
 // result types from here, so the dependency runs one way and this file keeps the URLs,
 // the requests and the error types.
 import {
-  asRecord,
   describeError,
   mapWithLimit,
   quoteOData,
-  requireString,
   safeText,
   toExpandedNotebook,
   toNode,
@@ -61,9 +60,9 @@ const NODE_SELECT = '$select=id,displayName&$orderby=displayName';
  * the response: 441 KB without it against 78 KB with it, for the same tree. The separator
  * inside a clause carrying both `$select` and `$expand` is a semicolon, not a comma.
  *
- * This is the shape the OneNote throttling guidance asks for — see the `Graph request
- * budget` section of CLAUDE.md. The per-container walk that returns the same data costs
- * `1 + 2 x containers`, which is 195 requests on the real account against this one.
+ * This is the shape the OneNote throttling guidance asks for — see `docs/graph.md`. The
+ * per-container walk that returns the same data costs `1 + 2 x containers`, which is 195
+ * requests on the real account against this one.
  */
 const EXPANDED_TREE_URL =
   `${GRAPH_ROOT}/me/onenote/notebooks?$select=id,displayName,lastModifiedDateTime` +
@@ -322,6 +321,7 @@ export async function graphGet(
   fetchImpl: FetchLike,
 ): Promise<Record<string, unknown>> {
   const response = await fetchImpl(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  recordClockSkew(response.headers);
 
   if (!response.ok) {
     // The body is read before it is thrown away: Graph puts the actual reason in it,
@@ -544,7 +544,7 @@ export class GraphStructure {
   }
 
   /**
-   * Every page id in one section, and nothing else.
+   * Every page in one section, with the two fields a reconciliation needs.
    *
    * This is the mirror's deletion sweep, and it is as cheap as deletion detection gets
    * on this account. Graph has no /delta on any OneNote resource and no tombstone for a
@@ -553,16 +553,20 @@ export class GraphStructure {
    * floor is one request per section plus one per additional 100 pages, and what makes
    * that affordable is that only the mirrored notebooks are swept.
    *
-   * `$select=id` alone, because the caller compares id sets and reads nothing else. No
-   * `top` argument: a sweep that stopped early would report pages as deleted that are
+   * `title` and `lastModifiedDateTime` cost nothing beyond bytes on a request that is
+   * already being made, and the sweep needs both: a page it discovers has no other source
+   * for its title, and a page it already holds can only be checked for content drift
+   * against Graph's own timestamp.
+   *
+   * No `top` argument: a sweep that stopped early would report pages as deleted that are
    * merely past the cutoff, which is the one mistake here that destroys data.
    */
-  async listPageIds(sectionId: string): Promise<string[]> {
+  async listPageSummaries(sectionId: string): Promise<PageSummary[]> {
     const url =
       `${GRAPH_ROOT}/me/onenote/sections/${encodeURIComponent(sectionId)}/pages` +
-      `?$select=id&$top=${MAX_GRAPH_TOP}`;
+      `?$select=id,title,lastModifiedDateTime&$top=${MAX_GRAPH_TOP}`;
 
-    return (await this.#collect(url)).map((item) => requireString(asRecord(item, url), 'id', url));
+    return (await this.#collect(url)).map((item) => toPageSummary(item, url));
   }
 
   /**

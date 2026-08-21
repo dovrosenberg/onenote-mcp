@@ -40,7 +40,12 @@ import {
   type TokenSource,
   withRequestTimeout,
 } from './graph-structure.ts';
-import { UNGATED, parseRetryAfter, type RequestGate } from './graph-throttle.ts';
+import {
+  UNGATED,
+  parseRetryAfter,
+  recordClockSkew,
+  type RequestGate,
+} from './graph-throttle.ts';
 import type { GraphAuth } from './graph-auth.ts';
 
 /** One entry in a PATCH change array. */
@@ -161,6 +166,7 @@ export class GraphPageWrite {
         },
         body: JSON.stringify(changes),
       });
+      recordClockSkew(response.headers);
 
       if (!response.ok) throw await requestError(url, 'PATCH', response);
       // Success is 204 with an empty body. Nothing is read from it.
@@ -218,6 +224,7 @@ export class GraphPageWrite {
         },
         body: createPageHtml(title, bodyHtml),
       });
+      recordClockSkew(response.headers);
 
       if (!response.ok) throw await requestError(url, 'POST', response);
 

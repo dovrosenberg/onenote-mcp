@@ -7,7 +7,7 @@ below are the authority on what it actually did here, because several of them co
 the documentation.
 
 Read this before adding a Graph call. The throttling limits and the design principles
-they force are in the `Graph request budget` section of `CLAUDE.md`.
+they force are in `docs/graph.md`.
 
 ## Resource paths
 
@@ -145,6 +145,228 @@ seconds apart with no write of any kind in between all returned `2026-08-19T19:3
 unchanged. The field moves on a write and only on a write.
 
 A re-read of the deleted page answered `404`.
+
+## A page rename does not move the page's `lastModifiedDateTime`
+
+**Measured 2026-08-21**, against a scratch page, reading
+`/me/onenote/sections/{id}/pages?$select=id,title,lastModifiedDateTime` between each step:
+
+| Step | Page `title` | Page `lastModifiedDateTime` |
+|---|---|---|
+| after `POST /sections/{id}/pages` (201) | `probe-clock-2026-08-21` | `2026-08-21T12:17:52Z` |
+| after `PATCH /pages/{id}/content` replacing the title (204) | `probe-clock-2026-08-21 RENAMED` | `2026-08-21T12:17:52Z` |
+| re-read ~2 minutes later | `probe-clock-2026-08-21 RENAMED` | `2026-08-21T12:17:52Z` |
+
+The title changed and the timestamp did not, so a rename is invisible to any comparison
+that reads only `lastModifiedDateTime`. This is not lag: the third row is the same value
+two minutes on.
+
+The consequence is that a timestamp is not sufficient to decide whether a page needs
+re-reading. Anything that skips work on an unmoved stamp has to compare the title as well,
+or a page renamed outside this server keeps its old title in the mirror for ever, which is
+the field `find_page_by_name` and `search_pages` match on. Three places do:
+`writePageFromRaw`'s short-circuit, `storedPageIsCurrent`, and `sweepSection` — the last
+two through `pageListingDiffers` in `src/mirror-schema.ts`, which is one predicate so a
+change to the rule cannot reach only one of them. The title costs nothing to compare: every
+listing this repository makes already selects it.
+
+The sweep is the place where omitting it has no upper bound. The incremental pass never
+lists a page whose stamp is below the section watermark, so once a rename has been missed
+the sweep is the only thing that could still see it.
+
+Measured through `PATCH /pages/{id}/content` with a `title` target, which is what
+`update_page_title` sends. Whether a rename performed **in the OneNote client** behaves
+the same way is not yet measured; it is the case that matters, because a rename made
+through this server already updates the mirror directly.
+
+## Page timestamps have whole-second resolution, and this server's do not
+
+**Measured 2026-08-21.** Graph returned `2026-08-21T12:17:52Z` for the page above — no
+fractional seconds, in the same shape as the section timestamps recorded above.
+`resyncPage` stamps a page locally with `new Date().toISOString()`, which always emits
+three fractional digits.
+
+So the two are not comparable as instants without parsing. `'2026-08-21T12:17:52.400Z' <
+'2026-08-21T12:17:52Z'` is **true** lexicographically, because `.` is `0x2E` and `Z` is
+`0x5A` — a locally stamped page landing in the same second as Graph's own stamp sorts
+*before* it.
+
+Nothing compares them as instants any more. `pageStampDiffers` in `src/mirror-schema.ts`
+asks only whether the two strings are the same string, and the sweep answers a difference
+by re-fetching the page. Two spellings of one instant therefore disagree, which is wanted:
+the re-fetch's short-circuit writes Graph's own spelling back through
+`MirrorStore.putPageMetadata`, so the locally stamped value is replaced rather than left in
+a field every tool result prints.
+
+## Graph reports the same page one second apart on two reads
+
+**Measured 2026-08-21.** One scratch section's page listing
+(`GET /sections/{id}/pages?$select=id,title,lastModifiedDateTime`) was read several times
+in a row. Between two of those reads, every page in the section reported a
+`lastModifiedDateTime` exactly one second later than it had before:
+
+| Page | Earlier read | Later read |
+|---|---|---|
+| probe page | `2026-08-21T12:17:52Z` | `2026-08-21T12:17:53Z` |
+| absolute spike | `2026-08-19T00:41:30Z` | `2026-08-19T00:41:31Z` |
+| geometry spike | `2026-08-19T00:39:41Z` | `2026-08-19T00:39:42Z` |
+| Renamed by update_page_title | `2026-08-19T00:24:22Z` | `2026-08-19T00:24:23Z` |
+
+Three of the four had not been touched for two days. A genuine edit would have stamped
+them with that day's date; they kept their 2026-08-19 dates and gained one second. So this
+is not an edit — the same unchanged page reports two values one second apart on different
+reads.
+
+The uniform +1 is consistent with one read path flooring the sub-second component and
+another ceiling it, but **the mechanism is not established**. What is established is the
+observation: a page's reported stamp can move by one second with nothing having happened
+to the page.
+
+The consequence is that a stamp difference is not proof of an edit. It is **not** that a
+margin is needed: a tolerance wide enough to absorb this second also discards every real
+edit made inside it, and an edit the sweep never notices is served as current for ever.
+
+What the sweep does instead is treat a difference as a hint. `pageStampDiffers` in
+`src/mirror-schema.ts` compares the two strings and nothing more, and the sweep answers a
+difference by re-fetching the page; `writePageFromRaw`'s content-hash comparison is the
+authoritative check, and a page whose content turns out to be unchanged costs one Graph
+request and a metadata write that stores Graph's stamp. So a page caught by this
+one-second wobble is fetched once and then agrees. The direction of the difference is
+irrelevant for the same reason — stored-ahead-of-live is the `resyncPage` local-stamp case
+recorded under **Writing page content**, and a re-fetch corrects it where the old stale
+mark destroyed it.
+
+### The shift is not path-dependent
+
+**Measured 2026-08-21**, after the shift above. The same page was read through two
+different query shapes against the same section:
+
+| Request | Reported `lastModifiedDateTime` |
+|---|---|
+| `GET /sections/{id}/pages?$select=id,title,lastModifiedDateTime&$orderby=lastModifiedDateTime desc&$top=N` | `2026-08-19T00:39:42Z` |
+| `GET /sections/{id}/pages?$select=id,title,lastModifiedDateTime&$filter=tolower(title) eq '…'` | `2026-08-19T00:39:42Z` |
+
+Same page, same value. Only two query shapes were tried; both are page listings on a
+section, and no other endpoint was probed. The stamps have also been stable across every
+read since the shift — the +1 second happened once and has not recurred.
+
+Two things this does not establish. The mechanism of the original shift is still unknown;
+the flooring-versus-ceiling explanation above remains a guess. And the shift was
+correlated in time with the OneNote client first opening that notebook, which is a
+correlation observed once and not a demonstrated cause.
+
+Why it matters: the re-fetch design depends on the disagreement being transient. If two
+query shapes reported the same page differently, then two sync passes reading through
+different shapes would disagree permanently, `pageStampDiffers` would be true on every
+run, and every page would be re-fetched every run — against a 400-request hourly budget,
+with the mirror never converging. These two reads agree, so the design converges: a page
+caught by the wobble is fetched once, its stored stamp is corrected to Graph's, and the
+next run agrees.
+
+## A section's page listing reports a title immediately; `GET /pages/{id}` does not
+
+**Measured 2026-08-21.** `GET /sections/{id}/pages?$select=id,title,lastModifiedDateTime`
+issued seconds after `POST /sections/{id}/pages` returned the new page with its title
+already correct. That is the opposite of the page-metadata weakness recorded under
+**Writing page content**, where `GET /pages/{id}?$select=title` answered `""` for pages
+created seconds earlier.
+
+So the listing endpoint is a usable source of titles and the per-page metadata endpoint is
+not.
+
+**That does not make `""` a safe sentinel for "no title read yet".** A later probe of the
+same account found a page whose listing entry carries `"title": ""` — a genuinely untitled
+page, not a read that failed. So an empty title is a legitimate value from either endpoint,
+and any comparison has to handle it as one rather than treating it as missing data. What
+the listing's reliability buys is that a title read from it can be *trusted*, not that it
+can never be empty.
+
+## Moving a page between sections changes its id and keeps its timestamp
+
+**Measured 2026-08-21**, moving one page between two sections in the OneNote client.
+
+**The page id changed completely** — both the GUID and the trailing section component:
+
+```
+before: 0-cc8f8e7e3eef4994be2452e57bb7ad1a!124-…!sc42d54e6be164de4b3b13f4a50c4160e
+after:  0-e641c1d6852b089a057bcd40db72a242!1-…!s2b04cff65ae64bf6b5a31d46ce86cb57
+```
+
+A page id therefore embeds the section it sits in, and there is no id that survives a move.
+To the mirror a moved page is a delete in the source section plus a create in the
+destination, which is what the sweep already reconciles on both sides: the source's stored
+page matches no live id and is tombstoned, and the destination's live id matches no stored
+page and is fetched.
+
+**The moved page kept its original `lastModifiedDateTime`** — `2026-08-21T12:17:53Z`, the
+minute it was created, not the minute it was moved. This settles a premise the sweep's
+rationale had been asserting without a measurement. A page moved into a section carries a
+stamp older than the section's watermark, so `listPagesChangedSince` never returns it and
+no incremental pass will ever see it. **Only the sweep finds a moved page.** That is the
+measured justification for the sweep existing at all.
+
+## Clock skew between Graph and this service: seconds, not minutes
+
+**Measured 2026-08-21**, loosely. A page created between local `12:17:39.939Z` and
+`12:17:55.387Z` was stamped by Graph at `12:17:52Z` — inside the bracket. The bracket is
+wide because it contains a full client round trip, so this bounds the skew rather than
+measuring it, and the clock it was taken against is a developer workstation rather than
+the deployed service.
+
+What it rules out is gross skew: not minutes, not hours. That is the property the
+watermark overlap is sized against, so an overlap of minutes has room. A tighter number
+needs the telemetry that reports the difference from inside the service on every run.
+
+
+## Moving a section reissues its id across notebooks and keeps it within one
+
+**Measured 2026-08-21**, moving one scratch section twice in the OneNote client. The
+section held 3 pages and none of them was touched during either move.
+
+**Move 1, into a section group in the same notebook.** The section id was unchanged:
+`0-583EFEEEF6E35B4B!sc42d54e6be164de4b3b13f4a50c4160e` before and after. Its 3 pages kept
+their ids and their `lastModifiedDateTime` values. The section went from being a direct
+child of the notebook to a child of a section group named `test`.
+
+**Move 2, into a different notebook.** The section id changed:
+
+```
+before: 0-583EFEEEF6E35B4B!sc42d54e6be164de4b3b13f4a50c4160e
+after:  0-583EFEEEF6E35B4B!s7d0fdb0d111d440dbdba64cfcd92602e
+```
+
+Its 3 pages were reissued too, and the shape of the change is narrower than a page move's.
+The GUID stayed the same and only the trailing section component followed the section:
+
+```
+before: 0-754d222de05c49a687a41a6d7d51c456!6-…!sc42d54e6…
+after:  0-754d222de05c49a687a41a6d7d51c456!6-…!s7d0fdb0d…
+```
+
+Contrast a *page* moved between sections, above, where both the GUID and the section
+component change. Page `lastModifiedDateTime` values were unchanged throughout both moves.
+
+**A section id is stable across a move within a notebook and is reissued on a move between
+notebooks.** That asymmetry is the non-obvious part: the id survives being reparented under
+a section group, and does not survive changing notebook.
+
+The consequence for the mirror is that the id change does the work on its own. The old
+section id is absent from the next tree read, so its document is deleted by absence along
+with its pages, and the new id creates a section document with `pagesSyncedThrough: null`,
+which `pickCandidates` treats as a candidate whatever the tier-1 cutoff says and whatever
+its notebook's activity says. The gap this section previously warned about — a section
+carrying months of arrears moved into a mirrored active notebook and never widened —
+**cannot occur**, because no watermark crosses a notebook boundary.
+
+The cost that replaces it: a cross-notebook section move re-backfills that section in full.
+Every page is fetched again under its new id and every page document under the old id is
+deleted. Correct and self-healing, and it shows up in a run report as a section's worth of
+requests against the hourly budget.
+
+**Whether the move bumps the section's own `lastModifiedDateTime` was not measured.** The
+section listing this account's tooling reads does not return that field, so the run that
+settled the ids could not answer it. It no longer decides anything: the id change alone
+makes the section a fresh backfill candidate, so tier 1 never gets the chance to skip it.
 
 ## `$filter` on a datetime
 

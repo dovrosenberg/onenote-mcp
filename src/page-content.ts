@@ -20,7 +20,12 @@ import {
   type TokenSource,
   withRequestTimeout,
 } from './graph-structure.ts';
-import { UNGATED, parseRetryAfter, type RequestGate } from './graph-throttle.ts';
+import {
+  UNGATED,
+  parseRetryAfter,
+  recordClockSkew,
+  type RequestGate,
+} from './graph-throttle.ts';
 import { renderInk, DEFAULT_RENDER_WIDTH, type InkImage } from './ink.ts';
 import { splitMultipart, findPart, type MultipartPart } from './multipart.ts';
 import { trimPageHtml } from './page-html.ts';
@@ -122,6 +127,8 @@ export class GraphPageContent {
       const response = await this.#fetch(url, {
         headers: { Authorization: `Bearer ${accessToken}` },
       });
+
+      recordClockSkew(response.headers);
 
       const contentType = response.headers.get('content-type');
       const raw = await safeText(response);

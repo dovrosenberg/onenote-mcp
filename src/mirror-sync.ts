@@ -8,17 +8,25 @@
 // was sized against — 5 notebooks, 40 sections, 2000 pages — a quiet day is 1 request and
 // a busy one is about 11.
 //
-// **Sweep** enumerates page ids per section and reconciles them against the mirror, which
-// is the only way a deletion is ever noticed: Graph has no /delta on any OneNote resource
-// and no tombstone for a deleted page, and the account-wide page list that would
-// enumerate everything cheaply is the banned one, error 20266.
+// **Sweep** enumerates each section's pages — id, title and stamp, for one request — and
+// reconciles them against the mirror. It does two jobs. It is the only way a deletion is
+// ever noticed: Graph has no /delta on any OneNote resource and no tombstone for a
+// deleted page, and the account-wide page list that would enumerate everything cheaply is
+// the banned one, error 20266. It is also the only thing that notices a page edited in
+// the OneNote client that the incremental pass missed, and the only thing that finds a
+// page *moved into* a section — measured 2026-08-21, a move keeps the page's stamp, so it
+// is below every later watermark. Both come from one comparison: a stored stamp that is
+// not the same string as Graph's sends the page back through `syncPage`, and the content
+// hash decides whether anything is written.
 //
 // Everything below follows from four things measured against the real account:
 //
 // 1. A page create, edit **and delete** each move the parent section's
 //    `lastModifiedDateTime`, and nothing else does (2026-08-19, api-overview.md). That is
 //    what makes tier 1 work, and it is what lets the nightly sweep visit only the
-//    sections that moved.
+//    sections that moved. The value compared is the one *this run's* tree read observed,
+//    overlaid onto the stored sections before the filter: the stored copy only moves on a
+//    structure rewrite, so filtering on it goes blind an hour after the last one.
 // 2. `$expand` on `/notebooks` has multi-minute outages — twice observed on 2026-08-19 —
 //    while un-expanded calls on the same collection answer 200 throughout. So a failed
 //    tree read is not fatal: the run keeps the structure already in Firestore and carries
@@ -36,8 +44,11 @@
 // saw. Per section because a budget-bounded run does not finish, and a global watermark
 // advanced past sections it never visited loses every edit in them permanently.
 // Pass-start because Graph's clock and this service's clock are not the same clock; the
-// hour of overlap in `overlapFrom` covers the difference, and a re-fetch of an unchanged
-// page is nearly free because `contentHash` short-circuits it.
+// hour of overlap `overlapFrom` reaches back covers the difference, and a page it
+// re-lists that has not changed costs nothing at all — `storedPageIsCurrent` skips it
+// without a request. The *section* scan reaches back a shorter distance for the opposite
+// reason: every section it surfaces costs a listing request. The two windows are
+// `WATERMARK_OVERLAP_MS` and `SECTION_SCAN_OVERLAP_MS` in ./mirror-schema.ts.
 
 import { createHash } from 'node:crypto';
 
@@ -52,14 +63,23 @@ import { fitInkToByteBudget } from './ink.ts';
 import { logEvent } from './logging.ts';
 import type { MirrorBlobWriter } from './mirror-blobs.ts';
 import {
+  groupIdentity,
   htmlPlacement,
   htmlObjectName,
   inkObjectName,
   isActive,
+  notebooksNeedingWideScan,
+  selectionMatchesSeen,
   inkmlObjectName,
+  notebookIdentity,
   overlapFrom,
+  overlapSaveAgeMs,
+  contentCopyIsSettled,
+  pageListingDiffers,
+  sectionIdentity,
+  storedPageIsCurrent,
+  SECTION_SCAN_OVERLAP_MS,
   utf8Bytes,
-  type MirrorNotebook,
   type MirrorPage,
   type MirrorPageContent,
   type MirrorSection,
@@ -67,6 +87,13 @@ import {
   type MirrorSyncState,
   type MirrorTombstone,
   type NotebookSelection,
+  type NotebookStructureWrite,
+  type NotebookTreeFields,
+  type PageStamp,
+  type SectionGroupStructureWrite,
+  type SectionGroupTreeFields,
+  type SectionStructureWrite,
+  type SectionTreeFields,
   type SyncMode,
   type SyncOutcome,
 } from './mirror-schema.ts';
@@ -90,7 +117,7 @@ export interface SyncGraph {
   listContainerChildren(kind: ContainerKind, containerId: string): Promise<ContainerChildren>;
   listPagesChangedSince(sectionId: string, sinceIso: string): Promise<PageSummary[]>;
   listPagesInSection(sectionId: string, top?: number): Promise<PageSummary[]>;
-  listPageIds(sectionId: string): Promise<string[]>;
+  listPageSummaries(sectionId: string): Promise<PageSummary[]>;
 }
 
 export interface SyncContent {
@@ -105,9 +132,9 @@ export interface SyncStore {
   acquireLease(mode: SyncMode, nowIso: string): Promise<void>;
   releaseLease(heldSince: string): Promise<void>;
   putStructure(structure: {
-    notebooks: readonly MirrorNotebook[];
-    sectionGroups: readonly MirrorSectionGroup[];
-    sections: readonly MirrorSection[];
+    notebooks: readonly NotebookStructureWrite[];
+    sectionGroups: readonly SectionGroupStructureWrite[];
+    sections: readonly SectionStructureWrite[];
   }): Promise<void>;
   listSectionsToSync(): Promise<MirrorSection[]>;
   listAllSectionGroups(): Promise<MirrorSectionGroup[]>;
@@ -119,9 +146,16 @@ export interface SyncStore {
   setChildGroupsKnown(groupId: string, known: boolean): Promise<void>;
   getPage(pageId: string): Promise<MirrorPage | null>;
   putPage(page: MirrorPage, content: MirrorPageContent | null): Promise<void>;
+  putPageMetadata(page: PageMetadataWrite): Promise<void>;
   deletePage(tombstone: MirrorTombstone): Promise<void>;
-  listPageIdsInSection(sectionId: string): Promise<string[]>;
+  listPageDigestsInSection(sectionId: string): Promise<PageStamp[]>;
 }
+
+/** The fields a short-circuited page write corrects without touching stored content. */
+export type PageMetadataWrite = Pick<
+  MirrorPage,
+  'id' | 'title' | 'titleLower' | 'sectionId' | 'notebookId' | 'sectionPath' | 'lastModifiedDateTime'
+>;
 
 export interface SyncDeps {
   readonly graph: SyncGraph;
@@ -147,6 +181,16 @@ export interface SyncReport {
   readonly pagesUpdated: number;
   readonly pagesDeleted: number;
   readonly pagesFailed: number;
+  /**
+   * Pages the listing named whose stored copy Graph already describes exactly.
+   *
+   * The saving, reported rather than hidden: each one is a content request not spent
+   * against the hourly 400. A run whose `pagesSkipped` collapses to zero while
+   * `sectionsVisited` holds steady is the signature of the skip having stopped working —
+   * a changed field on the page document, or a `contentSyncedAt` that stopped being
+   * written — which nothing else in the report would show.
+   */
+  readonly pagesSkipped: number;
   /** Selected notebook ids matching no notebook. A mistyped id is silent otherwise. */
   readonly unknownNotebookIds: number;
   /** Active notebook ids matching no notebook. */
@@ -196,9 +240,9 @@ class SyncBudget {
 // ---------------------------------------------------------------------------
 
 export interface BuiltStructure {
-  readonly notebooks: MirrorNotebook[];
-  readonly sectionGroups: MirrorSectionGroup[];
-  readonly sections: MirrorSection[];
+  readonly notebooks: NotebookStructureWrite[];
+  readonly sectionGroups: SectionGroupStructureWrite[];
+  readonly sections: SectionStructureWrite[];
   /** Selected notebook ids that matched no notebook in the tree. */
   readonly unknownNotebookIds: string[];
   /**
@@ -221,11 +265,20 @@ export interface BuiltStructure {
  * are in the selection. Without this, `list_notebooks` — which takes no arguments — and
  * an unscoped `search_pages` would answer confidently and partially from a mirror holding
  * 3 of 55 notebooks, and a partial answer that cannot be detected as partial is the
- * failure CLAUDE.md already names about truncated searches.
+ * failure docs/content.md already names about truncated searches.
  *
- * `childGroupsKnown` is false on every group here, because `$expand` reaches one level of
- * section group and a first-level group's nested groups are *absent from the response*
- * rather than known to be empty. The sweep sets it true.
+ * **It emits tree-owned fields only.** No `pagesSyncedThrough`, no `pageCount`, no
+ * `childGroupsKnown`, no `pendingWrites` — the tree read knows none of them, and a
+ * structure write that carried a default for one would reset hours of Graph requests.
+ * `NEW_SECTION_DEFAULTS` and `NEW_GROUP_DEFAULTS` in ./mirror-schema.ts are what a
+ * document gets the first time it appears, applied by the store on a create and never on
+ * an update. `childGroupsKnown: false` is the creation default for the reason its own
+ * docstring gives: `$expand` reaches one level of section group, so a new group's nested
+ * groups are absent from the response rather than known to be empty, and the sweep sets it
+ * true.
+ *
+ * Each document carries an `identity` built from those tree fields alone, which is what
+ * lets the store skip one that did not change.
  */
 export function buildStructure(
   tree: readonly ExpandedNotebook[],
@@ -234,25 +287,25 @@ export function buildStructure(
   const selected = new Set(selection.notebookIds);
   const seen = new Set<string>();
 
-  const notebooks: MirrorNotebook[] = [];
-  const sectionGroups: MirrorSectionGroup[] = [];
-  const sections: MirrorSection[] = [];
+  const notebooks: NotebookStructureWrite[] = [];
+  const sectionGroups: SectionGroupStructureWrite[] = [];
+  const sections: SectionStructureWrite[] = [];
 
   for (const notebook of tree) {
     seen.add(notebook.id);
     const mirrored = selected.has(notebook.id);
 
-    notebooks.push({
+    notebooks.push(withNotebookIdentity({
       id: notebook.id,
       displayName: notebook.displayName,
       mirrored,
       sectionCount: notebook.sections.length,
       sectionGroupCount: notebook.sectionGroups.length,
       graphLastModifiedDateTime: notebook.lastModifiedDateTime ?? null,
-    });
+    }));
 
     for (const section of notebook.sections) {
-      sections.push({
+      sections.push(withSectionIdentity({
         id: section.id,
         displayName: section.displayName,
         notebookId: notebook.id,
@@ -261,14 +314,12 @@ export function buildStructure(
         path: `${notebook.displayName} / ${section.displayName}`,
         mirrored,
         graphLastModifiedDateTime: section.lastModifiedDateTime ?? null,
-        pagesSyncedThrough: null,
-        pageCount: 0,
-      });
+      }));
     }
 
     for (const group of notebook.sectionGroups) {
       const groupPath = `${notebook.displayName} / ${group.displayName}`;
-      sectionGroups.push({
+      sectionGroups.push(withGroupIdentity({
         id: group.id,
         displayName: group.displayName,
         notebookId: notebook.id,
@@ -276,11 +327,10 @@ export function buildStructure(
         parentKind: 'notebook',
         mirrored,
         path: groupPath,
-        childGroupsKnown: false,
-      });
+      }));
 
       for (const section of group.sections) {
-        sections.push({
+        sections.push(withSectionIdentity({
           id: section.id,
           displayName: section.displayName,
           notebookId: notebook.id,
@@ -289,9 +339,7 @@ export function buildStructure(
           path: `${groupPath} / ${section.displayName}`,
           mirrored,
           graphLastModifiedDateTime: section.lastModifiedDateTime ?? null,
-          pagesSyncedThrough: null,
-          pageCount: 0,
-        });
+        }));
       }
     }
   }
@@ -309,26 +357,54 @@ export function buildStructure(
   };
 }
 
+// The three wrappers below exist so a field added to a tree-field type is a type error
+// here rather than a field silently missing from the identity — the object literal is
+// checked against the parameter type, and the identity is computed from the same value.
+
+function withNotebookIdentity(fields: NotebookTreeFields): NotebookStructureWrite {
+  return { ...fields, identity: notebookIdentity(fields) };
+}
+
+function withGroupIdentity(fields: SectionGroupTreeFields): SectionGroupStructureWrite {
+  return { ...fields, identity: groupIdentity(fields) };
+}
+
+function withSectionIdentity(fields: SectionTreeFields): SectionStructureWrite {
+  return { ...fields, identity: sectionIdentity(fields) };
+}
+
 /**
  * A hash of everything about the tree the mirror stores.
  *
- * An unchanged hash skips every structure write. The account has 55 notebooks and 568
- * sections; rewriting all of them every fifteen minutes would be millions of writes a
- * month for a tree that changes when someone adds a notebook. The timestamps are
- * deliberately **excluded** — they move constantly and are read from the live tree, not
- * from the stored copy, so including them would defeat the whole point.
+ * An unchanged hash skips `putStructure` entirely, so a run against an unchanged tree
+ * makes no Firestore query against the structure collections at all. The account has 55
+ * notebooks and 568 sections, and the tree changes when someone adds or renames one; a run
+ * every fifteen minutes would otherwise read all three collections each time.
+ *
+ * It is built from the same `identity` strings the documents themselves carry, so "the
+ * hash moved" and "this document changed" cannot disagree. The two answer different
+ * questions: the hash is the cheap check that decides whether to call `putStructure` at
+ * all, and the per-document identity decides what that call writes.
+ *
+ * That makes the hash **wider** than the one it replaced, which covered `id`,
+ * `displayName`, `parentId` and `mirrored` alone. `path`, `parentKind` and a notebook's
+ * two counts now move it too. More edits therefore trigger a structure pass — and that is
+ * a fix rather than a cost, because a pass now writes only the documents whose identity
+ * moved. Under the old wholesale write, widening the hash would have meant re-backfilling
+ * the selection over a moved section; a section renamed inside a group changes the `path`
+ * of nothing but itself.
+ *
+ * The timestamps are deliberately **excluded**, because they move constantly and would
+ * rewrite every document on every run. `reconcileStructure` therefore returns them
+ * separately, and `withLiveMtimes` overlays them onto the stored sections before
+ * `pickCandidates` reads them — without that overlay the stored copies freeze here and the
+ * sync goes blind.
  */
 export function structureHashOf(built: BuiltStructure): string {
   const hash = createHash('sha256');
-  for (const notebook of built.notebooks) {
-    hash.update(`n ${notebook.id} ${notebook.displayName} ${notebook.mirrored}\n`);
-  }
-  for (const group of built.sectionGroups) {
-    hash.update(`g ${group.id} ${group.displayName} ${group.parentId} ${group.mirrored}\n`);
-  }
-  for (const section of built.sections) {
-    hash.update(`s ${section.id} ${section.displayName} ${section.parentId} ${section.mirrored}\n`);
-  }
+  for (const notebook of built.notebooks) hash.update(`${notebook.identity}\n`);
+  for (const group of built.sectionGroups) hash.update(`${group.identity}\n`);
+  for (const section of built.sections) hash.update(`${section.identity}\n`);
   return hash.digest('hex');
 }
 
@@ -386,11 +462,21 @@ interface Tally {
   pagesUpdated: number;
   pagesDeleted: number;
   pagesFailed: number;
+  pagesSkipped: number;
   unknownNotebookIds: number;
   unknownActiveNotebookIds: number;
   sectionsSkippedInactive: number;
   treeRead: boolean;
   done: boolean;
+  /**
+   * Did any candidate section's page listing fail?
+   *
+   * Separate from `done` because the two say different things in the report: `done` false
+   * is what makes `runMode` answer `budget-exhausted`, and a 429 on one listing is not
+   * that. What they share is the consequence — this run did not scan every candidate, so
+   * `sectionsScannedThrough` must not advance past the section it missed.
+   */
+  sectionListingFailed: boolean;
 }
 
 /**
@@ -418,11 +504,13 @@ async function runMode(
     pagesUpdated: 0,
     pagesDeleted: 0,
     pagesFailed: 0,
+    pagesSkipped: 0,
     unknownNotebookIds: 0,
     unknownActiveNotebookIds: 0,
     sectionsSkippedInactive: 0,
     treeRead: false,
     done: true,
+    sectionListingFailed: false,
   };
 
   // Outside the try: a held lease must not be followed by a release that clears the
@@ -458,6 +546,7 @@ async function runMode(
     pagesUpdated: tally.pagesUpdated,
     pagesDeleted: tally.pagesDeleted,
     pagesFailed: tally.pagesFailed,
+    pagesSkipped: tally.pagesSkipped,
     unknownNotebookIds: tally.unknownNotebookIds,
     unknownActiveNotebookIds: tally.unknownActiveNotebookIds,
     sectionsSkippedInactive: tally.sectionsSkippedInactive,
@@ -482,6 +571,7 @@ async function runMode(
     pagesUpdated: report.pagesUpdated,
     pagesDeleted: report.pagesDeleted,
     pagesFailed: report.pagesFailed,
+    pagesSkipped: report.pagesSkipped,
     sectionsSkippedInactive: report.sectionsSkippedInactive,
     durationMs: report.durationMs,
   });
@@ -496,18 +586,18 @@ async function incrementalPass(ctx: PassContext): Promise<void> {
     return;
   }
 
-  const structureChanged = await reconcileStructure(ctx);
-  const reactivated = await reconcileActivity(ctx);
+  const structure = await reconcileStructure(ctx);
+  const wideScanNotebookIds = await reconcileSelection(ctx, structure.mirroredNotebookIds);
 
   const sections = await ctx.deps.store.listSectionsToSync();
   const { eligible, skippedInactive } = splitByActivity(sections, ctx.selection, true);
   ctx.tally.sectionsSkippedInactive = skippedInactive;
 
-  // `reactivated` nulled `sectionsScannedThrough` in the store, but `ctx.state` is a
-  // snapshot taken before that write, so tier 1 would still compare against the old
-  // cutoff on this very run — the run the reset exists to widen.
-  const state = reactivated ? { ...ctx.state, sectionsScannedThrough: null } : ctx.state;
-  const candidates = pickCandidates(eligible, state, ctx.tally.treeRead && !structureChanged);
+  const candidates = pickCandidates(eligible, structure.liveMtimes, {
+    state: ctx.state,
+    mayFilterByTimestamp: ctx.tally.treeRead,
+    wideScanNotebookIds,
+  });
 
   for (const section of candidates) {
     if (ctx.budget.exhausted) {
@@ -519,28 +609,57 @@ async function incrementalPass(ctx: PassContext): Promise<void> {
 
   // Only when every candidate completed. `sectionsScannedThrough` is what tier 1 compares
   // against, so advancing it after a partial run would make the next run skip the
-  // sections this one never reached.
-  if (ctx.tally.done && ctx.tally.treeRead) {
+  // sections this one never reached — whether the run stopped early (`done`) or carried
+  // on past a section whose listing failed (`sectionListingFailed`).
+  if (ctx.tally.done && ctx.tally.treeRead && !ctx.tally.sectionListingFailed) {
     await ctx.deps.store.patchSyncState({
       sectionsScannedThrough: ctx.startedAtIso,
+      // Cleared on exactly the condition that advances the cutoff, and for the same
+      // reason. A run stopped by its budget has not visited the sections it was widened
+      // for, and clearing the set there would put them back below a cutoff that only
+      // moves forward.
+      wideScanNotebookIds: [],
       backfillComplete: sections.every((section) => section.pagesSyncedThrough !== null),
     });
   }
 }
 
+/** Section `lastModifiedDateTime` as one tree read saw it, by section id. */
+export type SectionMtimes = ReadonlyMap<string, string | null>;
+
+/**
+ * What one structure pass learned.
+ *
+ * Empty timestamps mean no tree read happened — the budget was exhausted, or the read
+ * failed.
+ */
+interface StructureResult {
+  readonly liveMtimes: SectionMtimes;
+  /**
+   * The selected notebooks the tree returned, which is not `selection.notebookIds`: an id
+   * in the selection that no notebook in the tree carries is an `unknownNotebookIds` entry
+   * and is absent here.
+   */
+  readonly mirroredNotebookIds: readonly string[];
+}
+
 /**
  * Read the tree and write the structure, or carry on without it.
  *
- * Returns true when the structure was rewritten. A failed tree read is logged and
- * survived: `$expand` on `/notebooks` was measured unavailable for minutes at a time on
- * 2026-08-19 while un-expanded calls answered 200, and refusing to sync pages because
- * the structure read failed would skip a whole poll cycle over the slowest-changing
- * thing in the account.
+ * A failed tree read is logged and survived: `$expand` on `/notebooks` was measured
+ * unavailable for minutes at a time on 2026-08-19 while un-expanded calls answered 200,
+ * and refusing to sync pages because the structure read failed would skip a whole poll
+ * cycle over the slowest-changing thing in the account.
  */
-async function reconcileStructure(ctx: PassContext): Promise<boolean> {
+async function reconcileStructure(ctx: PassContext): Promise<StructureResult> {
+  const none: StructureResult = {
+    liveMtimes: new Map(),
+    mirroredNotebookIds: [],
+  };
+
   if (ctx.budget.exhausted) {
     ctx.tally.done = false;
-    return false;
+    return none;
   }
 
   ctx.budget.take();
@@ -551,12 +670,21 @@ async function reconcileStructure(ctx: PassContext): Promise<boolean> {
     if (!(err instanceof GraphRequestError)) throw err;
     logEvent('sync-tree-failed', { status: err.status, reason: reasonOf(err) });
     await ctx.deps.store.patchSyncState({ lastTreeFailureAt: ctx.startedAtIso });
-    return false;
+    return none;
   }
 
   ctx.tally.treeRead = true;
 
   const built = buildStructure(tree, ctx.selection);
+
+  // Taken whether or not the hash moved. This is the whole fix: `structureHashOf`
+  // excludes timestamps on purpose, so when the hash matches nothing writes them and the
+  // stored copies stay at whatever the last structure rewrite recorded.
+  const liveMtimes: SectionMtimes = new Map(
+    built.sections.map((section) => [section.id, section.graphLastModifiedDateTime]),
+  );
+  const mirroredNotebookIds = built.notebooks.filter((n) => n.mirrored).map((n) => n.id);
+
   ctx.tally.unknownNotebookIds = built.unknownNotebookIds.length;
   if (built.unknownNotebookIds.length > 0) {
     // Ids only in the count, never the ids themselves — a notebook id is opaque, but the
@@ -570,62 +698,91 @@ async function reconcileStructure(ctx: PassContext): Promise<boolean> {
   }
 
   const hash = structureHashOf(built);
-  if (hash === ctx.state.structureHash) return false;
+  if (hash === ctx.state.structureHash) {
+    return { liveMtimes, mirroredNotebookIds };
+  }
 
   await ctx.deps.store.putStructure(built);
   await ctx.deps.store.patchSyncState({ structureHash: hash });
-  return true;
+  return { liveMtimes, mirroredNotebookIds };
 }
 
 /**
- * Notice a change to the active set, and widen this run so re-activation works.
+ * Record the selection lists, and name the notebooks a change to them has to widen.
  *
- * Returns true when the set changed. Without this a re-activated notebook would never be
- * re-checked: tier 1 of `pickCandidates` skips a section whose
- * `graphLastModifiedDateTime` is older than `overlapFrom(state.sectionsScannedThrough)`,
- * and that cutoff advances on every completed run. A section last edited three months
- * ago, while its notebook was inactive, is older than the cutoff for ever.
+ * Returns the notebooks whose sections bypass tier 1 of `pickCandidates` this run: the
+ * set carried in the state document, plus whatever this run's diff added. Without it a
+ * notebook just mirrored or just activated would never be re-checked — tier 1 skips a
+ * section whose `graphLastModifiedDateTime` is older than
+ * `overlapFrom(state.sectionsScannedThrough, SECTION_SCAN_OVERLAP_MS)`, and that cutoff
+ * advances on every completed run, so a section last edited three months ago while its
+ * notebook was frozen is older than the cutoff for ever.
  *
- * Nulling the watermark costs one wide run: `overlapFrom(null)` is the epoch, so every
- * mirrored active section becomes a candidate. Each still lists only its own changes,
- * against its own per-section watermark, which this does not touch — so the cost is one
- * `listPagesChangedSince` per section and no page re-fetches. The run is budget-bounded
- * and resumable like any other.
+ * `sectionsScannedThrough` is deliberately not touched. Nulling it is what this replaced,
+ * and it is a global value: one activation made every mirrored active section a
+ * candidate, which is one `listPagesChangedSince` per section of the whole selection —
+ * about 70 requests on this account, against an hourly budget of 400, for a change that
+ * concerned one notebook.
+ *
+ * Only candidacy is widened. Each named notebook's sections still list against their own
+ * `pagesSyncedThrough`, which nothing here touches, so no page is re-fetched that has not
+ * changed.
+ *
+ * A state document written before these fields existed carries
+ * `mirroredNotebookIdsSeen: null`, and both schema functions read that as "never
+ * recorded": `notebooksNeedingWideScan` answers `[]` and `selectionMatchesSeen` answers
+ * false, so the first run after the deploy records the lists and widens nothing. That is
+ * the general path rather than a branch of its own.
+ *
+ * A run that read no tree records nothing, and that is not tidiness. `mirroredNotebookIds`
+ * is empty on such a run — the budget ran out before the read, or `getExpandedTree`
+ * answered the 500 measured on 2026-08-19 — so the `activeNotebookIds === null` case would
+ * resolve "every mirrored notebook is active" to the empty set, find nothing newly active,
+ * and still write `activeNotebookIdsSeen: null`. The next healthy run would then diff
+ * `null` against `null`, find nothing, and the notebook the operator just unfroze would
+ * stay below the cutoff for ever. Recording is never urgent; the next run with a tree
+ * diffs correctly.
  */
-async function reconcileActivity(ctx: PassContext): Promise<boolean> {
-  const hash = activeSelectionHashOf(ctx.selection);
-  const stored = ctx.state.activeSelectionHash;
-  if (hash === stored) return false;
+async function reconcileSelection(
+  ctx: PassContext,
+  mirroredNotebookIds: readonly string[],
+): Promise<ReadonlySet<string>> {
+  const carried = new Set(ctx.state.wideScanNotebookIds);
+  if (!ctx.tally.treeRead) return carried;
 
-  // A null stored hash is a state document written before this field existed, not a
-  // change to the active set. Nothing was skipped for inactivity under it, so there is
-  // nothing to widen — record the hash and leave the watermark alone. Resetting here
-  // instead would make the first run after every deploy a full-width scan.
-  if (stored === null) {
-    await ctx.deps.store.patchSyncState({ activeSelectionHash: hash });
-    return false;
+  // Recorded from the selection document verbatim, while the `null` active list resolves
+  // through the tree. The two domains differ: an id naming no notebook is in the first and
+  // not the second, so a diff against it can only ever under-report, never widen something
+  // that does not exist.
+  const recorded = {
+    mirroredNotebookIdsSeen: [...ctx.selection.notebookIds],
+    activeNotebookIdsSeen:
+      ctx.selection.activeNotebookIds === null ? null : [...ctx.selection.activeNotebookIds],
+  };
+
+  const seen = {
+    mirrored: ctx.state.mirroredNotebookIdsSeen,
+    active: ctx.state.activeNotebookIdsSeen,
+  };
+  const added = notebooksNeedingWideScan(seen, ctx.selection, mirroredNotebookIds);
+  // Both halves, because a removal widens nothing and still has to be recorded: a run that
+  // wrote only when it had something to widen would leave the deactivated notebook in
+  // `activeNotebookIdsSeen`, and re-activating it later would diff against a list it is
+  // already in. On a steady account this is the branch every run takes, and it costs no
+  // write.
+  if (added.length === 0 && selectionMatchesSeen(seen, ctx.selection)) return carried;
+
+  const widened = new Set([...carried, ...added]);
+  await ctx.deps.store.patchSyncState({ ...recorded, wideScanNotebookIds: [...widened] });
+  if (added.length > 0) {
+    // A count rather than the ids: a notebook id is opaque and this line reaches a public
+    // log, and the count is what says whether one edit widened one notebook or fifty. A
+    // removal reaches here to be recorded and logs nothing, because it widened nothing.
+    logEvent('mirror-selection-widened', { count: added.length });
   }
-
-  await ctx.deps.store.patchSyncState({
-    sectionsScannedThrough: null,
-    activeSelectionHash: hash,
-  });
-  return true;
+  return widened;
 }
 
-/**
- * Which sections this run visits.
- *
- * With `sectionRollUpTrusted` — the default, on the strength of the 2026-08-19 probe —
- * only sections whose timestamp moved past the overlap window, plus any never synced.
- * Without it, or when the tree read failed so the stored timestamps are stale, every
- * mirrored section. `listSectionsToSync` already returns them oldest-watermark-first, so
- * a budget-bounded run round-robins rather than starving the tail.
- *
- * A section with no `graphLastModifiedDateTime` is always a candidate. "The field is
- * absent" and "the timestamp cannot be relied on" have to behave identically, or a
- * service that quietly stopped returning it would silently stop the mirror updating.
- */
 /**
  * Split sections into the ones this run may visit and a count of what it declined.
  *
@@ -662,31 +819,102 @@ export function splitByActivity(
 }
 
 /**
- * A hash of the active set alone, so a change to it is detectable across runs.
+ * Stored sections carrying this run's observed timestamps.
  *
- * Over the active ids only, not the whole selection: a change to `notebookIds` already
- * moves the structure hash and rewrites the structure. The sentinel for "no active set
- * named" has to be a value no id list can produce, because `null` and `[]` mean opposite
- * things here.
+ * A section absent from `live` keeps its stored value rather than losing it. That case is
+ * only reachable when no tree read happened — the budget was exhausted, or the read
+ * failed — and `mayFilterByTimestamp` is false then, so `pickCandidates` returns
+ * everything regardless.
+ *
+ * A live entry of `null` is Graph reporting no timestamp on the section, and it overwrites
+ * the stored value like any other observation. Falling back to the stored one there would
+ * be the frozen-timestamp bug reached through a narrower door.
  */
-export function activeSelectionHashOf(selection: NotebookSelection): string {
-  if (selection.activeNotebookIds === null) return 'all';
-
-  const hash = createHash('sha256');
-  for (const id of [...selection.activeNotebookIds].sort()) hash.update(`${id}\n`);
-  return hash.digest('hex');
+export function withLiveMtimes(
+  sections: readonly MirrorSection[],
+  live: SectionMtimes,
+): MirrorSection[] {
+  return sections.map((section) => {
+    const observed = live.get(section.id);
+    return observed === undefined ? section : { ...section, graphLastModifiedDateTime: observed };
+  });
 }
 
+/**
+ * The three decisions `pickCandidates` makes its filter from, named at the call site.
+ *
+ * An options object rather than three more positional parameters: a `ReadonlySet<string>`
+ * beside a `boolean` and a state object has no self-evident order. `sections` and `live`
+ * stay positional because they are the data being filtered and the overlay applied to it,
+ * and their types say which is which.
+ */
+export interface CandidateOptions {
+  readonly state: MirrorSyncState;
+  readonly mayFilterByTimestamp: boolean;
+  /** Notebooks whose sections skip the timestamp cutoff; see `reconcileSelection`. */
+  readonly wideScanNotebookIds: ReadonlySet<string>;
+}
+
+/**
+ * The sections worth listing this run.
+ *
+ * The timestamps compared are `live` — what this run's tree read saw — overlaid onto the
+ * stored sections here rather than by the caller, because a call site that forgot the
+ * overlay would filter on stored values that only move when the structure is rewritten,
+ * and the sync would go blind an hour after the last rewrite with nothing to say so.
+ *
+ * `mayFilterByTimestamp` means the timestamps compared are this run's rather than a stored
+ * copy that has frozen, so both call sites pass `ctx.tally.treeRead` and nothing else.
+ *
+ * It used to be `treeRead && !structure.rewritten` in the incremental pass, and that was
+ * the bug this replaced: `notebookIdentity` carries `mirrored`, so editing `notebookIds`
+ * moves the structure hash, and a moved hash returned every observed section here — before
+ * the wide-scan clause was reached at all. One notebook added to the selection therefore
+ * listed every mirrored active section in the account, which is what the per-notebook set
+ * exists to stop.
+ *
+ * Each reason a structure change used to need a wide pass is now covered by a narrower
+ * rule. A section the tree just gained is created with `pagesSyncedThrough: null` from
+ * `NEW_SECTION_DEFAULTS`, so the null-watermark clause below takes it. A section whose
+ * notebook just became mirrored or active is the wide-scan set's job. A renamed section
+ * keeps a watermark no structure write touches, and a rename changes no page.
+ *
+ * A section moved between notebooks brings no watermark with it. Measured 2026-08-21 and
+ * recorded in `api-overview.md`, "Moving a section reissues its id across notebooks and
+ * keeps it within one": the OneNote client reissues a section's Graph id when it changes
+ * notebook, and keeps it when the section is only reparented under a section group in the
+ * same notebook. So the old id is absent from the next tree read, its document is deleted
+ * by absence, and the new id creates a document with `pagesSyncedThrough: null` — the
+ * null-watermark clause below, which no cutoff and no activity filter can decline. The
+ * class this docstring used to record as knowingly uncovered, a section carrying arrears
+ * into a mirrored active notebook, is unreachable.
+ *
+ * The cost that replaces it: a cross-notebook move re-backfills that section in full, every
+ * page fetched again under its new id and every page document under the old id deleted.
+ * Correct and self-healing, and a section's worth of requests against the hourly budget.
+ *
+ * Two sections are always candidates whatever the clock says: one never synced
+ * (`pagesSyncedThrough === null`), and one Graph reports no timestamp for — "the field is
+ * absent" and "the roll-up cannot be trusted" have to be the same branch, or a service
+ * that quietly stopped returning it would silently stop the mirror updating.
+ */
 export function pickCandidates(
   sections: readonly MirrorSection[],
-  state: MirrorSyncState,
-  timestampsAreFresh: boolean,
+  live: SectionMtimes,
+  options: CandidateOptions,
 ): MirrorSection[] {
-  if (!state.sectionRollUpTrusted || !timestampsAreFresh) return [...sections];
+  const { state, mayFilterByTimestamp, wideScanNotebookIds } = options;
+  const observed = withLiveMtimes(sections, live);
+  if (!state.sectionRollUpTrusted || !mayFilterByTimestamp) return observed;
 
-  const since = overlapFrom(state.sectionsScannedThrough);
-  return sections.filter(
+  const since = overlapFrom(state.sectionsScannedThrough, SECTION_SCAN_OVERLAP_MS);
+  return observed.filter(
     (section) =>
+      // First, because it is the only clause that can be true of a section every other
+      // one declines. A notebook just mirrored or just activated holds sections whose
+      // timestamps predate the cutoff by months, and the cutoff only advances, so nothing
+      // else would ever make them candidates again.
+      wideScanNotebookIds.has(section.notebookId) ||
       section.pagesSyncedThrough === null ||
       section.graphLastModifiedDateTime === null ||
       section.graphLastModifiedDateTime >= since,
@@ -694,7 +922,13 @@ export function pickCandidates(
 }
 
 /**
- * One section: list what changed, fetch each changed page, then advance the watermark.
+ * One section: list what changed, fetch the pages the mirror is behind on, then advance
+ * the watermark.
+ *
+ * Not every listed page is fetched. The listing carries each page's stamp and title, and
+ * `storedPageIsCurrent` decides from those whether the stored copy already matches — which
+ * is what the watermark overlap costs and what this saves, because the overlap re-lists
+ * every page edited in the last hour on every run.
  *
  * The watermark moves only after the whole changed set landed. A failure part-way leaves
  * it where it was, so the next run retries the section rather than skipping the pages it
@@ -709,6 +943,13 @@ async function syncSection(ctx: PassContext, section: MirrorSection): Promise<vo
   } catch (err) {
     logEvent('sync-section-failed', { sectionId: section.id, reason: reasonOf(err) });
     ctx.tally.pagesFailed += 1;
+    // Recorded, because otherwise the section-scan cutoff advances past a section this
+    // run never listed. Tier 1 of `pickCandidates` then has `SECTION_SCAN_OVERLAP_MS` to
+    // catch it, and a section whose Graph timestamp is older than that window drops out
+    // of the candidate set for good — its watermark stuck behind its real edits until the
+    // nightly full sweep. Holding the cutoff costs the next run a re-list of the sections
+    // inside the window, which is the price of one transient 429.
+    ctx.tally.sectionListingFailed = true;
     return;
   }
 
@@ -716,12 +957,38 @@ async function syncSection(ctx: PassContext, section: MirrorSection): Promise<vo
 
   for (const summary of changed) {
     // Checked before each page rather than only per section: 120 resvg renders on a
-    // 1-CPU instance is what is most likely to overrun the wall clock.
+    // 1-CPU instance is what is most likely to overrun the wall clock. It is checked
+    // ahead of the skip too, because the budget bounds wall clock as well as requests and
+    // a section left half-visited has to report `done: false` so its watermark stays put.
     if (ctx.budget.exhausted) {
       ctx.tally.done = false;
       return;
     }
-    await syncPage(ctx, section, summary);
+
+    // The saving this pass exists for. The listing already carried the stamp and the
+    // title, so a page Graph describes exactly as the mirror already holds it needs no
+    // content request — and the content request is the resource under the hourly 400,
+    // where the write, the blob and the resvg render that `writePageFromRaw`'s
+    // short-circuit already saves are not. With an hour of watermark overlap, every page
+    // edited in the last hour was otherwise re-fetched by every run for the next hour.
+    //
+    // The document read here is handed to `writePageFromRaw`, so a page that is *not*
+    // skipped is still read from Firestore exactly once.
+    const stored = await ctx.deps.store.getPage(summary.id);
+    if (stored !== null && storedPageIsCurrent(stored, summary, section.id)) {
+      ctx.tally.pagesSkipped += 1;
+      continue;
+    }
+
+    const written = await syncPage(ctx, section, summary, stored);
+
+    // Only a page that was *written* counts. One the overlap re-read and found unchanged
+    // is what the window costs, not what it saves, and logging it here would produce
+    // evidence arguing to keep a window that is catching nothing.
+    if (written) {
+      const ageMs = overlapSaveAgeMs(section.pagesSyncedThrough, summary.lastModifiedDateTime);
+      if (ageMs !== null) logEvent('sync-overlap-save', { ageMs });
+    }
   }
 
   await ctx.deps.store.setSectionWatermark(section.id, ctx.startedAtIso);
@@ -777,12 +1044,17 @@ function cutOffAt(pages: readonly PageSummary[], since: string): PageSummary[] {
  *
  * A 404 is not an error. The page was deleted between the listing and the fetch, which
  * is the issue's "lazy tombstoning" and comes free on this path.
+ *
+ * Returns true only when a page document was written. A deletion, a failure, and a copy
+ * the short-circuit found already current are all false. `syncSection` reads it to decide
+ * whether the watermark overlap earned its cost on this page.
  */
 async function syncPage(
   ctx: PassContext,
   section: MirrorSection,
   summary: PageSummary,
-): Promise<void> {
+  stored?: MirrorPage | null,
+): Promise<boolean> {
   ctx.budget.take();
 
   let raw: RawPageContent;
@@ -791,21 +1063,24 @@ async function syncPage(
   } catch (err) {
     if (err instanceof GraphRequestError && err.status === 404) {
       await deletePage(ctx, summary.id, section, 'not-found');
-      return;
+      return false;
     }
     logEvent('mirror-page-failed', { pageId: summary.id, reason: reasonOf(err) });
     ctx.tally.pagesFailed += 1;
-    return;
+    return false;
   }
 
   try {
     // Only counted when something was actually written. A page re-read because it fell
     // inside the watermark overlap and found unchanged is not an update, and reporting
     // it as one would make every run look busy and hide a sync that had stopped working.
-    if (await storePage(ctx, section, summary, raw)) ctx.tally.pagesUpdated += 1;
+    if (!(await storePage(ctx, section, summary, raw, stored))) return false;
+    ctx.tally.pagesUpdated += 1;
+    return true;
   } catch (err) {
     logEvent('mirror-page-failed', { pageId: summary.id, reason: reasonOf(err) });
     ctx.tally.pagesFailed += 1;
+    return false;
   }
 }
 
@@ -815,6 +1090,7 @@ async function storePage(
   section: MirrorSection,
   summary: PageSummary,
   raw: RawPageContent,
+  stored?: MirrorPage | null,
 ): Promise<boolean> {
   const written = await writePageFromRaw(
     { store: ctx.deps.store, blobs: ctx.deps.blobs },
@@ -824,6 +1100,7 @@ async function storePage(
     () => {
       ctx.tally.pagesFailed += 1;
     },
+    stored,
   );
   return written;
 }
@@ -845,7 +1122,7 @@ function placementOf(section: MirrorSection): PagePlacement {
 
 /** The narrow slice both the sync and a post-write resync write through. */
 export interface PageWriteDeps {
-  readonly store: Pick<SyncStore, 'getPage' | 'putPage'>;
+  readonly store: Pick<SyncStore, 'getPage' | 'putPage' | 'putPageMetadata'>;
   readonly blobs: MirrorBlobWriter;
 }
 
@@ -867,6 +1144,12 @@ export async function writePageFromRaw(
   summary: PageSummary,
   raw: RawPageContent,
   onInkFailure: () => void = () => {},
+  /**
+   * The stored document, when the caller has already read it. `undefined` means "read it
+   * here"; `null` means "there is none". `syncSection`'s pre-check has always just read
+   * one, and a second read would double the Firestore cost of every page it does not skip.
+   */
+  known?: MirrorPage | null,
 ): Promise<boolean> {
   const html = pageHtml(raw) ?? '';
   const hash = createHash('sha256').update(html).digest('hex');
@@ -882,7 +1165,7 @@ export async function writePageFromRaw(
   //
   // `lastModifiedDateTime` is deliberately NOT compared. It moves on every write, so
   // including it would rewrite every page the overlap re-read and defeat the whole point.
-  const stored = await deps.store.getPage(summary.id);
+  const stored = known === undefined ? await deps.store.getPage(summary.id) : known;
   if (
     stored !== null &&
     stored.contentState === 'present' &&
@@ -890,6 +1173,43 @@ export async function writePageFromRaw(
     stored.title === summary.title &&
     stored.sectionId === placement.sectionId
   ) {
+    // The content is right. Two other things may not be, and both have to be corrected
+    // here or nowhere.
+    //
+    // The stamp: `resyncPage` writes this process's clock into `lastModifiedDateTime`,
+    // nothing above compares that field, and the string is printed in every tool result.
+    // The sweep re-fetches any page whose stored stamp disagrees with Graph's, so without
+    // this write the local value is permanent and that page is fetched again on every
+    // sweep, for ever.
+    //
+    // `contentSyncedAt`: the settle guard in `storedPageIsCurrent` refuses a copy that
+    // cannot be shown to have been taken well after Graph's stamp, and `putPageMetadata`
+    // is the only thing that refreshes that field on a page nothing rewrote. Without this
+    // clause a refused copy was fetched, found identical, written nowhere, and refused
+    // again on the next run — one Graph content request per run per page for the whole
+    // hour-wide listing window, on the freshest pages in the account, invisible in a run
+    // report because `pagesUpdated` and `pagesSkipped` both stay at zero. Every page
+    // document written before `contentSyncedAt` existed has that shape.
+    //
+    // An empty live stamp is `toPageSummary`'s fallback for a field Graph did not send and
+    // must not overwrite a good stored one. Such a page fails the settle guard for ever —
+    // `Date.parse('')` is NaN — and is re-read once per run; that is the documented price
+    // of never hiding an edit, and no page Graph stamps ever pays it.
+    if (
+      summary.lastModifiedDateTime !== '' &&
+      (summary.lastModifiedDateTime !== stored.lastModifiedDateTime ||
+        !contentCopyIsSettled(stored.contentSyncedAt, summary.lastModifiedDateTime))
+    ) {
+      await deps.store.putPageMetadata({
+        id: summary.id,
+        title: summary.title,
+        titleLower: summary.title.toLowerCase(),
+        sectionId: placement.sectionId,
+        notebookId: placement.notebookId,
+        sectionPath: placement.sectionPath,
+        lastModifiedDateTime: summary.lastModifiedDateTime,
+      });
+    }
     return false;
   }
 
@@ -985,16 +1305,17 @@ async function deletePage(
 // ---------------------------------------------------------------------------
 
 /**
- * Enumerate page ids per section and reconcile them against the mirror.
+ * Enumerate each section's pages and reconcile them against the mirror: deletions,
+ * stamp disagreements, and discoveries.
  *
  * `unscoped` false sweeps only sections whose timestamp moved since the last sweep,
  * which the probe supports — a delete moves it. `unscoped` true sweeps every mirrored
  * section, and is the weekly backstop against the timestamp missing something.
  *
- * The sweep also queues ids Graph has that the mirror lacks. A page *moved into* a
- * mirrored section may not have its own `lastModifiedDateTime` bumped by the move — the
- * same class of unknown as the section roll-up — so without this it would be invisible
- * until someone next edited it.
+ * The sweep also queues pages Graph has that the mirror lacks. Measured 2026-08-21, a page
+ * moved between sections keeps the `lastModifiedDateTime` it already had, so it sits below
+ * every later section watermark and `listPagesChangedSince` never returns it. Without this
+ * loop it would be invisible until someone next edited it.
  */
 async function sweepPass(
   ctx: PassContext,
@@ -1003,14 +1324,13 @@ async function sweepPass(
 ): Promise<void> {
   if (ctx.selection.notebookIds.length === 0) return;
 
-  await reconcileStructure(ctx);
+  const structure = await reconcileStructure(ctx);
   await learnNestedGroups(ctx);
 
   const stored = await ctx.deps.store.listSectionsToSync();
 
-  // `includeBackfill` is false: a sweep reconciles page ids against a section it has
-  // already filled, and a never-synced section in an inactive notebook is the
-  // incremental pass's job. `sweep-all` skips the filter entirely, which is what it is
+  // `includeBackfill` is false: a sweep reconciles a section it has already filled, and a
+  // never-synced section in an inactive notebook is the incremental pass's job. `sweep-all` skips the filter entirely, which is what it is
   // for.
   let all = stored;
   if (activeOnly) {
@@ -1019,19 +1339,42 @@ async function sweepPass(
     ctx.tally.sectionsSkippedInactive = split.skippedInactive;
   }
 
-  const sections = unscoped ? all : pickCandidates(all, ctx.state, ctx.tally.treeRead);
+  const sections = unscoped
+    ? all
+    : pickCandidates(all, structure.liveMtimes, {
+        state: ctx.state,
+        mayFilterByTimestamp: ctx.tally.treeRead,
+        // Read, never cleared: a sweep reconciles a section's pages against Graph rather
+        // than resuming a watermark, so it is not what the widening is waiting for.
+        wideScanNotebookIds: new Set(ctx.state.wideScanNotebookIds),
+      });
 
   const resumeAt = ctx.state.sweepCursorSectionId;
   const start = resumeAt === null ? 0 : Math.max(0, sections.findIndex((s) => s.id === resumeAt));
 
   for (let index = start; index < sections.length; index += 1) {
     const section = sections[index] as MirrorSection;
+
+    // Nothing started here, so the cursor names this section and the next run begins with
+    // it.
     if (ctx.budget.exhausted) {
       ctx.tally.done = false;
       await ctx.deps.store.patchSyncState({ sweepCursorSectionId: section.id });
       return;
     }
-    await sweepSection(ctx, section);
+
+    // Started and cut short part-way through its pages, so the cursor has to name *this*
+    // section too. Writing the next one — which is what recording the cursor only at the
+    // top of the loop did — leaves the interrupted section half reconciled, and nothing
+    // returns to it until the cursor reaches the end of the list and resets, several runs
+    // later. It is the section that most needed the visit: the budget ran out inside it
+    // because it had the most to do. The first `/sync/sweep/full` after a deploy is when
+    // that is likeliest, because every page `resyncPage` ever wrote carries a local
+    // `…000Z` stamp that disagrees with Graph's spelling and so costs a content fetch.
+    if (!(await sweepSection(ctx, section))) {
+      await ctx.deps.store.patchSyncState({ sweepCursorSectionId: section.id });
+      return;
+    }
   }
 
   await ctx.deps.store.patchSyncState({ sweepCursorSectionId: null });
@@ -1066,54 +1409,106 @@ async function learnNestedGroups(ctx: PassContext): Promise<void> {
 }
 
 /**
- * One section's id reconciliation.
+ * One section's page reconciliation: deletions, stamp disagreements, and discoveries.
  *
- * **A failed enumeration deletes nothing.** An auth failure or a 500 would otherwise
- * empty the mirror one section at a time, and nothing about a deleted page is
- * recoverable from here. That is the single most important line in this file.
+ * **A failed enumeration deletes nothing and fetches nothing.** An auth failure or a 500
+ * would otherwise empty the mirror one section at a time, and nothing about a deleted
+ * page is recoverable from here. That is the single most important line in this file.
+ *
+ * Returns false only when the budget cut the section short part-way through its pages,
+ * which is what `sweepPass` needs to write a resume cursor that names this section rather
+ * than the next one. A failed enumeration returns true: it is logged, it reconciled
+ * nothing, and the sweep carries on to the sections after it exactly as before.
  */
-async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<void> {
+async function sweepSection(ctx: PassContext, section: MirrorSection): Promise<boolean> {
   ctx.budget.take();
 
-  let live: string[];
+  let live: PageSummary[];
   try {
-    live = await ctx.deps.graph.listPageIds(section.id);
+    live = await ctx.deps.graph.listPageSummaries(section.id);
   } catch (err) {
     logEvent('sync-section-failed', { sectionId: section.id, reason: reasonOf(err) });
     ctx.tally.pagesFailed += 1;
-    return;
+    return true;
   }
 
   ctx.tally.sectionsVisited += 1;
 
-  const liveIds = new Set(live);
-  const mirrored = await ctx.deps.store.listPageIdsInSection(section.id);
+  const liveById = new Map(live.map((page) => [page.id, page]));
+  const mirrored = await ctx.deps.store.listPageDigestsInSection(section.id);
 
-  for (const pageId of mirrored) {
-    if (!liveIds.has(pageId)) await deletePage(ctx, pageId, section, 'sweep');
-  }
-
-  // Ids Graph has that the mirror lacks — new, or moved in. Fetched now, budget
-  // permitting; anything left is picked up by the next incremental, because this
-  // section's watermark is deliberately not advanced here.
-  const mirroredIds = new Set(mirrored);
-  for (const pageId of live) {
-    if (mirroredIds.has(pageId)) continue;
+  for (const stored of mirrored) {
+    // Bounded, like the discovery loop below it. A deletion is two Firestore writes the
+    // request budget does not otherwise see, and a stamp disagreement now costs a Graph
+    // request as well — so without this check one section could spend a content fetch per
+    // mirrored page in it, against 400 an hour shared with every interactive tool call.
+    // The first sweep after a deploy is when both are most widespread. An early return
+    // skips `setSectionSweepResult`, so this section is not recorded as swept, and
+    // `done: false` is what makes the run report `budget-exhausted` rather than a clean
+    // pass.
     if (ctx.budget.exhausted) {
       ctx.tally.done = false;
-      return;
+      return false;
     }
-    await syncPage(ctx, section, {
-      id: pageId,
-      title: '',
-      lastModifiedDateTime: new Date(0).toISOString(),
-    });
+
+    const match = liveById.get(stored.id);
+
+    if (match === undefined) {
+      await deletePage(ctx, stored.id, section, 'sweep');
+      continue;
+    }
+
+    // Matched, so it is not a discovery. Removing it leaves `liveById` holding exactly
+    // the pages Graph has that the mirror lacks, which is what the loop below wants.
+    liveById.delete(stored.id);
+
+    // The sweep's second job: the listing disagrees with the stored copy, so re-read the
+    // page. `pageListingDiffers` compares the stamp *and* the title, and the title half is
+    // what makes the sweep able to see a rename at all: measured 2026-08-21
+    // (api-overview.md), a rename moves no `lastModifiedDateTime`, and the incremental
+    // never lists a page whose stamp is below the section watermark — so a stamp-only
+    // comparison here left a page renamed outside this server carrying its old title in the
+    // mirror for ever, which is the field every listing and every by-name lookup matches
+    // on. The reachable route needs nothing unmeasured: `update_page_title` marks the page
+    // stale without touching its stamp, the PATCH renames it without moving the stamp, and
+    // a `resyncPage` that hit a transient failure is documented as non-fatal.
+    //
+    // The disagreement is a hint and nothing more — `writePageFromRaw` compares the content
+    // hash, the title and the section and writes only if something actually changed, and
+    // corrects the stored stamp when nothing did, which is what stops the next sweep asking
+    // again.
+    //
+    // **This must not become a stale mark.** `markPageStale` deletes the page-content
+    // document, and nothing re-fetches a stale page: the incremental will not list a page
+    // whose Graph stamp is behind the section watermark, no read path writes to the
+    // mirror, and a mark is therefore permanent. `resyncPage` stamps this process's clock,
+    // so a page written through this server is stored *ahead* of Graph — one sweep could
+    // delete the mirrored content of every page the server has ever written. A re-fetch
+    // repairs that case instead of destroying it, which is why the comparison needs no
+    // direction test and no tolerance, and why no edit is too small for it to notice.
+    //
+    // It also subsumes the pre-2026-08-21 discovered pages, which carry `title: ''` and
+    // `new Date(0)`: the epoch disagrees with anything Graph sends, and the re-fetch writes
+    // both fields from Graph's listing.
+    if (pageListingDiffers(stored, match)) await syncPage(ctx, section, match);
+  }
+
+  // Pages Graph has that the mirror lacks — new, or moved in. Fetched now, budget
+  // permitting; anything left is picked up by the next incremental, because this
+  // section's watermark is deliberately not advanced here.
+  for (const page of liveById.values()) {
+    if (ctx.budget.exhausted) {
+      ctx.tally.done = false;
+      return false;
+    }
+    await syncPage(ctx, section, page);
   }
 
   await ctx.deps.store.setSectionSweepResult(section.id, {
     pageCount: live.length,
     lastSweptAt: ctx.startedAtIso,
   });
+  return true;
 }
 
 /** A reason string for a log line. Never a message, which can carry a request body. */
@@ -1137,7 +1532,7 @@ export interface ResyncHint {
 
 export interface ResyncDeps extends PageWriteDeps {
   readonly content: SyncContent;
-  readonly store: Pick<SyncStore, 'getPage' | 'putPage' | 'deletePage'> & {
+  readonly store: Pick<SyncStore, 'getPage' | 'putPage' | 'putPageMetadata' | 'deletePage'> & {
     getSection(sectionId: string): Promise<MirrorSection | null>;
   };
   readonly now?: () => number;
